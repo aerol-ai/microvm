@@ -6,9 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/aerol-ai/microvm/internal/privmode"
+	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
-	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -25,8 +24,9 @@ import (
 // worker gets its own /work only as an open folder.
 //
 // What a worker writes for sandboxd to read back as its own, a checkpoint
-// (pause, passivation, a move), stays the worker user's file, which
-// sandboxd cannot take back: those wait for a later step, and answer 501.
+// (passivation, a move, a snapshot), stays the worker user's file, which
+// sandboxd cannot take back: sandboxd copies it out instead
+// (split_checkpoint_unix.go, M1 PR 15).
 
 // split reports whether the root helper holds the workers.
 func (d *Driver) split() bool { return d.cfg.HelperSockets != "" }
@@ -66,6 +66,49 @@ func (d *Driver) parseResidentSocket(socket string) (string, int, bool) {
 	return parseResidentSocket(d.cfg.RunDir, filepath.Join(d.cfg.RunDir, "resident", name))
 }
 
+// slotFromSocket reads a warm-pool slot's id back from its worker's socket.
+// In single mode the socket is in the slot's folder (wasmpool
+// SlotFromSocket). In split the root helper serves it, w-<slot id>.sock in
+// its folder (the pool's SetSocketFor): only a slot id's shape is a slot's,
+// so no sandbox's own worker passes for one.
+func (d *Driver) slotFromSocket(socket string) (string, bool) {
+	if !d.split() {
+		return wasmpool.SlotFromSocket(d.cfg.RunDir, socket)
+	}
+	name, ok := strings.CutPrefix(filepath.Base(socket), "w-")
+	if !ok {
+		return "", false
+	}
+	id, ok := strings.CutSuffix(name, ".sock")
+	if !ok || !wasmpool.IsSlotID(id) || d.helperSocket(rootpolicy.HostWasmWorker, id) != socket {
+		return "", false
+	}
+	return id, true
+}
+
+// warmSlotFolder is the folder of the warm-pool slot an instance took,
+// removed with the sandbox: its socket's folder in single mode; in split,
+// where the socket is the helper's, the slot's own folder, found again by
+// its id and the module's digest (wasmpool SlotDirIn). "" when the socket
+// names no slot.
+func (d *Driver) warmSlotFolder(inst *sandboxInstance) string {
+	if !d.split() {
+		return filepath.Dir(inst.socketPath)
+	}
+	id, ok := d.slotFromSocket(inst.socketPath)
+	if !ok || inst.moduleDigest == "" {
+		return ""
+	}
+	// The digest is the record's: cleaned and seen to stay in the pool's
+	// folder before anything is removed.
+	pool := filepath.Join(filepath.Clean(d.cfg.RunDir), "pool") + string(filepath.Separator)
+	dir := filepath.Clean(wasmpool.SlotDirIn(d.cfg.RunDir, inst.moduleDigest, id))
+	if !strings.HasPrefix(dir, pool) {
+		return ""
+	}
+	return dir
+}
+
 // handToWorker gives a folder sandboxd made to the worker: to its uid in
 // single mode; in split to its group, setgid so what is made in it stays
 // the group's, mode 2770.
@@ -77,28 +120,6 @@ func (d *Driver) handToWorker(dir string) error {
 		return err
 	}
 	return os.Chmod(dir, os.ModeSetgid|0o770)
-}
-
-// errSplitCheckpoint is what split mode cannot do for WASM yet.
-var errSplitCheckpoint = privmode.NotYet("checkpoint a WASM sandbox (pause, passivation, a move, a snapshot)", privmode.StepWasmCheckpoints)
-
-// splitCheckpointGap refuses a checkpoint in split mode: the worker writes
-// it as its own user, and sandboxd cannot take it back to read as its own.
-func (d *Driver) splitCheckpointGap() error {
-	if d.split() {
-		return errSplitCheckpoint
-	}
-	return nil
-}
-
-// splitCreateGap refuses, in split mode, a create that would need a
-// checkpoint later: a durable or passivatable sandbox is checkpointed when
-// sandboxd stops.
-func (d *Driver) splitCreateGap(req models.CreateSandboxRequest) error {
-	if d.split() && (req.Durability == models.DurabilityDurable || req.Durability == models.DurabilityPassivatable) {
-		return errSplitCheckpoint
-	}
-	return nil
 }
 
 // SetWorkerLister makes boot adoption list the running workers through

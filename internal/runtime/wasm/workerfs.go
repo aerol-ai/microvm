@@ -149,7 +149,14 @@ func (d *Driver) stageCheckpoint(final string) (string, error) {
 	if err := os.Mkdir(stage, 0o700); err != nil {
 		return "", err
 	}
-	if d.workerOwns() {
+	if d.split() {
+		// sandboxd is not root: the worker writes in it by group, and the
+		// checkpoint is copied out (split_checkpoint_unix.go).
+		if err := d.handToWorker(stage); err != nil {
+			_ = os.RemoveAll(stage)
+			return "", err
+		}
+	} else if d.workerOwns() {
 		if err := os.Chown(stage, d.cfg.Worker.UID, d.cfg.Worker.GID); err != nil {
 			_ = os.RemoveAll(stage)
 			return "", err
@@ -172,6 +179,9 @@ var errStagedSnapshot = errors.New("checkpoint staging holds something other tha
 // with one name. Only then is it moved into place. The staging folder is
 // removed either way.
 func (d *Driver) promoteCheckpoint(staged, final string) error {
+	if d.split() {
+		return d.copyOutCheckpoint(staged, final)
+	}
 	stage := filepath.Dir(staged)
 	defer os.RemoveAll(stage)
 	uid, gid := os.Geteuid(), os.Getegid()

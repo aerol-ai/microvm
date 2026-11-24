@@ -162,6 +162,38 @@ func TestWasmHostSocket(t *testing.T) {
 	}
 }
 
+// TestWasmHostOfSocket: a WASM host's socket reads back to the kind and id
+// it was named for, and nothing else reads back at all.
+func TestWasmHostOfSocket(t *testing.T) {
+	const dir = "/run/aerolvm-rootd/wasm"
+	for _, tc := range []struct {
+		socket string
+		kind   HostKind
+		id     string
+	}{
+		{dir + "/w-sb-1.sock", HostWasmWorker, "sb-1"},
+		{dir + "/w-pool-0123456789abcdef.sock", HostWasmWorker, "pool-0123456789abcdef"},
+		{dir + "/r-o0123456789abcdef-b.sock", HostWasmResident, "o0123456789abcdef-b"},
+		{dir + "/w-../x.sock", "", ""},
+		{dir + "/w-_hidden.sock", "", ""},
+		{dir + "/w-sb-1.sockx", "", ""},
+		{dir + "/x-sb-1.sock", "", ""},
+		{dir + "/w-.sock", "", ""},
+		{"/elsewhere/w-sb-1.sock", "", ""},
+		{dir + "/sub/w-sb-1.sock", "", ""},
+		{dir + "/w-" + strings.Repeat("a", 90) + ".sock", "", ""},
+	} {
+		kind, id, ok := WasmHostOfSocket(dir, tc.socket)
+		if ok != (tc.kind != "") || kind != tc.kind || id != tc.id {
+			t.Errorf("WasmHostOfSocket(%q) = %q %q %v, want %q %q", tc.socket, kind, id, ok, tc.kind, tc.id)
+		}
+	}
+	// The folder must be one WasmHostSocket names sockets in.
+	if _, _, ok := WasmHostOfSocket("relative", "relative/w-sb-1.sock"); ok {
+		t.Error("a relative folder")
+	}
+}
+
 // FuzzHostOfGroup: whatever a group's name, reading it back never yields an
 // id that leaves the kind's group, and an id read back names that group.
 func FuzzHostOfGroup(f *testing.F) {

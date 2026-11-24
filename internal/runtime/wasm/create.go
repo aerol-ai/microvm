@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -32,9 +31,6 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 
 	if d.resolver == nil {
 		return nil, fmt.Errorf("wasm runtime: module resolver not configured: %w", models.ErrRuntimeNotImplemented)
-	}
-	if err := d.splitCreateGap(req); err != nil {
-		return nil, err
 	}
 	if d.supervisor == nil {
 		return nil, fmt.Errorf("wasm runtime: worker supervisor not configured: %w", models.ErrRuntimeNotImplemented)
@@ -135,7 +131,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	cleanup := func() {
 		_ = d.supervisor.Stop(workerKey)
 		if warmSlot != nil {
-			_ = os.RemoveAll(filepath.Dir(warmSlot.SocketPath))
+			if dir := warmSlot.Folder(); dir != "" {
+				_ = os.RemoveAll(dir)
+			}
 		} else {
 			_ = os.Remove(socketPath)
 		}
@@ -249,10 +247,13 @@ func preopensFromBinds(workDir string, binds []mounts.ContainerBind) []wasmengin
 		// A read-only mount must stay read-only for a WASM guest too: the
 		// host directory under it is often writable, and only the
 		// container's bind made it read-only.
+		// A mount point the root helper keeps (privilege mode split) is
+		// lent to the worker by the helper, never opened here.
 		preopens = append(preopens, wasmengine.Preopen{
 			GuestPath: guest,
 			HostPath:  host,
 			ReadOnly:  b.ReadOnly,
+			Lent:      b.Lent,
 		})
 	}
 	return preopens

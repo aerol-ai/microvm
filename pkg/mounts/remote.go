@@ -8,12 +8,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
-
-// errWasmMountsInSplit refuses a WASM sandbox's mounts in split mode.
-var errWasmMountsInSplit = privmode.NotYet("mount external storage for a WASM sandbox", privmode.StepWasmMounts)
 
 // Remote mounts (privilege mode split, M1 PR 8): sandboxd has no rights,
 // and the root helper (internal/rootd) runs the mount work in a Manager of
@@ -46,6 +42,10 @@ type Remote interface {
 	// Ready says why the helper cannot mount, or nil when it can (or when
 	// it has not been asked yet, and the call will say).
 	Ready() error
+	// WasmReady says why the helper cannot lend a WASM sandbox's mount
+	// points to its worker (an older helper, or one that runs no WASM
+	// hosts), or nil when it can.
+	WasmReady(ctx context.Context) error
 }
 
 // remoteCallTimeout bounds an unmount or a sweep the service runs with no
@@ -79,15 +79,20 @@ func (m *Manager) remoteMount(ctx context.Context, sandboxID string, mode Remote
 	}
 	if _, ok := consumerFrom(ctx); ok {
 		// A consumer is a WASM worker (M1 PR 9 runs them in split mode).
-		// It reaches a mount through sandboxd, which opens the mount's root
-		// for it (worker grants), and in split mode sandboxd cannot open
-		// the helper's mount points: refused here, before the helper
-		// mounts anything, as the node's setting (501).
-		return RemoteResult{}, errWasmMountsInSplit
+		// sandboxd cannot open the helper's mount points, so the helper
+		// lends them to the worker (GrantWasmMounts, M1 PR 15): a helper
+		// that does not is refused here, before it mounts anything.
+		if err := m.remote.WasmReady(ctx); err != nil {
+			return RemoteResult{}, err
+		}
 	}
 	res, err := m.remote.Mount(ctx, sandboxID, mode, specs)
 	if err != nil {
 		return RemoteResult{}, err
+	}
+	// Every mount point is the helper's: a WASM worker is lent it.
+	for i := range res.Binds {
+		res.Binds[i].Lent = true
 	}
 	m.mu.Lock()
 	m.remoteBinds[sandboxID] = slices.Clone(res.Binds)

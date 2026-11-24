@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -279,8 +280,10 @@ func TestMountCtxFor(t *testing.T) {
 		t.Fatal("a consumer with the drop off")
 	}
 	// Split mode: sandboxd is not root, but the helper drops every worker,
-	// so a WASM sandbox's mounts name that consumer (and the helper-backed
-	// mount manager refuses them, 501, before mounting anything).
+	// so a WASM sandbox's mounts name that consumer, and the helper-backed
+	// mount manager first checks the helper lends mount points to WASM
+	// hosts (M1 PR 15): one that does not is refused before mounting
+	// anything.
 	s.cfg.PrivilegeMode, s.cfg.WasmWorkerDropPrivs = privmode.Split, true
 	m, err := mounts.NewRemote(slog.New(slog.DiscardHandler), refusingRemote{t}, "")
 	if err != nil {
@@ -288,12 +291,13 @@ func TestMountCtxFor(t *testing.T) {
 	}
 	_, err = m.MountAll(s.mountCtxFor(ctx, &models.Sandbox{Runtime: models.RuntimeWasm}), "sb-1",
 		[]models.MountSpec{{Type: models.MountTypeNFS, Source: "127.0.0.1:/e", Target: "/mnt"}})
-	if !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("a WASM sandbox's mounts in split mode: %v, want a 501", err)
+	if !errors.Is(err, mounts.ErrMountsUnavailable) {
+		t.Fatalf("a WASM sandbox's mounts on a helper that lends none: %v, want a 501", err)
 	}
 }
 
-// refusingRemote fails the test if a mount reaches the helper.
+// refusingRemote is a helper that lends no mount points to WASM hosts, and
+// fails the test if a mount reaches it.
 type refusingRemote struct{ t *testing.T }
 
 func (r refusingRemote) Mount(context.Context, string, mounts.RemoteMode, []models.MountSpec) (mounts.RemoteResult, error) {
@@ -304,6 +308,9 @@ func (r refusingRemote) Mount(context.Context, string, mounts.RemoteMode, []mode
 func (refusingRemote) Unmount(context.Context, string, bool) (bool, error) { return false, nil }
 func (refusingRemote) Sweep(context.Context, []string) error               { return nil }
 func (refusingRemote) Ready() error                                        { return nil }
+func (refusingRemote) WasmReady(context.Context) error {
+	return fmt.Errorf("%w: the helper lends no mount points to WASM hosts", mounts.ErrMountsUnavailable)
+}
 
 // A worker holding its spill lock never stalls the drain: the drain runs on
 // the audit writer holding spillMu and the audit lock, so it skips that

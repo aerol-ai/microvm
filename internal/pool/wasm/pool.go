@@ -27,6 +27,22 @@ type Slot struct {
 	WorkerKey    string
 	MemoryMB     int
 	LoadedAt     time.Time
+	// Dir is the slot's own folder (SlotDir), which names its compile
+	// cache and goes with the slot. Its worker's socket is in it, unless
+	// the root helper serves the socket (SetSocketFor).
+	Dir string
+}
+
+// Folder is the slot's own folder: Dir, or, for a slot made without one,
+// its socket's folder; "" for a slot with neither.
+func (s *Slot) Folder() string {
+	switch {
+	case s.Dir != "":
+		return s.Dir
+	case s.SocketPath == "":
+		return ""
+	}
+	return filepath.Dir(s.SocketPath)
 }
 
 // Pool keeps pre-loaded workers keyed by module digest.
@@ -48,6 +64,10 @@ type Pool struct {
 	closeCancel     context.CancelFunc
 	closed          bool
 	runWG           sync.WaitGroup
+	// socketFor, when set, is the socket a slot's worker serves: in
+	// privilege mode split the root helper's, by the slot's id. Nil: the
+	// socket in the slot's own folder.
+	socketFor func(slotID string) (string, error)
 }
 
 // New constructs a warm pool. runDir is the WASM runtime root (pool slots live under runDir/pool/).
@@ -76,6 +96,15 @@ func (p *Pool) SetSpawner(s Spawner) {
 	if !p.closed {
 		p.spawner = s
 	}
+	p.mu.Unlock()
+}
+
+// SetSocketFor makes each slot's worker serve the socket fn names for the
+// slot's id (privilege mode split: the root helper's, where the helper
+// starts the worker as the worker user). Call it before the refill runs.
+func (p *Pool) SetSocketFor(fn func(slotID string) (string, error)) {
+	p.mu.Lock()
+	p.socketFor = fn
 	p.mu.Unlock()
 }
 
@@ -181,8 +210,8 @@ func (p *Pool) RecordLoaded(slot *Slot) {
 		if spawner != nil {
 			_ = spawner.Shutdown(slot.WorkerKey)
 		}
-		if slot.SocketPath != "" {
-			_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		if dir := slot.Folder(); dir != "" {
+			_ = os.RemoveAll(dir)
 		}
 		return
 	}
@@ -253,8 +282,8 @@ func (p *Pool) DropModule(digest string) {
 		if spawner != nil {
 			_ = spawner.Shutdown(slot.WorkerKey)
 		}
-		if slot.SocketPath != "" {
-			_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		if dir := slot.Folder(); dir != "" {
+			_ = os.RemoveAll(dir)
 		}
 	}
 }
@@ -322,6 +351,7 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 	spawner := p.spawner
 	memMB := p.defaultMemoryMB
 	closed := p.closed
+	socketFor := p.socketFor
 	p.mu.Unlock()
 	if closed {
 		return nil, ErrPoolClosed
@@ -331,11 +361,17 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 	}
 	slotID := NewSlotID()
 	dir := p.SlotDir(digest, slotID)
+	socketPath := filepath.Join(dir, slotSocketName)
+	if socketFor != nil {
+		var err error
+		if socketPath, err = socketFor(slotID); err != nil {
+			return nil, fmt.Errorf("wasm pool: slot socket: %w", err)
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	socketPath := filepath.Join(dir, slotSocketName)
-	if err := spawner.Warm(ctx, slotID, socketPath, modulePath, memMB); err != nil {
+	if err := spawner.Warm(WithSlotDir(ctx, dir), slotID, socketPath, modulePath, memMB); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
@@ -347,8 +383,34 @@ func (p *Pool) WarmOne(ctx context.Context, digest, modulePath string) (*Slot, e
 		WorkerKey:    slotID,
 		MemoryMB:     memMB,
 		LoadedAt:     time.Now().UTC(),
+		Dir:          dir,
 	}, nil
 }
+
+type slotDirKey struct{}
+
+// WithSlotDir tells a Spawner the folder of the slot it warms, when its
+// socket is not in it.
+func WithSlotDir(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, slotDirKey{}, dir)
+}
+
+// slotDirFrom is the slot's folder WithSlotDir put on ctx, or the socket's
+// folder.
+func slotDirFrom(ctx context.Context, socketPath string) string {
+	if dir, _ := ctx.Value(slotDirKey{}).(string); dir != "" {
+		return dir
+	}
+	return filepath.Dir(socketPath)
+}
+
+// IsSlotID reports whether id is one NewSlotID mints.
+func IsSlotID(id string) bool { return slotIDPattern.MatchString(id) }
+
+// SlotDirIn is the folder of slot slotID for a module with digest, in a
+// pool over runDir (Pool.SlotDir): where a restarted sandboxd finds a
+// claimed slot's folder from its record.
+func SlotDirIn(runDir, digest, slotID string) string { return slotDir(runDir, digest, slotID) }
 
 // Close shuts down all warm slots still in the pool.
 func (p *Pool) Close() (drained int) {
@@ -376,8 +438,8 @@ func (p *Pool) Close() (drained int) {
 		if spawner != nil {
 			_ = spawner.Shutdown(slot.WorkerKey)
 		}
-		if slot.SocketPath != "" {
-			_ = os.RemoveAll(filepath.Dir(slot.SocketPath))
+		if dir := slot.Folder(); dir != "" {
+			_ = os.RemoveAll(dir)
 		}
 		drained++
 	}

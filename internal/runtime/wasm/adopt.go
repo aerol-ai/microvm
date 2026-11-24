@@ -15,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	wasmpool "github.com/aerol-ai/microvm/internal/pool/wasm"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/aerol-ai/microvm/pkg/mounts"
@@ -253,7 +252,7 @@ func (d *Driver) recordRoutesValid(sandboxID string, rec instanceRecord, legacy 
 		bucketID, index, ok := d.parseResidentSocket(rec.Socket)
 		return ok && !rec.WarmPool && rec.WorkerKey == d.residentHostKey(bucketID, index)
 	case rec.WarmPool:
-		slotID, ok := wasmpool.SlotFromSocket(d.cfg.RunDir, rec.Socket)
+		slotID, ok := d.slotFromSocket(rec.Socket)
 		return ok && rec.WorkerKey == slotID
 	case rec.WorkerKey != sandboxID:
 		return false

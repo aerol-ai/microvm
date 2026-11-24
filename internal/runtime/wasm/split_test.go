@@ -2,15 +2,16 @@ package wasm
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
-	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
-	"github.com/aerol-ai/microvm/pkg/models"
+	"github.com/aerol-ai/microvm/pkg/mounts"
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
 )
 
@@ -124,26 +125,6 @@ func TestSplitHandsFoldersToTheGroup(t *testing.T) {
 	}
 }
 
-func TestSplitRefusesCheckpoints(t *testing.T) {
-	d, _, _, _ := splitDriver(t)
-	_, _, err := d.CheckpointSandbox(context.Background(), &models.Sandbox{ID: "sb-1"})
-	if !errors.Is(err, privmode.ErrGap) || !errors.Is(err, models.ErrRuntimeNotImplemented) {
-		t.Fatalf("checkpoint in split = %v", err)
-	}
-	for _, dur := range []string{models.DurabilityDurable, models.DurabilityPassivatable} {
-		if err := d.splitCreateGap(models.CreateSandboxRequest{Durability: dur}); !errors.Is(err, privmode.ErrGap) {
-			t.Fatalf("%s create in split = %v", dur, err)
-		}
-	}
-	if err := d.splitCreateGap(models.CreateSandboxRequest{}); err != nil {
-		t.Fatal(err)
-	}
-	single, _, _, _ := adoptDriver(t, true)
-	if single.splitCheckpointGap() != nil || single.splitCreateGap(models.CreateSandboxRequest{Durability: models.DurabilityDurable}) != nil {
-		t.Fatal("single mode refuses checkpoints")
-	}
-}
-
 func TestCacheName(t *testing.T) {
 	root := "/var/lib/sandboxd/wasm/modules/cache/wazero-compile"
 	for dir, want := range map[string]string{
@@ -184,6 +165,23 @@ func TestSplitRecordRoutes(t *testing.T) {
 		if got := d.recordRoutesValid("sb-1", tc.rec, false); got != tc.want {
 			t.Errorf("%s: %v, want %v", name, got, tc.want)
 		}
+	}
+}
+
+// TestLentMountPreopens: a mount point the root helper keeps (privilege
+// mode split) is a preopen sandboxd does not open: marked lent, and never
+// sent to the worker as such (the worker sees a plain preopen).
+func TestLentMountPreopens(t *testing.T) {
+	pre := preopensFromBinds("/run/w", []mounts.ContainerBind{
+		{HostPath: "/var/lib/aerolvm-rootd/mounts/sb-1/0", ContainerPath: "/data", Lent: true},
+		{HostPath: "/var/lib/sandboxd/mounts/sb-1/1", ContainerPath: "/old", ReadOnly: true},
+	})
+	if len(pre) != 3 || pre[0].Lent || !pre[1].Lent || pre[2].Lent || !pre[2].ReadOnly {
+		t.Fatalf("preopens %+v", pre)
+	}
+	raw, err := json.Marshal(pre[1])
+	if err != nil || strings.Contains(strings.ToLower(string(raw)), "lent") {
+		t.Fatalf("wire %s %v", raw, err)
 	}
 }
 

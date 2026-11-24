@@ -82,6 +82,10 @@ type Preopen struct {
 	// ReadOnly lets the guest read the directory but not change it, as a
 	// read-only bind does for a container.
 	ReadOnly bool `json:"read_only,omitempty"`
+	// Lent marks a folder sandboxd does not open to pass, which the root
+	// helper lends the worker instead: a mount point in privilege mode
+	// split (pkg/wasm/worker lend.go). Never sent to the worker.
+	Lent bool `json:"-"`
 }
 
 // UsageStats captures per-invocation metering for billing (UC-42a on wazero).

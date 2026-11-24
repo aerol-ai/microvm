@@ -80,6 +80,8 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		func(c *config.Config) { wasmSplit(c); c.WasmEngine = "wazero" },
 		// A warm pool the resident host makes moot is never wired.
 		func(c *config.Config) { wasmSplit(c); c.WasmPoolEnabled = true },
+		// M1 PR 15: the WASM warm pool's slot workers are the helper's.
+		func(c *config.Config) { wasmSplit(c); c.WasmResidentHostEnabled, c.WasmPoolEnabled = false, true },
 		// M1 PR 9b: Firecracker VMs, through the helper's jailer, on a
 		// node whose network rules are off.
 		func(c *config.Config) { c.EnableFirecracker, c.UseJailer = true, true },
@@ -106,8 +108,6 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		{"WASM on wasmtime", func(c *config.Config) { wasmSplit(c); c.WasmEngine = "wasmtime" }, "SB_WASM_ENGINE=wasmtime", nil},
 		{"WASM workers as sandboxd", func(c *config.Config) { wasmSplit(c); c.WasmWorkerUID = os.Getuid() }, "sandboxd's own uid", nil},
 		{"sandboxd outside the worker group", func(c *config.Config) { wasmSplit(c); c.WasmWorkerGID = 4242 }, "member of the WASM worker group", nil},
-		{"the WASM warm pool", func(c *config.Config) { wasmSplit(c); c.WasmResidentHostEnabled, c.WasmPoolEnabled = false, true }, "WASM warm pool",
-			[]privmode.Step{privmode.StepWasmWarmPool}},
 		// The helper jails every group it runs: an unjailed one is single
 		// mode only, for good.
 		{"V8 isolates unjailed", func(c *config.Config) { c.EnableIsolate = true }, "SB_ISOLATE_USE_JAIL=true", nil},

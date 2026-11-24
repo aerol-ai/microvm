@@ -203,6 +203,8 @@ func TestWireIsAppendOnly(t *testing.T) {
 		"aerolvm.rootd.v1.GuestRulesResponse":          {"inserted=1:bool"},
 		"aerolvm.rootd.v1.FirecrackerFilesRequest":     {"id=1:string", "names=2:repeated string"},
 		"aerolvm.rootd.v1.FirecrackerFilesResponse":    nil,
+		"aerolvm.rootd.v1.GrantWasmMountsRequest":      {"sandbox_id=1:string", "kind=2:enum", "host_id=3:string"},
+		"aerolvm.rootd.v1.GrantWasmMountsResponse":     {"granted=1:uint32"},
 	}
 	msgs := File_rootd_proto.Messages()
 	if msgs.Len() != len(want) {

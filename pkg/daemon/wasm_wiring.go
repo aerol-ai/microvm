@@ -89,10 +89,16 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	// each is opened from its folder one name at a time, never following a
 	// link, and refused through a folder a worker could write
 	// (worker.GrantPolicy).
-	worker.SetGrantPolicy(worker.GrantPolicy{
+	grants := worker.GrantPolicy{
 		Roots:  []string{cfg.WasmRunDir, cfg.WasmModulesDir, resolver.CacheDir, cfg.MountsRootPath, effectiveWasmCompileCacheDir(cfg)},
 		Worker: confine,
-	})
+	}
+	if lender, ok := hosts.(mountLender); ok {
+		// A sandbox's external mounts are the helper's: it lends their
+		// mount points to the worker (M1 PR 15).
+		grants.Lend = splitMountLender(lender, cfg.RootdWasmSocketDir)
+	}
+	worker.SetGrantPolicy(grants)
 	resolver.Auth = wasmmod.ModuleAuth{
 		Username: cfg.WasmRegistryUsername,
 		PATPath:  cfg.WasmRegistryPATPath,
@@ -182,6 +188,12 @@ func wireWasmRuntime(ctx context.Context, cfg config.Config, logger *slog.Logger
 	var pool *wasmpool.Pool
 	if warmPoolEffectivelyEnabled(cfg) {
 		pool = wasmpool.New(cfg.WasmRunDir, logger)
+		if hosts != nil {
+			// Each slot's worker is a WASM worker host of the helper's,
+			// named by the slot's id, on the socket the helper serves it on
+			// (splitWasmLauncher); the slot's folder stays sandboxd's.
+			pool.SetSocketFor(splitSlotSocket(cfg.RootdWasmSocketDir))
+		}
 		pool.SetDefaultDepth(cfg.WasmPoolDepthDefault)
 		pool.SetDefaultMemoryMB(cfg.WasmDefaultMemoryMB)
 		spawner := wasmpool.NewSupervisorSpawner(supervisor)
