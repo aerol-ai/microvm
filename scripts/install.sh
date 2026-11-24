@@ -240,6 +240,17 @@ SPLIT_FIRECRACKER_KERNEL_PATH="/usr/local/lib/aerolvm-firecracker/vmlinux"
 # (setup_privilege_mode): a change is a switch, which moves files' owners.
 PREVIOUS_PRIVILEGE_MODE=""
 
+# agent_may_own_folders reports whether sandboxd's user may own its folders
+# and have written in them: the node ran in privilege mode split before this
+# run (--config-only, which never switches a node, reads the mode it
+# renders). That user can then swap any name in /var/lib/sandboxd,
+# /run/sandboxd or the certificate folders for a link, and root's tools
+# follow links, so root makes, changes and writes nothing inside them: the
+# steps that must happen there run as that user (as_agent).
+agent_may_own_folders() {
+	[[ "${PREVIOUS_PRIVILEGE_MODE:-${PRIVILEGE_MODE:-single}}" == "split" ]]
+}
+
 # --- BEGIN DOWNLOAD PINS ------------------------------------------------------
 # Every pinned third-party download, with its SHA-256. A file is installed
 # only if it has the pinned hash, whichever source served it, so neither
@@ -2497,8 +2508,18 @@ install_binaries() {
 }
 
 write_environment() {
-	mkdir -p /etc/sandboxd /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
-	chmod 0700 /var/lib/sandboxd /var/lib/sandboxd/mounts /run/sandboxd
+	mkdir -p /etc/sandboxd /var/lib/sandboxd /run/sandboxd
+	chmod 0700 /var/lib/sandboxd /run/sandboxd
+	# The mounts folder is inside /var/lib/sandboxd. When sandboxd's user owns
+	# that folder (split, or a switch back from it: agent_may_own_folders,
+	# written out here so this function stands alone) root makes nothing in
+	# it: a link that user left would take root's chmod elsewhere. Split's
+	# unit makes it as that user (split_sandboxd_unit), single's unit as root
+	# once leave_split_mode has removed every link.
+	if [[ "${PRIVILEGE_MODE:-single}" != "split" && "${PREVIOUS_PRIVILEGE_MODE:-${PRIVILEGE_MODE:-single}}" != "split" ]]; then
+		mkdir -p /var/lib/sandboxd/mounts
+		chmod 0700 /var/lib/sandboxd/mounts
+	fi
 	local route_dns_link_addr=""
 	if [[ "$INGRESS_PROXY_ROUTING" == "true" ]]; then
 		route_dns_link_addr="$ROUTE_DNS_LINK_ADDR"
@@ -2663,6 +2684,10 @@ prepare_key_custody() {
 	[[ "$KEY_CUSTODY" == "wrapped" ]] || return 0
 	local plain=/var/lib/sandboxd/credential_encryption.key
 	local wrapped=/var/lib/sandboxd/credential_encryption.key.wrapped
+	if agent_may_own_folders; then
+		prepare_key_custody_as_agent "$plain" "$wrapped"
+		return 0
+	fi
 	if [[ -f "$plain" && ! -f "$wrapped" ]]; then
 		echo "Wrapping the existing server key at $plain"
 		"$INSTALL_PREFIX/sandboxd" key wrap --env-file /etc/sandboxd/sandboxd.env
@@ -2672,6 +2697,24 @@ prepare_key_custody() {
 	elif [[ -f "$plain" && -f "$wrapped" ]]; then
 		"$INSTALL_PREFIX/sandboxd" key verify --env-file /etc/sandboxd/sandboxd.env
 		rm -f "$plain"
+	fi
+}
+
+# prepare_key_custody_as_agent is prepare_key_custody on a node whose key
+# files are sandboxd's user's (agent_may_own_folders): that user looks at,
+# wraps and removes them, so a link left in its folder leads only where it
+# could read and write anyway. It reaches the key store as sandboxd does at
+# every start. sandboxd.env is root's, so root opens it and hands it over on
+# stdin.
+prepare_key_custody_as_agent() {
+	local plain="$1" wrapped="$2"
+	if runuser -u "$SANDBOXD_USER" -- test -f "$plain" && ! runuser -u "$SANDBOXD_USER" -- test -f "$wrapped"; then
+		echo "Wrapping the existing server key at $plain, as $SANDBOXD_USER"
+		runuser -u "$SANDBOXD_USER" -- "$INSTALL_PREFIX/sandboxd" key wrap --env-file /dev/stdin </etc/sandboxd/sandboxd.env
+		runuser -u "$SANDBOXD_USER" -- rm -f "$plain"
+	elif runuser -u "$SANDBOXD_USER" -- test -f "$plain" && runuser -u "$SANDBOXD_USER" -- test -f "$wrapped"; then
+		runuser -u "$SANDBOXD_USER" -- "$INSTALL_PREFIX/sandboxd" key verify --env-file /dev/stdin </etc/sandboxd/sandboxd.env
+		runuser -u "$SANDBOXD_USER" -- rm -f "$plain"
 	fi
 }
 
@@ -3344,7 +3387,15 @@ invocation="$(unit_prop InvocationID)"
 main_pid="$(unit_prop MainPID)"
 
 probe() {
-	if [[ -S "$LIVENESS_SOCKET" ]]; then
+	# Privilege mode split: the socket is in /run/sandboxd, which sandboxd's
+	# user owns and could fill with a link, so the probe runs as that user
+	# and root never connects there.
+	if [[ "${SB_PRIVILEGE_MODE:-single}" == "split" ]]; then
+		if runuser -u sandboxd -- test -S "$LIVENESS_SOCKET"; then
+			runuser -u sandboxd -- curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" --unix-socket "$LIVENESS_SOCKET" "http://localhost/livez" >/dev/null
+			return
+		fi
+	elif [[ -S "$LIVENESS_SOCKET" ]]; then
 		curl -fsS --max-time "$PROBE_TIMEOUT_SECONDS" --unix-socket "$LIVENESS_SOCKET" "http://localhost/livez" >/dev/null
 		return
 	fi
