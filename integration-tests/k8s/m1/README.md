@@ -17,8 +17,10 @@ It has two parts:
 - **Part B** (`vm-n1.sh`): one EC2 machine (m7i.xlarge, Ubuntu 24.04), in
   a security group of its own that lets nothing in. It times WASM and V8
   creates in `single` and in `split` on the same machine.
-  The chart does not run WASM or V8 in a split worker pod yet, so EKS
-  cannot answer this.
+  When this kit was written, the chart did not run WASM or V8 in a split
+  worker pod, so Part A does not time them. The chart runs both in split
+  now (`worker.wasm.enabled`, `worker.isolate.enabled`); Part A does not
+  turn them on yet.
 
 ## What it proves
 
