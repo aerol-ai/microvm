@@ -30,6 +30,10 @@
 #                                  # alone (go build -overlay on
 #                                  # internal/rootswap/release-keys.pub).
 #                                  # Never push these images.
+#   AEROL_K8S_WASM_V8=1 ...        # with WASM and V8-isolate sandboxes on
+#                                  # (worker.wasm.enabled,
+#                                  # worker.isolate.enabled), in either
+#                                  # privilege mode
 #
 # Needs Docker, kind, kubectl and Helm 3.8 or later (HELM names another).
 # sandboxd links glibc, so it is compiled in a golang container; toolboxd, the
@@ -56,6 +60,8 @@ privilege="${AEROL_K8S_PRIVILEGE_MODE:-single}"
 case "$privilege" in single|split) ;; *) echo "k8s-dev: AEROL_K8S_PRIVILEGE_MODE is single or split, got $privilege" >&2; exit 2 ;; esac
 privilege_flags=()
 [[ "$privilege" == split ]] && privilege_flags=(--set privilegeMode=split)
+hosts_flags=()
+[[ "${AEROL_K8S_WASM_V8:-0}" == 1 ]] && hosts_flags=(--set worker.wasm.enabled=true --set worker.isolate.enabled=true)
 # A signed helper carries a release version (internal/rootswap), so split
 # builds one too.
 tag="dev"
@@ -232,7 +238,7 @@ VALUES
   "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
     -f "$dist/cluster-values.yaml" --set image.tag="$tag" --set cluster.version="$tag" --set image.pullPolicy=Never \
     ${edge_flags[@]+"${edge_flags[@]}"} ${ca_flags[@]+"${ca_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"} \
-    ${privilege_flags[@]+"${privilege_flags[@]}"}
+    ${privilege_flags[@]+"${privilege_flags[@]}"} ${hosts_flags[@]+"${hosts_flags[@]}"}
   # The operator replaces nothing a new image changes on its own: restart it
   # so a rebuilt operator runs.
   kubectl --context "kind-$cluster" -n "$namespace" rollout restart deployment/aerolvm-operator >/dev/null
@@ -259,7 +265,7 @@ existing=0
 kubectl --context "kind-$cluster" -n "$namespace" get pod aerolvm-0 >/dev/null 2>&1 && existing=1
 "$helm" --kube-context "kind-$cluster" upgrade --install aerolvm charts/aerolvm -n "$namespace" \
   --set image.tag="$tag" --set image.pullPolicy=Never ${edge_flags[@]+"${edge_flags[@]}"} ${identity_flags[@]+"${identity_flags[@]}"} \
-  ${privilege_flags[@]+"${privilege_flags[@]}"}
+  ${privilege_flags[@]+"${privilege_flags[@]}"} ${hosts_flags[@]+"${hosts_flags[@]}"}
 if [[ "$existing" == 1 ]]; then
   kubectl --context "kind-$cluster" -n "$namespace" delete pod aerolvm-0 --wait=true --timeout=2m >/dev/null
 fi
