@@ -312,3 +312,20 @@ func releaseFIFO(t *testing.T, path string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A file that is not a database is refused at the first read, inside the
+// open's time limit, and leaves no copy behind.
+func TestVacuumIntoNoFollowRefusesAFileThatIsNoDatabase(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.db")
+	if err := os.WriteFile(path, []byte(strings.Repeat("not a database ", 512)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "copy.db")
+	if err := VacuumIntoNoFollow(context.Background(), path, dest); err == nil || !strings.Contains(err.Error(), "not a database") {
+		t.Fatalf("err = %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, "copy.db*")); len(left) != 0 {
+		t.Fatalf("left behind: %v", left)
+	}
+}

@@ -465,3 +465,20 @@ func TestRestoreReplacesAFileWhereTheConfigFolderGoes(t *testing.T) {
 		t.Fatal("not restored")
 	}
 }
+
+// A file where the restore needs a folder on the way is refused, as
+// mkdir -p refused it, and what was moved aside comes back.
+func TestRestoreRefusesAFileOnTheWay(t *testing.T) {
+	archive := filepath.Join(t.TempDir(), "a.tgz")
+	writeTar(t, archive, tarEntry{name: "./var/lib/sandboxd/state.db", body: "new"}, tarEntry{name: "./etc/sandboxd/tls/node.crt", body: "c"})
+	dst := t.TempDir()
+	write(t, filepath.Join(dst, "var", "lib", "sandboxd", "state.db"), "old")
+	write(t, filepath.Join(dst, "etc", "sandboxd", "tls"), "a file")
+	_, out, err := restore(t, RestoreOptions{Input: archive, TargetRoot: dst})
+	if err == nil || !strings.Contains(err.Error(), "not a directory") {
+		t.Fatalf("err = %v\n%s", err, out)
+	}
+	if read(t, filepath.Join(dst, "var", "lib", "sandboxd", "state.db")) != "old" {
+		t.Fatal("the moved database was not put back")
+	}
+}
