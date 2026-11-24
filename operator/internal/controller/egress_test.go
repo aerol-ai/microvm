@@ -215,6 +215,55 @@ func TestUseEgressFloorFile(t *testing.T) {
 	}
 }
 
+// In a split worker whose root helper runs WASM hosts, the runtime
+// container reads the floor too: the helper keeps the WASM worker user's
+// fence from its own environment, and hands each worker the floor file. It
+// gets the found lists, merged with the chart's, and the file, mounted as
+// the others have it. A runtime container whose helper runs no WASM host,
+// and every single-mode one, takes neither.
+func TestSplitRuntimeReadsTheFloor(t *testing.T) {
+	found := clusterAddresses{DenyFloor: []string{"10.96.0.1/32"}, Private: []string{"100.96.0.0/24"}}
+	stamp := func(runtimeEnv ...corev1.EnvVar) corev1.Container {
+		t.Helper()
+		c := testCluster()
+		tpl := mustTemplate(t, TemplateWorker)
+		rt := &tpl.Spec.Containers[containerIndex(tpl.Spec.Containers, RuntimeContainer)]
+		rt.Env = append(rt.Env, runtimeEnv...)
+		agent := &tpl.Spec.Containers[containerIndex(tpl.Spec.Containers, AgentContainer)]
+		agent.Env = append(agent.Env, envOn("SB_PRIVILEGE_MODE", "split"))
+		pod, err := Stamp(tpl, StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("w", v1.RoleWorker, "general", "z-a"),
+			Namespace: testWorkerNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0], Addresses: found})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pod.Spec.Containers[containerIndex(pod.Spec.Containers, RuntimeContainer)]
+	}
+	floorMounted := func(c corev1.Container) bool {
+		for _, m := range c.VolumeMounts {
+			if m.Name == EgressFloorVolume {
+				return m.ReadOnly && m.SubPath == "" && m.MountPath == "/etc/aerolvm-egress-floor"
+			}
+		}
+		return false
+	}
+	rt := stamp(envOn("SB_ENABLE_WASM", "true"), envOn(envDenyFloor, "192.0.2.1/32"))
+	if got := env(rt, envDenyFloor); got != "192.0.2.1/32,10.96.0.1/32" {
+		t.Errorf("WASM helper floor = %q, want the chart's and the found addresses", got)
+	}
+	if got := env(rt, envPrivate); got != "100.96.0.0/24" {
+		t.Errorf("WASM helper private = %q", got)
+	}
+	if env(rt, envFloorFile) != "/etc/aerolvm-egress-floor/deny-floor" || !floorMounted(rt) {
+		t.Errorf("WASM helper floor file %q, mounts %+v", env(rt, envFloorFile), rt.VolumeMounts)
+	}
+	for name, e := range map[string][]corev1.EnvVar{"no WASM": nil, "WASM off": {envOn("SB_ENABLE_WASM", "false")}} {
+		rt := stamp(e...)
+		if env(rt, envDenyFloor) != "<unset>" || env(rt, envFloorFile) != "<unset>" || floorMounted(rt) {
+			t.Errorf("%s: the runtime container took the floor: %+v", name, rt)
+		}
+	}
+}
+
 func podHasConfigMap(p *corev1.Pod, name string) bool {
 	for _, v := range p.Spec.Volumes {
 		if v.ConfigMap != nil && v.ConfigMap.Name == name && v.ConfigMap.Optional == nil {

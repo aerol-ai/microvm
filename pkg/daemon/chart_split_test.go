@@ -68,11 +68,12 @@ func chartGapRows() []chartGapRow {
 		{name: "no netns pool", flags: []string{"--set", "worker.extraEnv.SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=false"},
 			chart: "worker.extraEnv.SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", env: "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED",
 			set: func(c *config.Config, v string) { c.ContainerdNativeNetnsPoolEnabled = isTrue(v) }, want: "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED"},
-		// Kubernetes rows: split on the daemon, not yet in the worker pod.
-		// sandboxd runs WASM's warm pool, checkpoints and external mounts
-		// in split (M1 PR 15); the worker pod's WASM wiring is still to do.
-		{name: "WASM", flags: []string{"--set", "worker.wasm.enabled=true"}, chart: "worker.wasm.enabled"},
-		{name: "V8 isolates", flags: []string{"--set", "worker.isolate.enabled=true"}, chart: "worker.isolate.enabled"},
+		// Kubernetes rows: worker pod wiring. WASM and V8 isolates run in a
+		// split worker pod through worker.wasm.enabled and
+		// worker.isolate.enabled (TestChartSplitHosts); turned on in
+		// extraEnv they would get none of the pod's wiring for them.
+		{name: "WASM in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ENABLE_WASM=true"}, chart: "worker.extraEnv.SB_ENABLE_WASM"},
+		{name: "V8 isolates in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ENABLE_ISOLATE=true"}, chart: "worker.extraEnv.SB_ENABLE_ISOLATE"},
 		{name: "a helper setting in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ROOTD_AGENT_UID=1"}, chart: "worker.extraEnv.SB_ROOTD_AGENT_UID"},
 	}...)
 }
@@ -241,12 +242,15 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 	// API's warm pools that park in it, and the helper's move limits.
 	moves := []string{"--set", "worker.gvisor.checkpointMoves=true", "--set", "worker.extraEnv.SB_CONTAINERD_POOL_ENABLED=true",
 		"--set", "worker.extraEnv.SB_ROOTD_MOVE_MAX_BYTES=1073741824", "--set", "worker.extraEnv.SB_ROOTD_MOVE_MAX_STAGED=2"}
+	hosts := []string{"--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true"}
 	for name, flags := range map[string][]string{
 		"single": nil, "single edge": edge, "cluster": chartClusterFlags, "cluster edge": append(slices.Clone(chartClusterFlags), edge...),
 		"enterprise": enterprise, "enterprise edge": append(slices.Clone(enterprise), edge...),
 		"moves and warm pool": moves,
 		"cluster agent-sandbox API": append(slices.Clone(chartClusterFlags), "--set", "cluster.agentSandboxAPI.enabled=true",
 			"--set", "worker.gvisor.checkpointMoves=true"),
+		"WASM and V8 isolates": hosts, "cluster WASM and V8 isolates": append(slices.Clone(chartClusterFlags), hosts...),
+		"enterprise WASM and V8 isolates": append(append(slices.Clone(enterprise), edge...), hosts...),
 	} {
 		t.Run(name, func(t *testing.T) {
 			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, flags...)...)
@@ -254,13 +258,38 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 				t.Fatal(err)
 			}
 			env := workerEnv(t, out, "agent")
+			// sandboxd's own defaults (config.Load) where the chart sets
+			// nothing.
+			boolOr := func(k string, def bool) bool {
+				if v, ok := env[k]; ok {
+					return isTrue(v)
+				}
+				return def
+			}
 			cfg := config.Config{PrivilegeMode: privmode.Split, ContainerEngine: env["SB_CONTAINER_ENGINE"],
 				ContainerdNativeNetnsPoolEnabled: isTrue(env["SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED"]),
 				ContainerdPoolEnabled:            isTrue(env["SB_CONTAINERD_POOL_ENABLED"]),
 				GvisorCheckpointMoves:            isTrue(env["SB_GVISOR_CHECKPOINT_MOVES"]),
 				EnableFirecracker:                isTrue(env["SB_ENABLE_FIRECRACKER"]),
 				EnableWasm:                       isTrue(env["SB_ENABLE_WASM"]),
-				EnableIsolate:                    isTrue(env["SB_ENABLE_ISOLATE"])}
+				EnableIsolate:                    isTrue(env["SB_ENABLE_ISOLATE"]),
+				IsolateUseJail:                   boolOr("SB_ISOLATE_USE_JAIL", true),
+				WasmWorkerDropPrivs:              boolOr("SB_WASM_WORKER_DROP_PRIVS", true),
+				WasmWorkerUID:                    config.DefaultWasmWorkerID, WasmWorkerGID: config.DefaultWasmWorkerID}
+			// sandboxd's groups are the ones the pod gives the agent: its
+			// own and the pod's supplemental groups. A WASM worker needs it
+			// in the workers' group (checkSplitWasm).
+			spec := workerSpec(t, out)
+			groups := []int{65531}
+			sup, _ := dig(spec, "securityContext")["supplementalGroups"].([]any)
+			for _, g := range sup {
+				if n, ok := g.(int); ok {
+					groups = append(groups, n)
+				}
+			}
+			old := agentGroups
+			agentGroups = func() ([]int, error) { return groups, nil }
+			t.Cleanup(func() { agentGroups = old })
 			if env["SB_PRIVILEGE_MODE"] != "split" || cfg.ContainerEngine != models.ContainerEngineContainerd {
 				t.Fatalf("split worker env: SB_PRIVILEGE_MODE=%q SB_CONTAINER_ENGINE=%q", env["SB_PRIVILEGE_MODE"], cfg.ContainerEngine)
 			}
@@ -359,6 +388,157 @@ func TestChartSplitMoves(t *testing.T) {
 	}
 }
 
+// WASM and V8 isolates in a split worker pod: the root helper starts their
+// hosts in the runtime container, so the pod shares no process namespace,
+// and the two containers meet only where the helper's rules allow, as on a
+// VM (scripts/install.sh isolate_environment, split_environment):
+//
+//   - the WASM hosts' sockets are in a folder of the helper's on the
+//     shared folder, at one path in both containers, outside the agent's
+//     own folder; the compile cache is in the agent's own folder there;
+//   - the V8 jail's base is outside every folder the agent writes, root's
+//     (split-folders), two-way from the runtime container only, and read
+//     only in the agent, which takes the helper's mounts in;
+//   - workerd comes from a volume only a root init container with no
+//     capability writes, read only in the runtime container, never in the
+//     agent.
+//
+// The root helper then loads the runtime container's settings as they are,
+// with both host kinds on.
+func TestChartSplitHosts(t *testing.T) {
+	helm := chartHelm(t)
+	hosts := []string{"--set", "privilegeMode=split", "--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true"}
+	for name, flags := range map[string][]string{"single": hosts, "cluster": append(slices.Clone(chartClusterFlags), hosts...)} {
+		t.Run(name, func(t *testing.T) {
+			out, err := renderChart(helm, flags...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := workerSpec(t, out)
+			if v, _ := spec["shareProcessNamespace"].(bool); v {
+				t.Error("a split worker shares one process namespace")
+			}
+			type mount struct {
+				vol, path, propagation string
+				ro                     bool
+			}
+			containers := map[string][]mount{}
+			scripts := map[string]string{}
+			for _, list := range []string{"initContainers", "containers"} {
+				cs, _ := spec[list].([]any)
+				for _, c := range cs {
+					m, _ := c.(map[string]any)
+					name := fmt.Sprint(m["name"])
+					vms, _ := m["volumeMounts"].([]any)
+					for _, v := range vms {
+						vm, _ := v.(map[string]any)
+						ro, _ := vm["readOnly"].(bool)
+						p, _ := vm["mountPropagation"].(string)
+						containers[name] = append(containers[name], mount{vol: fmt.Sprint(vm["name"]), path: fmt.Sprint(vm["mountPath"]), propagation: p, ro: ro})
+					}
+					args, _ := m["args"].([]any)
+					for _, a := range args {
+						scripts[name] += fmt.Sprint(a)
+					}
+				}
+			}
+			// mountOf is the container's mount whose folder holds path.
+			mountOf := func(c, path string) (mount, bool) {
+				var best mount
+				for _, m := range containers[c] {
+					if (path == m.path || strings.HasPrefix(path, m.path+"/")) && len(m.path) > len(best.path) {
+						best = m
+					}
+				}
+				return best, best.path != ""
+			}
+			agent, runtime := workerEnv(t, out, "agent"), workerEnv(t, out, "runtime")
+
+			sockets, cache, own := runtime["SB_ROOTD_WASM_SOCKET_DIR"], runtime["SB_WASM_COMPILE_CACHE_DIR"], agent["SB_MOUNTS_CRED_DIR"]
+			if sockets == "" || agent["SB_ROOTD_WASM_SOCKET_DIR"] != sockets || cache == "" || agent["SB_WASM_COMPILE_CACHE_DIR"] != cache {
+				t.Fatalf("WASM: sockets %q / %q, cache %q / %q (helper / agent)", sockets, agent["SB_ROOTD_WASM_SOCKET_DIR"], cache, agent["SB_WASM_COMPILE_CACHE_DIR"])
+			}
+			for _, p := range []string{sockets, cache} {
+				a, okA := mountOf("agent", p)
+				r, okR := mountOf("runtime", p)
+				if !okA || !okR || a.vol != "rootd-shared" || r.vol != "rootd-shared" || a.path != r.path {
+					t.Errorf("%s: the agent sees it on %+v, the helper on %+v; want the shared folder at one path", p, a, r)
+				}
+			}
+			if strings.HasPrefix(sockets+"/", own+"/") || !strings.HasPrefix(cache, own+"/") {
+				t.Errorf("WASM sockets %s must be outside the agent's own folder %s, its compile cache %s inside", sockets, own, cache)
+			}
+
+			base := runtime["SB_ISOLATE_JAIL_CHROOT_BASE"]
+			if base == "" || agent["SB_ISOLATE_JAIL_CHROOT_BASE"] != base || runtime["SB_ISOLATE_JAIL_DIR"] != base {
+				t.Fatalf("V8 jail base: helper %q, agent %q, supervisor's unmount %q", base, agent["SB_ISOLATE_JAIL_CHROOT_BASE"], runtime["SB_ISOLATE_JAIL_DIR"])
+			}
+			if agent["SB_ISOLATE_USE_JAIL"] != "true" || runtime["SB_ISOLATE_USE_JAIL"] != "true" {
+				t.Error("split writes SB_ISOLATE_USE_JAIL=true for both, as install.sh does")
+			}
+			r, _ := mountOf("runtime", base)
+			a, _ := mountOf("agent", base)
+			f, _ := mountOf("split-folders", base)
+			if r.path != base || r.vol != "isolate-jail" || r.ro || r.propagation != "Bidirectional" {
+				t.Errorf("the helper mounts the jail base as %+v, want its own volume, writable and two-way", r)
+			}
+			if a.path != base || a.vol != "isolate-jail" || !a.ro || a.propagation != "HostToContainer" {
+				t.Errorf("the agent mounts the jail base as %+v, want the same volume, read only, HostToContainer", a)
+			}
+			for _, m := range containers["agent"] {
+				if !m.ro && (base == m.path || strings.HasPrefix(base, m.path+"/")) {
+					t.Errorf("the jail base %s is inside %s, which the agent writes", base, m.path)
+				}
+			}
+			if f.path != base || !strings.Contains(scripts["split-folders"], "chown 0:0 "+base+"\n") || !strings.Contains(scripts["split-folders"], "chmod 0755 "+base+"\n") {
+				t.Errorf("split-folders does not make the jail base %s root's, closed to others (mount %+v)", base, f)
+			}
+
+			workerd := runtime["SB_ISOLATE_WORKERD_PATH"]
+			w, _ := mountOf("runtime", workerd)
+			c, _ := mountOf("workerd", workerd)
+			if workerd == "" || w.vol != "workerd" || !w.ro || c.vol != "workerd" || c.path != w.path || c.ro {
+				t.Errorf("workerd %q: the helper reads it from %+v, the init container writes it to %+v", workerd, w, c)
+			}
+			for _, m := range containers["agent"] {
+				if m.vol == "workerd" {
+					t.Error("the agent mounts workerd's volume")
+				}
+			}
+			if !strings.Contains(scripts["workerd"], "/usr/local/bin/workerd") {
+				t.Error("the workerd init container copies no workerd")
+			}
+
+			// The helper's environment is the runtime container's, plus the
+			// cgroup parent the supervisor works out (internal/supervisor
+			// helperEnv). The node's memory stands in for /proc/meminfo,
+			// which this test may not have; the mount tools' user is made by
+			// the runtime container's start command, so this machine has
+			// none, and external storage is left out.
+			cfg, err := rootd.ConfigFromEnv(func(k string) string {
+				switch k {
+				case "SB_CONTAINERD_CGROUP_PARENT":
+					return "/kubepods/pod1/runtime/sandboxes"
+				case "SB_HOST_MEMORY_MB":
+					return "8192"
+				case "SB_ROOTD_MOUNT_USER":
+					return ""
+				}
+				return runtime[k]
+			})
+			if err != nil {
+				t.Fatalf("the root helper refuses the runtime container's settings: %v", err)
+			}
+			if cfg.Hosts.Wasm == nil || cfg.Hosts.Wasm.SocketDir != sockets || cfg.Hosts.Wasm.CacheRoot != cache || cfg.Hosts.Wasm.GID != config.DefaultWasmWorkerID {
+				t.Errorf("helper's WASM hosts = %+v", cfg.Hosts.Wasm)
+			}
+			if cfg.Hosts.Workerd == nil || cfg.Hosts.Workerd.Jail.ChrootBase != base || cfg.Hosts.Workerd.Jail.WorkerdPath != workerd {
+				t.Errorf("helper's V8 hosts = %+v", cfg.Hosts.Workerd)
+			}
+		})
+	}
+}
+
 // In a split worker no root process writes in a folder the agent can write
 // (plan §3.3, "root-read paths live in root's folders"). Every container
 // that starts as root (the runtime container, the egress container before
@@ -385,8 +565,16 @@ func TestChartSplitRootWritesNoAgentFolder(t *testing.T) {
 		"split-folders/rootd-shared": true,
 	}
 	edge := []string{"--set", "edge.enabled=true", "--set", "edge.domain=aerolvm.test", "--set", "edge.certManager.issuerRef.name=ci"}
-	for name, flags := range map[string][]string{"single": edge, "cluster": append(slices.Clone(chartClusterFlags), edge...)} {
+	// WASM and V8 isolates add one root container, workerd, which copies
+	// workerd into a volume of its own that the agent never mounts.
+	hosts := append(slices.Clone(edge), "--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true")
+	for name, flags := range map[string][]string{"single": edge, "cluster": append(slices.Clone(chartClusterFlags), edge...),
+		"WASM and V8 isolates": hosts, "cluster WASM and V8 isolates": append(slices.Clone(chartClusterFlags), hosts...)} {
 		t.Run(name, func(t *testing.T) {
+			wantRoots := []string{"egress", "runtime", "split-folders"}
+			if slices.Contains(flags, "worker.isolate.enabled=true") {
+				wantRoots = []string{"egress", "runtime", "split-folders", "workerd"}
+			}
 			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, flags...)...)
 			if err != nil {
 				t.Fatal(err)
@@ -440,8 +628,8 @@ func TestChartSplitRootWritesNoAgentFolder(t *testing.T) {
 				}
 			}
 			slices.Sort(roots)
-			if want := []string{"egress", "runtime", "split-folders"}; !slices.Equal(roots, want) {
-				t.Errorf("containers that start as root: %v, want %v", roots, want)
+			if !slices.Equal(roots, wantRoots) {
+				t.Errorf("containers that start as root: %v, want %v", roots, wantRoots)
 			}
 			if _, ok := all["runtime"].mounts["state"]; ok {
 				t.Error("the runtime container mounts sandboxd's state volume")
@@ -566,13 +754,16 @@ func TestChartSplitNonRootReadsItsFiles(t *testing.T) {
 // Single renders none of split: no setting, no helper, a privileged agent.
 func TestChartSingleHasNoSplit(t *testing.T) {
 	helm := chartHelm(t)
-	for name, flags := range map[string][]string{"single": nil, "cluster": chartClusterFlags} {
+	hosts := []string{"--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true"}
+	for name, flags := range map[string][]string{"single": nil, "cluster": chartClusterFlags,
+		"single WASM and V8 isolates": hosts, "cluster WASM and V8 isolates": append(slices.Clone(chartClusterFlags), hosts...)} {
 		t.Run(name, func(t *testing.T) {
 			out, err := renderChart(helm, flags...)
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime", "run-egress", "SB_EGRESS_GATEWAY_SOCKET"} {
+			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime", "run-egress", "SB_EGRESS_GATEWAY_SOCKET",
+				"/srv/isolate-jail", "HostToContainer", "aerolvm-workerd", "supplementalGroups"} {
 				if strings.Contains(out, bad) {
 					t.Errorf("single renders %q", bad)
 				}

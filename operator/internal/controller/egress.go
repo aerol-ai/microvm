@@ -39,8 +39,9 @@ import (
 // watches (review R4): the cluster controller keeps the current addresses
 // in a ConfigMap in the worker namespace (syncEgressFloor), every worker
 // pod mounts it (useEgressFloorFile), the kubelet updates the file in
-// place, and sandboxd, its WASM workers and the egress gateway each add
-// what it holds to their deny floor within seconds
+// place, and sandboxd, its WASM workers (in privilege mode split, the
+// root helper's) and the egress gateway each add what it holds to their
+// deny floor within seconds
 // (SB_EGRESS_DENY_FLOOR_FILE). Both fail closed: a worker pod is not made
 // while the API server's addresses cannot be read, its volume makes it
 // wait until the ConfigMap exists, and a read that fails later leaves the
@@ -164,9 +165,26 @@ var sandboxdPrivateDefault = []netip.Prefix{
 // SB_CONTAINERD_BRIDGE_SUBNET.
 const defaultSandboxSubnet = "10.88.0.0/16"
 
+// readsEgressRanges says whether container c of a worker pod reads the
+// deny floor and the private default: sandboxd (its firewall) and the egress
+// gateway always; and the runtime container when its root helper runs WASM
+// hosts (privilege mode split, the helper's own SB_ENABLE_WASM). The helper
+// builds the WASM worker user's fence from its own environment, and each
+// worker it starts reads the floor file it is handed; neither may miss the
+// API server's addresses.
+func readsEgressRanges(c *corev1.Container) bool {
+	switch c.Name {
+	case AgentContainer, "egress":
+		return true
+	case RuntimeContainer:
+		return envValue(c.Env, "SB_ENABLE_WASM") == "true"
+	}
+	return false
+}
+
 // setEgressRanges adds the found lists to each container that reads them
-// (the agent's firewall and the egress gateway), keeping what the chart's
-// values set, within the rules sandboxd checks at start
+// (readsEgressRanges), keeping what the chart's values set, within the
+// rules sandboxd checks at start
 // (internal/config's validateEgressRanges), so a found range can never stop
 // a worker from starting:
 //
@@ -191,7 +209,7 @@ func setEgressRanges(spec *corev1.PodSpec, a clusterAddresses) {
 	}
 	for i := range spec.Containers {
 		c := &spec.Containers[i]
-		if c.Name != AgentContainer && c.Name != "egress" {
+		if !readsEgressRanges(c) {
 			continue
 		}
 		for _, kv := range []struct {

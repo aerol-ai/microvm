@@ -729,10 +729,11 @@ const (
 func EgressFloorConfigMap(cluster string) string { return cluster + "-egress-floor" }
 
 // useEgressFloorFile mounts the deny-floor ConfigMap into the containers
-// that guard sandbox traffic (sandboxd and the egress gateway) and points
-// them at the file. The whole volume, never a subPath: the kubelet updates
-// only a volume mounted whole. Not optional: a worker pod waits for the
-// ConfigMap rather than start without the floor.
+// that guard sandbox traffic (readsEgressRanges: sandboxd, the egress
+// gateway, and a split worker's runtime container when its root helper
+// runs WASM hosts) and points them at the file. The whole volume, never a
+// subPath: the kubelet updates only a volume mounted whole. Not optional: a
+// worker pod waits for the ConfigMap rather than start without the floor.
 func useEgressFloorFile(spec *corev1.PodSpec, cluster string) {
 	if !usesEgressRanges(spec) {
 		return
@@ -742,7 +743,7 @@ func useEgressFloorFile(spec *corev1.PodSpec, cluster string) {
 	}})
 	for i := range spec.Containers {
 		c := &spec.Containers[i]
-		if c.Name != AgentContainer && c.Name != "egress" {
+		if !readsEgressRanges(c) {
 			continue
 		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: EgressFloorVolume, MountPath: egressFloorMount, ReadOnly: true})

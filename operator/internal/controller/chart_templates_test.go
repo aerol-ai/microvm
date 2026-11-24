@@ -2,6 +2,7 @@ package controller
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -186,6 +187,71 @@ func TestRenderedSplitWorkerTemplate(t *testing.T) {
 	}
 	if v := volumeNamed(pod.Spec.Volumes, TLSVolume); v == nil || v.Secret == nil || v.Secret.DefaultMode == nil || *v.Secret.DefaultMode != 0o404 {
 		t.Errorf("split external-CA certificate volume %+v: the agent (uid 65531) cannot read a root-owned 0400 key", v)
+	}
+}
+
+// A split worker template with WASM and V8 isolates on stamps into a pod
+// whose root helper runs their hosts: no shared process namespace; the
+// agent in the WASM workers' group; one two-way mount, the runtime
+// container's V8 jail folder, which the agent takes in read only and sends
+// nothing back; workerd copied by an init container with no capability, in
+// a volume the agent never mounts; and the deny floor in the runtime
+// container too, for the helper's WASM fence. CI renders the chart into
+// AEROLVM_POD_TEMPLATES_SPLIT_HOSTS; without it the test skips.
+func TestRenderedSplitHostsWorkerTemplate(t *testing.T) {
+	tm := renderedWorker(t, "AEROLVM_POD_TEMPLATES_SPLIT_HOSTS")
+	c := testCluster()
+	pod, err := Stamp(tm, StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: c, Node: node("prod-worker-0", TemplateWorker, "general", "z-a"),
+		Namespace: testNS, Version: "v0.7.2", Pool: &c.Spec.WorkerPools[0], Addresses: clusterAddresses{DenyFloor: []string{"10.96.0.1/32"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
+		t.Error("a split worker shares one process namespace")
+	}
+	if psc := pod.Spec.SecurityContext; psc == nil || !slices.Contains(psc.SupplementalGroups, 61000) || psc.FSGroup != nil {
+		t.Errorf("pod security %+v: want the WASM workers' group 61000 and no fsGroup", psc)
+	}
+	ic := pod.Spec.InitContainers
+	if len(ic) != 4 || ic[0].Name != PreflightContainer || ic[1].Name != "split-folders" || ic[2].Name != "workerd" || ic[3].Name != SetupContainer {
+		t.Fatalf("split worker init containers = %v", ic)
+	}
+	if ic[2].Image != "registry.example/aerol/aerolvm:v0.7.2" {
+		t.Errorf("workerd's copy comes from %s, want the release's agent image", ic[2].Image)
+	}
+	if sc := ic[2].SecurityContext; sc == nil || (sc.Privileged != nil && *sc.Privileged) || sc.Capabilities == nil ||
+		len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" || len(sc.Capabilities.Add) != 0 ||
+		sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation || sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+		t.Errorf("workerd init security = %+v", sc)
+	}
+	if m := ic[2].VolumeMounts; len(m) != 1 || m[0].Name != "workerd" {
+		t.Errorf("workerd init mounts %+v, want its own volume alone", m)
+	}
+	agent := pod.Spec.Containers[containerIndex(pod.Spec.Containers, AgentContainer)]
+	runtime := pod.Spec.Containers[containerIndex(pod.Spec.Containers, RuntimeContainer)]
+	for _, ctr := range pod.Spec.Containers {
+		for _, m := range ctr.VolumeMounts {
+			two := m.MountPropagation != nil && *m.MountPropagation == corev1.MountPropagationBidirectional
+			if two && (ctr.Name != RuntimeContainer || m.Name != "isolate-jail") {
+				t.Errorf("%s mounts %s two-way", ctr.Name, m.MountPath)
+			}
+			if ctr.Name == AgentContainer && m.Name == "workerd" {
+				t.Error("the agent mounts workerd's volume")
+			}
+			if ctr.Name == AgentContainer && m.Name == "isolate-jail" &&
+				(!m.ReadOnly || m.MountPropagation == nil || *m.MountPropagation != corev1.MountPropagationHostToContainer) {
+				t.Errorf("the agent mounts the V8 jail as %+v, want read only, HostToContainer", m)
+			}
+		}
+	}
+	if envValue(runtime.Env, "SB_ENABLE_WASM") != "true" || envValue(runtime.Env, "SB_ENABLE_ISOLATE") != "true" {
+		t.Error("the runtime container's helper does not run WASM and V8 hosts")
+	}
+	if envValue(runtime.Env, envDenyFloor) != "10.96.0.1/32" || envValue(runtime.Env, envFloorFile) == "" {
+		t.Errorf("the helper's floor: %q, file %q", envValue(runtime.Env, envDenyFloor), envValue(runtime.Env, envFloorFile))
+	}
+	if envValue(agent.Env, envFloorFile) != envValue(runtime.Env, envFloorFile) {
+		t.Error("the agent and the helper read different floor files")
 	}
 }
 

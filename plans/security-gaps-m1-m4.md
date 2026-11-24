@@ -761,7 +761,8 @@ Each is small and stands alone. Together they shrink the root surface now.
       without a shared process namespace. gVisor moves default to off in
       split and on in single. pkg/daemon's chart tests read
       `checkPrivilegeMode`'s source, so a new daemon gap fails CI until
-      the chart refuses it too.
+      the chart refuses it too. (WASM and V8 isolates were wired in later:
+      see "WASM and V8 isolates in a split worker pod" below.)
     - **Switching a running install** is a decommission per worker in
       cluster mode and a pod delete in single mode (the NOTES and the Operate
       page say how). A state volume that outlives the pod keeps files the
@@ -911,6 +912,68 @@ Each is small and stands alone. Together they shrink the root surface now.
       where the kit now lives. With this run, D10's live proof is done
       for S2, OV-E2, F8 and F10, and for N1 cold, WASM and V8. N1 warm is
       not: it is over its p50 budget.
+    - **WASM and V8 isolates in a split worker pod (2026-11-24).** The
+      chart no longer refuses `worker.wasm.enabled` or
+      `worker.isolate.enabled` in split; it wires them as install.sh does
+      on a VM. Firecracker stays refused until a live KVM run. What the pod
+      needed:
+      - **No shared process namespace.** The helper starts WASM hosts and
+        `workerd` in the runtime container, so an agent restart never
+        reaches them, and the next agent takes them over through the
+        helper (ListHosts, OpenHost). sandboxd's own C14 check already
+        skips split.
+      - **WASM sockets on the shared folder:** `SB_ROOTD_WASM_SOCKET_DIR`
+        is `/run/aerolvm-rootd/shared/wasm`, set for both, a folder the
+        helper makes beside its own socket's (only root and the agent's
+        group enter the shared folder). The agent shares each sandbox's
+        files with its worker by group, so the pod gets supplemental
+        group 61000 (sandboxd refuses to start outside it,
+        `checkSplitWasm`). The group reaches every container, but only the
+        agent's own folders hold such files, and the workers and the
+        egress gateway drop every group.
+      - **The compile cache.** The helper hands each WASM host its cache
+        open, from the agent's cache root; on a VM that is in sandboxd's
+        data folder, which the runtime container does not mount here. It
+        is in the agent's own folder on the shared folder
+        (`SB_WASM_COMPILE_CACHE_DIR`, both containers). Without it every
+        host would compile from nothing, with a warning per start.
+      - **The V8 jail's base** is `/srv/isolate-jail` (the VM default),
+        outside every agent folder (the helper refuses a base inside one),
+        an `emptyDir` that `split-folders` makes root's, 0755. Each group's
+        `run` folder is a tmpfs the helper mounts and the agent writes in,
+        so the agent must see the helper's mounts: the volume is two-way
+        in the runtime container (the split pod's one two-way mount) and
+        `HostToContainer`, read only, in the agent. Kind showed the
+        agent's read-only bind stays read only at the top while each
+        propagated `run` tmpfs is writable, and a restarted agent sees
+        them. The supervisor's unmount at pod end (`SB_ISOLATE_JAIL_DIR`)
+        now names the split base.
+      - **workerd from a root folder.** The helper runs `ldd` on workerd
+        and copies it into the jails' base as root, so it must not come
+        from a folder the agent writes, and the runtime image has none.
+        Adding it there (131 MB) would grow every install's runtime image;
+        instead an init container, `workerd`, copies it from the release's
+        agent image into an `emptyDir` only the runtime container mounts,
+        read only (root, no capability; 2 s on kind). A workerd bump
+        reaches a split worker when its pod is made again, as the runtime
+        image's tools do.
+      - **The deny floor in the runtime container.** The helper builds the
+        WASM worker user's fence from its own environment and hands each
+        worker the floor file. The operator now stamps the floor lists
+        and the floor file into the runtime container too when its helper
+        runs WASM hosts (its own `SB_ENABLE_WASM`), and nowhere new
+        otherwise.
+      - **Kind** (Docker Desktop, kernel 5.10; `split.sh` with
+        `AEROL_K8S_WASM_V8=1`): every step passed, the new `hosts` step
+        too. A WASM sandbox and a V8 sandbox answered; their hosts ran in
+        the runtime container as uid 61000 and the jail's uid 1000; the
+        agent saw neither process; after an agent restart the same WASM
+        host and a workerd from before still ran, both sandboxes answered,
+        and the new sandboxd logged both taken over (V8: reloading none);
+        both deleted. With them on, the agent and helper restarts, the
+        rclone mount and `aerolvm k8s verify` passed as before, and a pod
+        delete took 1 s and left none of the 4 V8 jail mounts on the
+        machine. The kubernetes CI job runs split with both on.
 12. Docs, `EVIDENCE.md` and the capability matrix.
 
 ### 3.6 Tests
