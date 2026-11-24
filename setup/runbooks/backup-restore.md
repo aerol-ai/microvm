@@ -52,6 +52,13 @@ The archive does **not** contain Docker image layers, running containers, or
 external mounted storage. Recovered sandboxes must still be recreated from
 pullable images and valid credentials.
 
+In privilege mode split, `sandboxd` runs as the `sandboxd` user, which owns
+`/var/lib/sandboxd` and the certificate folders. The backup still runs as
+root, because it reads root's env files. It reads that user's folders without
+following any symbolic link out of them. A link is stored as a link. The
+backup also refuses a `state.db` that is a link, or that SQLite opens as
+another file.
+
 ## Pre-Restore Checklist
 
 1. Confirm the target cluster and node identity.

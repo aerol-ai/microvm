@@ -196,6 +196,16 @@ runs as the `sandboxd` user. `/etc/sandboxd/secrets` stays root's
 shared SSH host key go there as files that user owns.
 `SB_SSH_HOST_KEY_PATH` then names the key there.
 
+A copy of the shared key that an older run left in `/var/lib/sandboxd`
+is removed, as the `sandboxd` user, while the shared key is still set. If
+you later take the shared key out of the config, sandboxd then makes a
+key of its own instead of using the old shared one.
+
+The backup cron (`sandboxd_backup_enabled`) still runs `sandboxd backup` as
+root, because it must read root's env files in `/etc/sandboxd`. In split it
+reads the `sandboxd` user's folders without following a link out of them;
+see `setup/runbooks/backup-restore.md`.
+
 ## Connect this cluster to AOCR (mirror + auto-import)
 
 If you operate an [AOCR](https://github.com/aerolai/aocr) deployment alongside
