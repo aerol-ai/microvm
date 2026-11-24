@@ -402,8 +402,9 @@ func TestInstallPrivilegeModeSingleIsUnchanged(t *testing.T) {
 	}
 }
 
-// Split runs only what the helper covers today; anything else is refused
-// before the host is touched.
+// Split runs only what the helper covers; anything else is refused before
+// the host is touched. V8 isolates and Firecracker are the helper's since
+// M1 PRs 9, 9b, 14 and 14b (TestInstallPrivilegeModeSplitRunsIsolatesAndFirecracker).
 func TestInstallPrivilegeModeRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -413,8 +414,6 @@ func TestInstallPrivilegeModeRefusals(t *testing.T) {
 		{"not a mode", []string{"--privilege-mode", "half"}, "must be single or split"},
 		{"Docker", []string{"--privilege-mode", "split"}, "needs --with-containerd-engine"},
 		{"local", []string{"--privilege-mode", "split", "--local"}, "does not work with --cli-only or --local"},
-		{"V8 isolates", []string{"--privilege-mode", "split", "--with-containerd-engine", "--with-isolate"}, "--with-isolate yet"},
-		{"Firecracker", []string{"--privilege-mode", "split", "--with-containerd-engine", "--with-firecracker"}, "--with-firecracker or --with-isolate yet"},
 		{"root BuildKit", []string{"--privilege-mode", "split", "--with-containerd-engine", "--no-buildkit-rootless"}, "drop --no-buildkit-rootless"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -427,6 +426,170 @@ func TestInstallPrivilegeModeRefusals(t *testing.T) {
 				t.Fatalf("a refused run touched the host:\n%s", calls)
 			}
 		})
+	}
+}
+
+// stubRuntimeSteps replaces the steps of --with-firecracker and
+// --with-isolate that need KVM or download (tested in
+// internal/runtime/firecracker and integration-tests/safety) with ones that
+// log what they would install where.
+func (r *runRig) stubRuntimeSteps() {
+	r.t.Helper()
+	raw, err := os.ReadFile(r.script)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	const mainFlow = "\nif [[ \"$CONFIG_ONLY\" == \"true\" ]]; then\n\tif [[ $FAKE_EUID -ne 0 ]]; then\n"
+	stubs := `firecracker_preflight() { echo "firecracker_preflight" >>"$LOG"; }
+install_firecracker() { echo "install_firecracker kernel=$FIRECRACKER_KERNEL_PATH" >>"$LOG"; }
+register_isolate_runtime() { echo "register_isolate_runtime" >>"$LOG"; }
+`
+	src := strings.Replace(string(raw), mainFlow, "\n"+stubs+mainFlow, 1)
+	if src == string(raw) {
+		r.t.Fatal("could not stub the runtime steps")
+	}
+	if err := os.WriteFile(r.script, []byte(src), 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// The lines --with-isolate and --with-firecracker wrote before split could
+// run them, with the rig's ids (990) and paths. Single must write exactly
+// these, and split these and more.
+func runtimeLines(r *runRig) []string {
+	return []string{
+		"SB_ENABLE_FIRECRACKER=true",
+		"SB_JAILER_UID=990",
+		"SB_JAILER_GID=990",
+		"SB_ENABLE_ISOLATE=true",
+		"SB_ISOLATE_JAIL_UID=990",
+		"SB_ISOLATE_JAIL_GID=990",
+		"SB_ISOLATE_JAIL_CHROOT_BASE=" + r.path("srv-isolate"),
+		"SB_ISOLATE_JAIL_CGROUP_ROOT=/sys/fs/cgroup/aerolvm-isolate",
+	}
+}
+
+// splitRuntimeLines are what split adds: the helper runs each V8 group in
+// its jail and each VM through the jailer, from this same file, so both
+// sides name one jailer, firecracker, chroot base and kernel, and the
+// kernel sits in a folder only root writes.
+var splitRuntimeLines = []string{
+	"SB_ISOLATE_USE_JAIL=true",
+	"SB_FIRECRACKER_USE_JAILER=true",
+	"SB_JAILER_BINARY=/usr/local/bin/jailer",
+	"SB_FIRECRACKER_BINARY=/usr/local/bin/firecracker",
+	"SB_JAILER_CHROOT_BASE=/srv/jailer",
+	"SB_FIRECRACKER_KERNEL=/usr/local/lib/aerolvm-firecracker/vmlinux",
+}
+
+// --privilege-mode split with --with-isolate and --with-firecracker: no
+// refusal; sandboxd.env carries what the helper needs for both; the kernel
+// is installed to root's folder; sandboxd may write the VMs' stage folders
+// under the jailer's chroot base (owners keep everything else root's); and
+// a re-run that changes nothing restarts nothing.
+func TestInstallPrivilegeModeSplitRunsIsolatesAndFirecracker(t *testing.T) {
+	r := newRunRig(t)
+	r.stubEngineSteps()
+	r.stubRuntimeSteps()
+	args := append(r.splitRelease("helper v0.7.8\n"), "--with-containerd-engine", "--privilege-mode", "split",
+		"--with-isolate", "--with-firecracker")
+	out, err := r.run(r.env("SANDBOXD_ACTIVE=false"), args...)
+	if err != nil {
+		t.Fatalf("install.sh: %v\n%s\ncalls:\n%s", err, out, r.calls())
+	}
+	env := lines(r.read("sandboxd/sandboxd.env"))
+	for _, want := range append(append(runtimeLines(r), splitRuntimeLines...), "SB_PRIVILEGE_MODE=split") {
+		if !env[want] {
+			t.Errorf("split sandboxd.env has no %q:\n%s", want, r.read("sandboxd/sandboxd.env"))
+		}
+	}
+	calls := r.calls()
+	r.inOrder(calls, "firecracker_preflight", "register_isolate_runtime",
+		"install_firecracker kernel=/usr/local/lib/aerolvm-firecracker/vmlinux", "sandboxd upgrade root-helper",
+		"systemctl enable --now aerolvm-rootd", "systemctl enable --now caddy sandboxd")
+	unit := r.read("systemd/system/sandboxd.service")
+	if want := "ReadWritePaths=" + r.path("varlib") + " -/run/aerolvm-procid -" + r.path("sandboxd") + "/tls -" +
+		r.path("sandboxd") + "/cluster-ca -/srv/jailer"; !lines(unit)[want] {
+		t.Errorf("split sandboxd.service has no line %q:\n%s", want, unit)
+	}
+	// The V8 group's run folder is the helper's tmpfs, mounted after
+	// sandboxd starts: the jail base itself stays read-only to sandboxd.
+	if strings.Contains(unit, "srv-isolate") {
+		t.Errorf("split sandboxd.service makes the V8 jail base writable:\n%s", unit)
+	}
+	nodeJSON := r.read("sandboxd/node.json")
+	for _, want := range []string{`"privilege_mode": "split"`, `"with_firecracker": true`, `"with_isolate": true`} {
+		if !strings.Contains(nodeJSON, want) {
+			t.Errorf("node.json has no %s:\n%s", want, nodeJSON)
+		}
+	}
+
+	// A re-run that changes nothing: the saved node, nothing restarts.
+	r.resetLog()
+	if out, err = r.run(r.env("SANDBOXD_ACTIVE=true"), r.splitRelease("helper v0.7.8\n")...); err != nil {
+		t.Fatalf("re-run: %v\n%s", err, out)
+	}
+	for _, never := range []string{"systemctl restart aerolvm-rootd", "systemctl restart sandboxd"} {
+		if strings.Contains(r.calls(), never) {
+			t.Errorf("the re-run did %q; calls:\n%s", never, r.calls())
+		}
+	}
+}
+
+// A split node that gets --with-isolate later: only sandboxd.env changes,
+// which the helper reads too, so the running helper starts again to serve
+// V8 groups (before, it restarted only for its own unit or rootd.env).
+func TestInstallPrivilegeModeSplitRestartsTheHelperForSharedSettings(t *testing.T) {
+	r := newRunRig(t)
+	r.stubEngineSteps()
+	r.stubRuntimeSteps()
+	base := append(r.splitRelease("helper v0.7.8\n"), "--with-containerd-engine", "--privilege-mode", "split")
+	if out, err := r.run(r.env("SANDBOXD_ACTIVE=false"), base...); err != nil {
+		t.Fatalf("install.sh: %v\n%s", err, out)
+	}
+	r.resetLog()
+	out, err := r.run(r.env("SANDBOXD_ACTIVE=true"), append(r.splitRelease("helper v0.7.8\n"), "--with-isolate")...)
+	if err != nil {
+		t.Fatalf("re-run with --with-isolate: %v\n%s", err, out)
+	}
+	if !lines(r.read("sandboxd/sandboxd.env"))["SB_ISOLATE_USE_JAIL=true"] {
+		t.Fatalf("sandboxd.env:\n%s", r.read("sandboxd/sandboxd.env"))
+	}
+	r.mustCall(r.calls(), "systemctl restart aerolvm-rootd")
+}
+
+// Single with --with-isolate and --with-firecracker writes what it wrote
+// before: the same runtime lines, none of split's, the kernel in sandboxd's
+// data folder (install.sh's default, sandboxd's too), and today's unit.
+func TestInstallPrivilegeModeSingleRuntimesUnchanged(t *testing.T) {
+	r := newRunRig(t)
+	r.stubEngineSteps()
+	r.stubRuntimeSteps()
+	out, err := r.run(r.env(), append(r.splitRelease("unused\n"), "--with-containerd-engine", "--with-isolate", "--with-firecracker")...)
+	if err != nil {
+		t.Fatalf("install.sh: %v\n%s", err, out)
+	}
+	raw := r.read("sandboxd/sandboxd.env")
+	env := lines(raw)
+	for _, want := range runtimeLines(r) {
+		if !env[want] {
+			t.Errorf("single sandboxd.env has no %q:\n%s", want, raw)
+		}
+	}
+	for _, never := range append(splitRuntimeLines, "SB_PRIVILEGE_MODE=split") {
+		if env[never] {
+			t.Errorf("single sandboxd.env has split's %q", never)
+		}
+	}
+	// The block install.sh wrote before, in its order and nothing between.
+	if want := strings.Join(runtimeLines(r)[3:], "\n") + "\n"; !strings.Contains(raw, want) {
+		t.Errorf("single sandboxd.env's V8 lines changed; want the block\n%s\nin:\n%s", want, raw)
+	}
+	r.mustCall(r.calls(), "install_firecracker kernel="+r.path("varlib")+"/firecracker/vmlinux")
+	want := strings.NewReplacer("/etc/sandboxd", r.path("sandboxd"), "/var/lib/sandboxd", r.path("varlib"),
+		"/run/sandboxd", r.path("run"), "PREFIX", r.path("bin")).Replace(singleUnit)
+	if got := r.read("systemd/system/sandboxd.service"); got != want {
+		t.Fatalf("single sandboxd.service:\n%s\nwant:\n%s", got, want)
 	}
 }
 

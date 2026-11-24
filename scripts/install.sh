@@ -58,6 +58,8 @@ JAILER_BIN="/usr/local/bin/jailer"
 FIRECRACKER_KERNEL_PATH="/var/lib/sandboxd/firecracker/vmlinux"
 FIRECRACKER_TEMPLATES_DIR="/var/lib/sandboxd/firecracker/templates"
 JAILER_CHROOT_BASE="/srv/jailer"
+# The V8 jail's chroot base (--with-isolate; SB_ISOLATE_JAIL_CHROOT_BASE).
+ISOLATE_JAIL_CHROOT_BASE="/srv/isolate-jail"
 # The jailer drops every firecracker process to this user. The daemon's
 # default (uid/gid 1000) is the first login user on most images — on AWS
 # Ubuntu that is `ubuntu`, with sudo — so the VMs get an identity that owns
@@ -230,6 +232,10 @@ ROOTD_ENV_FILE="/etc/sandboxd/rootd.env"
 ROOTD_SOCKET="/run/aerolvm-rootd/sock/root.sock"
 SPLIT_UPGRADE_STATE_DIR="/var/lib/aerolvm-upgrade"
 SPLIT_PROCID_DIR="/run/aerolvm-procid"
+# The Firecracker guest kernel in split (--with-firecracker): root links it
+# into every VM's jail, so it sits in a folder only root writes. Single
+# keeps it in sandboxd's data folder, which sandboxd's user owns in split.
+SPLIT_FIRECRACKER_KERNEL_PATH="/usr/local/lib/aerolvm-firecracker/vmlinux"
 # The privilege mode this node ran in before this run, read from sandboxd.env
 # (setup_privilege_mode): a change is a switch, which moves files' owners.
 PREVIOUS_PRIVILEGE_MODE=""
@@ -518,8 +524,11 @@ Options:
                                its root work. Needs --with-containerd-engine;
                                turns on --buildkit-rootless. Installs the
                                helper only once its release signature checks.
-                               Not yet with --with-isolate or
-                               --with-firecracker. Switching an existing node
+                               With --with-isolate and --with-firecracker the
+                               helper runs every V8 group in its jail and
+                               every VM through the jailer, and the guest
+                               kernel goes to a folder only root writes.
+                               Switching an existing node
                                keeps its sandboxes; --privilege-mode single
                                goes back.
   --runsc-path <path>          Absolute path to a pre-installed runsc binary.
@@ -1292,12 +1301,16 @@ load_saved_node_settings() {
 
 # check_privilege_mode checks --privilege-mode once the flags and the saved
 # settings are in (plans/security-gaps-m1-m4.md M1 PR 10). Split runs only
-# what the root helper does today: the containerd engine (Docker's socket is
-# as good as root, and nothing gates it), builds through rootless BuildKit
+# what the root helper does: the containerd engine (Docker's socket is as
+# good as root, and nothing gates it) and builds through rootless BuildKit
 # alone (a root buildkitd writes into containerd past the helper's gate, so
-# split turns --buildkit-rootless on), and no V8 isolates or Firecracker
-# yet (their host processes are M1 PR 9). sandboxd refuses each of these at
-# start too; refusing here stops a node that would never come up.
+# split turns --buildkit-rootless on). sandboxd refuses each of these at
+# start too; refusing here stops a node that would never come up. V8
+# isolates and Firecracker run through the helper (M1 PRs 9, 9b, 14 and
+# 14b): it builds each V8 group's jail and runs workerd, and runs every VM
+# through the jailer. Their split settings are isolate_environment's and
+# firecracker_environment's; the guest kernel moves to a folder only root
+# writes (SPLIT_FIRECRACKER_KERNEL_PATH).
 check_privilege_mode() {
 	case "$PRIVILEGE_MODE" in
 	single | split) ;;
@@ -1315,15 +1328,12 @@ check_privilege_mode() {
 		echo "--privilege-mode split needs --with-containerd-engine: Docker's socket is as good as root, and nothing gates it" >&2
 		exit 1
 	fi
-	if [[ "$WITH_FIRECRACKER" == "true" || "$WITH_ISOLATE" == "true" ]]; then
-		echo "--privilege-mode split does not run --with-firecracker or --with-isolate yet: the root helper does not start their host processes. Leave them off, or keep --privilege-mode single" >&2
-		exit 1
-	fi
 	if flag_given --no-buildkit-rootless; then
 		echo "--privilege-mode split builds images only with rootless BuildKit; drop --no-buildkit-rootless" >&2
 		exit 1
 	fi
 	BUILDKIT_ROOTLESS="true"
+	FIRECRACKER_KERNEL_PATH="$SPLIT_FIRECRACKER_KERNEL_PATH"
 }
 
 # secret_provider_lines prints the key-store settings write_environment
@@ -2581,15 +2591,8 @@ EOF
 		if ! getent passwd sandboxd-isolate >/dev/null 2>&1; then
 			useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-isolate
 		fi
-		ISOLATE_JAIL_UID="$(id -u sandboxd-isolate)"
-		ISOLATE_JAIL_GID="$(id -g sandboxd-isolate)"
-		{
-			echo "SB_ISOLATE_JAIL_UID=${ISOLATE_JAIL_UID}"
-			echo "SB_ISOLATE_JAIL_GID=${ISOLATE_JAIL_GID}"
-			echo "SB_ISOLATE_JAIL_CHROOT_BASE=/srv/isolate-jail"
-			echo "SB_ISOLATE_JAIL_CGROUP_ROOT=/sys/fs/cgroup/aerolvm-isolate"
-		} >> /etc/sandboxd/sandboxd.env
-		install -d -m 0755 /srv/isolate-jail
+		isolate_environment >> /etc/sandboxd/sandboxd.env
+		install -d -m 0755 "$ISOLATE_JAIL_CHROOT_BASE"
 	fi
 	# Containerd engine is opt-in and dark by default (plans/containerd-engine.md).
 	# Flipping SB_CONTAINER_ENGINE here does not remove dockerd; coexistence is
@@ -3855,8 +3858,16 @@ install_firecracker() {
 # firecracker_environment prints the sandboxd.env lines for
 # --with-firecracker. SB_ENABLE_FIRECRACKER also advertises "firecracker" to
 # cluster placement, even next to the SB_HOST_RUNTIMES --with-gvisor writes
-# (pkg/daemon supportedRuntimesForConfig appends it). Every path is the
-# daemon's default; only the jailer's identity has to be written.
+# (pkg/daemon supportedRuntimesForConfig appends it). In single every path
+# is the daemon's default; only the jailer's identity has to be written.
+#
+# In split the root helper runs each VM, and it reads these from this same
+# file (aerolvm-rootd.service loads sandboxd.env first), so the helper and
+# sandboxd name one jailer, one firecracker, one chroot base and one
+# kernel; each is written out rather than left to two defaults. The helper
+# refuses a VM without the jailer (it would run as root), and a kernel or
+# chroot base in a folder sandboxd's user writes: root links the kernel into
+# every VM's jail and makes, links and removes in the chroot base.
 firecracker_environment() {
 	local uid gid
 	uid="$(id -u "$JAILER_USER")"
@@ -3864,6 +3875,31 @@ firecracker_environment() {
 	echo "SB_ENABLE_FIRECRACKER=true"
 	echo "SB_JAILER_UID=$uid"
 	echo "SB_JAILER_GID=$gid"
+	[[ "${PRIVILEGE_MODE:-single}" == "split" ]] || return 0
+	echo "SB_FIRECRACKER_USE_JAILER=true"
+	echo "SB_JAILER_BINARY=$JAILER_BIN"
+	echo "SB_FIRECRACKER_BINARY=$FIRECRACKER_BIN"
+	echo "SB_JAILER_CHROOT_BASE=$JAILER_CHROOT_BASE"
+	echo "SB_FIRECRACKER_KERNEL=$FIRECRACKER_KERNEL_PATH"
+}
+
+# isolate_environment prints the sandboxd.env lines for --with-isolate's
+# jail: the jail user (made by write_environment), its chroot base and its
+# cgroup root. In split the root helper builds each group's jail and runs
+# workerd from this same file; it never runs a group unjailed (workerd would
+# be root), so split writes the switch out. The chroot base is a folder of
+# root's, outside every folder sandboxd's user writes: root links, mounts and
+# removes in it, and each group's run folder there is the helper's tmpfs.
+isolate_environment() {
+	local uid gid
+	uid="$(id -u sandboxd-isolate)"
+	gid="$(id -g sandboxd-isolate)"
+	echo "SB_ISOLATE_JAIL_UID=$uid"
+	echo "SB_ISOLATE_JAIL_GID=$gid"
+	echo "SB_ISOLATE_JAIL_CHROOT_BASE=$ISOLATE_JAIL_CHROOT_BASE"
+	echo "SB_ISOLATE_JAIL_CGROUP_ROOT=/sys/fs/cgroup/aerolvm-isolate"
+	[[ "${PRIVILEGE_MODE:-single}" == "split" ]] || return 0
+	echo "SB_ISOLATE_USE_JAIL=true"
 }
 
 install_cni_plugins() {
@@ -4405,6 +4441,7 @@ privilege_split_dropin() {
 # install_buildkit: the BuildKit drop-in names sandboxd's user.
 setup_privilege_mode() {
 	SPLIT_CONFIG_BEFORE="$(split_fingerprint)"
+	SPLIT_SHARED_ENV_BEFORE="$(split_shared_env_fingerprint)"
 	PREVIOUS_PRIVILEGE_MODE="$(env_file_value "$SANDBOXD_ENV_FILE" SB_PRIVILEGE_MODE)"
 	PREVIOUS_PRIVILEGE_MODE="${PREVIOUS_PRIVILEGE_MODE:-single}"
 	[[ "$PRIVILEGE_MODE" == "split" ]] || return 0
@@ -4596,11 +4633,21 @@ EOF
 # socket. RuntimeDirectory makes /run/sandboxd sandboxd's and keeps it
 # across restarts: the sandboxes' files there outlive a sandboxd restart.
 split_sandboxd_unit() {
-	local groups="$ROOTD_SOCKET_GROUP $WASM_WORKER_GROUP" runtime="sandboxd"
+	local groups="$ROOTD_SOCKET_GROUP $WASM_WORKER_GROUP" runtime="sandboxd" writable=""
 	# --pat-scope host: sandboxd gives Caddy its public API socket by group.
 	if [[ "${PAT_SCOPE:-any}" == "host" ]]; then
 		groups+=" caddy"
 		runtime+=" sandboxd-public"
+	fi
+	# --with-firecracker: the helper makes a stage folder of sandboxd's for
+	# each VM, <chroot base>/firecracker/<id>/stage, and sandboxd puts files
+	# there for the helper to move into the jail (a start's disk copies, the
+	# snapshot and template files it shares), but the system is read-only to
+	# sandboxd. Only that folder is sandboxd's there; the chroot base, each
+	# jail and its chroot stay root's or the jailer user's, so this lifts the
+	# read-only mount, not the owners.
+	if [[ "${WITH_FIRECRACKER:-false}" == "true" ]]; then
+		writable+=" -$JAILER_CHROOT_BASE"
 	fi
 	cat <<EOF
 [Unit]
@@ -4632,7 +4679,7 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/sandboxd -$SPLIT_PROCID_DIR -/etc/sandboxd/tls -/etc/sandboxd/cluster-ca
+ReadWritePaths=/var/lib/sandboxd -$SPLIT_PROCID_DIR -/etc/sandboxd/tls -/etc/sandboxd/cluster-ca$writable
 Restart=always
 RestartSec=5
 TimeoutStartSec=60
@@ -4754,6 +4801,14 @@ split_fingerprint() {
 		"$(privilege_split_dropin aerolvm-egress-gateway.socket)" "$(privilege_split_dropin aerolvm-egress-gateway.service)" 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
 }
 
+# split_shared_env_fingerprint is the settings the helper shares with
+# sandboxd (aerolvm-rootd.service loads sandboxd.env and cluster.env): a run
+# that turns V8 isolates or Firecracker on for a split node changes only
+# these, and the running helper must start again to serve them.
+split_shared_env_fingerprint() {
+	{ cat "$SANDBOXD_ENV_FILE" /etc/sandboxd/cluster.env 2>/dev/null || true; } | cksum | cut -d' ' -f1-2
+}
+
 # leave_split_mode is the way back to single (--privilege-mode single on a
 # split node): sandboxd stops, every file in its folders that sandboxd's
 # user owns becomes root's again (other users' files keep their owner, and
@@ -4811,7 +4866,8 @@ restart_split_services() {
 		systemctl stop sandboxd
 	fi
 	if systemctl is-active --quiet aerolvm-rootd 2>/dev/null; then
-		if [[ "$ROOTD_CHANGED" == "true" || "$(split_fingerprint)" != "${SPLIT_CONFIG_BEFORE:-}" ]]; then
+		if [[ "$ROOTD_CHANGED" == "true" || "$(split_fingerprint)" != "${SPLIT_CONFIG_BEFORE:-}" ||
+			"$(split_shared_env_fingerprint)" != "${SPLIT_SHARED_ENV_BEFORE:-}" ]]; then
 			echo "Restarting the root helper onto its new binary or settings; sandboxes keep running"
 			systemctl restart aerolvm-rootd
 		fi
