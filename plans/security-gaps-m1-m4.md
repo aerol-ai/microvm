@@ -473,6 +473,63 @@ Each is small and stands alone. Together they shrink the root surface now.
    root.
 8. Mounts (closes the F13 follow-up).
 9. Host processes: WASM, V8, Firecracker jailer and TAP (closes C14).
+9c. Split mode's last Firecracker gaps (PR 18): the warm VM pool and a
+    disk saved as a container image.
+    **What building it taught us (PR 18, 2026-11-24).**
+    - **The helper knows a warm slot by its own name, for the VM's whole
+      life.** A slot ID (`vmms-` and 16 hex) passes the helper's VM ID rule
+      (`CheckHostID`, a sandbox ID's shape), so the slot's jail, cgroup and
+      jailer run under it from the refill to the end. The helper keeps no
+      state of its own about a VM: each call looks at the jail and the
+      group's processes, so a helper restart changes nothing. A claim needs
+      no new helper call and no rename: the driver keeps the slot behind
+      the sandbox (as single mode does, where the slot's run dir serves the
+      sandbox), and every later call for the sandbox (stop, the copy out,
+      destroy, adoption) names the jail its run dir is in, worked out from
+      the helper's own layout. A rename at claim time was the other way:
+      it costs a helper call on the create path and leaves a window where
+      the jail, the group and the record disagree after a crash.
+    - **What each step does in split.** Refill: the jail, the TAP with the
+      snapshot's MAC, the jailer, the template's memory, state and disk
+      shared read-only in one call, the overlay placeholder moved in, and
+      the sockets given to the agent's group, all off the create path.
+      Claim: with no overlay asked for, no helper call (the placeholder
+      the refill moved in is unwritten, as the VM never ran); with one,
+      the helper makes its filesystem and moves it in, which also gives
+      the sockets again. The slot row's run dir must be that slot's own
+      jail, or the claim is refused before any call. Destroy of a claimed
+      slot and of an unclaimed one: `StopHost` by the slot's ID, which
+      kills the group and removes the jail; the orphan reap does the same
+      for a slot a restart left. Adoption after an agent restart opens the
+      VM by the jail its record's run dir names.
+    - **The fresh-chroot rule holds by itself.** Slot IDs are random and
+      never reused, and the helper makes a chroot again from nothing
+      whenever no process runs in the VM's group, so a slot whose VM died
+      never hands its files to the next one.
+    - **The lease fence is unchanged.** Split VMs cannot be frozen
+      (their groups are root's), so `FenceReady` keeps every
+      recreate-policy VM, warm or cold, off a node that writes the lease
+      file, and the lease stops a VM instead. So the lease file never
+      names a split VM's group, and a claimed slot's group keeping the
+      slot's name changes nothing there.
+    - **Adoption found one more thing.** A cold VM adopted after a
+      sandboxd restart had its jail removed by a plain remove on destroy,
+      which the agent cannot do in split: the destroy failed once and the
+      jail stayed on disk. An adopted split VM's jail now goes through the
+      helper (`StopHost`), as a VM this sandboxd started does.
+    - **Images: the export VM is one more VM of the helper's.** The export
+      VM's root image (toolboxd as init) is built by the helper's
+      `MakeFilesystem` in a jail of its own and moved into sandboxd's
+      folder, as a template's disk is; the export VM's jail, kernel and
+      sockets come from the same calls as any VM; the image goes in
+      read-only (shared) and the disk copy goes in as the jailer's under
+      the overlay's name, the one writable disk name the helper takes. A
+      running sandbox's disk is handed out and copied into the export VM's
+      stage folder; a stopped one's is sandboxd's own already. The image
+      reaches containerd through the gate with the calls a pull makes
+      (content writes, an image record, an unpack); the agent names no path
+      root writes. The boot sweep stops a crash's leftover export jails by
+      ID.
 10b. Builds (eng review D14). First step done separately (PR #1371): build
     steps run on the sandboxes' CNI network behind the egress floor and node
     guard. Then: buildkitd runs rootless (BuildKit's rootless

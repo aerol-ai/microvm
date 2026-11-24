@@ -98,9 +98,9 @@ TestChartRefusesWhatSplitRefuses keeps this list and the daemon's in step. */ -}
 {{- /* strconv.ParseBool's words, which sandboxd reads switches with. */ -}}
 {{- $true := list "1" "t" "T" "TRUE" "true" "True" -}}
 {{- $false := list "0" "f" "F" "FALSE" "false" "False" -}}
-{{- /* Firecracker: sandboxd runs it in split, except with the VM pool
-(privmode's firecracker_warm_pool step), but this chart does not wire it
-into a split worker pod yet, and no live run has proven it there. */}}
+{{- /* Firecracker: sandboxd runs it in split, its VM pool and disk images
+too (M1 PR 18), but this chart does not wire it into a split worker pod
+yet, and no live run has proven it there. */}}
 {{- if $w.firecracker.enabled }}
 - worker.firecracker.enabled is true: this chart does not run Firecracker in a split worker pod yet. Set it to false.
 {{- end }}

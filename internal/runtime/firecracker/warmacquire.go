@@ -184,13 +184,33 @@ func (d *Driver) tryAcquireWarm(
 	// process (which runs under that chroot when jailer is enabled)
 	// can open it. We're re-using the per-slot RunDir as the sandbox's
 	// runtime directory for the lifetime of this Acquire.
+	//
+	// In privilege mode split (M1 PR 18) the slot's jail serves the
+	// sandbox the same way, under the slot's ID: the row's run dir must be
+	// that slot's own chroot, or the claim stops before any helper call.
+	// The overlay is built in the jail's stage folder and moved in.
+	warmDir := slot.RunDir
+	if d.split != nil {
+		jail, root, stage, err := d.splitJailOf(slot.RunDir)
+		if err != nil || jail != slot.ID || slot.RunDir != root {
+			return nil, false, fmt.Errorf("firecracker runtime: warm slot %s: its run dir %s is not its own jail", slot.ID, slot.RunDir)
+		}
+		warmDir = stage
+	}
 	warmOverlayPath := overlayPath
+	// warmOverlayInChroot: a split claim with no overlay of its own takes
+	// the placeholder the refill moved in, unwritten as the VM never ran.
+	warmOverlayInChroot := false
 	if req.OverlaySizeGB > 0 {
-		warmOverlayPath = filepath.Join(slot.RunDir, overlayFileName)
+		warmOverlayPath = filepath.Join(warmDir, overlayFileName)
 		if err := allocateSparse(warmOverlayPath, int64(req.OverlaySizeGB)<<30); err != nil {
 			return nil, false, fmt.Errorf("firecracker runtime: overlay alloc (warm): %w", err)
 		}
-		if d.cfg.OverlayMkfs {
+		if d.cfg.OverlayMkfs && d.split != nil {
+			if err := d.makeOverlayFS(ctx, warmOverlayPath); err != nil {
+				return nil, false, fmt.Errorf("firecracker runtime: mkfs.ext4 overlay (warm): %w", err)
+			}
+		} else if d.cfg.OverlayMkfs {
 			if d.cfg.Mkfs4Bin == "" {
 				return nil, false, fmt.Errorf("firecracker runtime: SB_FIRECRACKER_OVERLAY_MKFS=true but SB_FIRECRACKER_MKFS_BIN is unset")
 			}
@@ -200,7 +220,9 @@ func (d *Driver) tryAcquireWarm(
 			}
 		}
 	}
-	if snap.HasOverlay && warmOverlayPath == "" {
+	if snap.HasOverlay && warmOverlayPath == "" && d.split != nil {
+		warmOverlayPath, warmOverlayInChroot = filepath.Join(slot.RunDir, overlayFileName), true
+	} else if snap.HasOverlay && warmOverlayPath == "" {
 		warmOverlayPath = filepath.Join(slot.RunDir, overlayFileName)
 		if err := allocateSparse(warmOverlayPath, overlayPlaceholderBytes); err != nil {
 			return nil, false, fmt.Errorf("firecracker runtime: overlay placeholder alloc (warm): %w", err)
@@ -238,9 +260,12 @@ func (d *Driver) tryAcquireWarm(
 	// The snapshot baked in the template's placeholder overlay; we
 	// swap to this sandbox's per-sandbox file before Resume.
 	if warmOverlayPath != "" {
-		warmOverlayAPIPath, err := d.chrootFilePath(slot.RunDir, warmOverlayPath, overlayFileName)
-		if err != nil {
-			return nil, false, fmt.Errorf("firecracker runtime: warm stage overlay for API: %w", err)
+		warmOverlayAPIPath := overlayFileName
+		if !warmOverlayInChroot {
+			warmOverlayAPIPath, err = d.chrootFilePath(slot.RunDir, warmOverlayPath, overlayFileName)
+			if err != nil {
+				return nil, false, fmt.Errorf("firecracker runtime: warm stage overlay for API: %w", err)
+			}
 		}
 		if err := client.PatchDrive(ctx, overlayDriveID, firecracker.DrivePatch{
 			DriveID:    overlayDriveID,
@@ -266,6 +291,14 @@ func (d *Driver) tryAcquireWarm(
 	// dial. Dialing tapSlot.VsockCID would race the guest, which is
 	// listening on the snapshot's CID baked in at template build.
 	vsockPath := filepath.Join(slot.RunDir, hostVsockUDSName)
+	if d.split != nil && !agentSocket(vsockPath) {
+		// The refill shared the VM's sockets after its load; should the
+		// vsock socket not be sandboxd's group's yet, the helper shares it
+		// now (one call, only then).
+		if _, _, err := d.split.PrepareFirecracker(ctx, slot.ID); err != nil {
+			return nil, false, fmt.Errorf("firecracker runtime: warm share sockets: %w", err)
+		}
+	}
 	handshakeStart := time.Now()
 	if err := d.vsockHandshake(ctx, vsockPath, slot.VsockCID); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm vsock handshake: %w", err)

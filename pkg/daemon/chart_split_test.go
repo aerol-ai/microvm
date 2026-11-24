@@ -80,10 +80,9 @@ func chartGapRows() []chartGapRow {
 // firecrackerGapRows are the chart's Firecracker refusals. The chart refuses
 // worker.firecracker.enabled whole in split: it does not wire Firecracker
 // into a split worker pod, and no live run has proven it, so the first two
-// rows are the chart's alone. sandboxd's own refusals are narrower (M1 PRs
-// 9b, #1425, #1426): a worker with the VM pool waits for the helper's warm
-// pool step, and one without the jailer is never split. When a privmode
-// step is renamed again, change only the step name here.
+// rows are the chart's alone. sandboxd's own refusal is narrower (M1 PRs
+// 9b, #1425, #1426, PR 18): one without the jailer is never split; the VM
+// pool and disk images run in split since PR 18.
 func firecrackerGapRows() []chartGapRow {
 	const fcOn = "worker.firecracker.enabled=true"
 	// fc is a split worker with Firecracker on as the chart renders it:
@@ -96,14 +95,10 @@ func firecrackerGapRows() []chartGapRow {
 			}
 		}
 	}
-	vmPool := privmode.StepFirecrackerWarmPool
 	return []chartGapRow{
 		{name: "Firecracker", flags: []string{"--set", fcOn}, chart: "worker.firecracker.enabled"},
 		{name: "Firecracker in extraEnv", flags: []string{"--set", "worker.extraEnv.SB_ENABLE_FIRECRACKER=true"},
 			chart: "worker.extraEnv.SB_ENABLE_FIRECRACKER"},
-		{name: "Firecracker's VM pool", flags: []string{"--set", fcOn, "--set", "worker.extraEnv.SB_FIRECRACKER_VMM_POOL_ENABLED=true"},
-			chart: "worker.firecracker.enabled", env: "SB_FIRECRACKER_VMM_POOL_ENABLED",
-			set: fc(func(c *config.Config, v string) { c.FirecrackerVMMPoolEnabled = isTrue(v) }), step: vmPool},
 		{name: "Firecracker without the jailer", flags: []string{"--set", fcOn, "--set", "worker.extraEnv.SB_FIRECRACKER_USE_JAILER=false"},
 			chart: "worker.firecracker.enabled", env: "SB_FIRECRACKER_USE_JAILER",
 			set: fc(func(c *config.Config, v string) { c.UseJailer = isTrue(v) }), want: "SB_FIRECRACKER_USE_JAILER=true"},
@@ -120,11 +115,13 @@ func TestChartRefusalsCoverEveryDaemonGap(t *testing.T) {
 	}
 	byName := privmodeSteps(t)
 	var steps []privmode.Step
+	found := 0
 	for _, d := range f.Decls {
 		fn, ok := d.(*ast.FuncDecl)
 		if !ok || (fn.Name.Name != "checkPrivilegeMode" && fn.Name.Name != "checkSplitWasm") {
 			continue
 		}
+		found++
 		ast.Inspect(fn, func(n ast.Node) bool {
 			sel, ok := n.(*ast.SelectorExpr)
 			if !ok {
@@ -141,8 +138,10 @@ func TestChartRefusalsCoverEveryDaemonGap(t *testing.T) {
 			return true
 		})
 	}
-	if len(steps) == 0 {
-		t.Fatal("found no privmode step in checkPrivilegeMode")
+	// Since M1 PR 18 checkPrivilegeMode names no step; the two functions
+	// must still be there, or this test reads nothing.
+	if found != 2 {
+		t.Fatalf("found %d of checkPrivilegeMode and checkSplitWasm in privilege_mode.go", found)
 	}
 	covered := map[privmode.Step]bool{}
 	for _, r := range chartGapRows() {

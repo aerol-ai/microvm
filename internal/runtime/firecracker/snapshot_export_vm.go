@@ -81,7 +81,8 @@ type exportHelperImages struct {
 // and the directories it mounts on. It is attached read-only, so every
 // export shares it.
 func (d *Driver) exportHelperRootfs(ctx context.Context) (string, error) {
-	if d.cfg.ToolboxBinaryPath == "" || d.cfg.Mkfs4Bin == "" {
+	// In privilege mode split the root helper runs its own mkfs.ext4.
+	if d.cfg.ToolboxBinaryPath == "" || (d.cfg.Mkfs4Bin == "" && d.split == nil) {
 		return "", errors.New("a snapshot needs the toolbox binary and mkfs.ext4 configured, to build its export VM")
 	}
 	info, err := os.Stat(d.cfg.ToolboxBinaryPath)
@@ -137,7 +138,22 @@ func (d *Driver) buildExportHelperImage(ctx context.Context, dir, image string) 
 	}
 	tmp := image + ".tmp"
 	_ = os.Remove(tmp)
-	if out, err := runHelperMkfs(ctx, d.cfg.Mkfs4Bin, "-q", "-F", "-t", "ext4", "-L", "aerolvm-export",
+	if d.split != nil {
+		// The root helper makes a filesystem only in a VM's stage folder,
+		// as sandboxd's own user seen as root, so the image's files come
+		// out root's as single mode's root mkfs makes them: it is built in
+		// a jail of its own and moved here (M1 PR 18).
+		if err := d.splitBuildInJail(ctx, exportHelperID(), "export VM image", tmp, func(stageOut string) error {
+			id, name, err := d.splitJailID(stageOut)
+			if err != nil {
+				return err
+			}
+			return d.split.MakeFilesystem(ctx, id, name, stage, exportHelperImageMiB)
+		}); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	} else if out, err := runHelperMkfs(ctx, d.cfg.Mkfs4Bin, "-q", "-F", "-t", "ext4", "-L", "aerolvm-export",
 		"-E", "root_owner=0:0", "-d", stage, tmp, fmt.Sprintf("%dM", exportHelperImageMiB)); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("mkfs.ext4: %w: %s", err, strings.TrimSpace(string(out)))
@@ -209,12 +225,18 @@ func (d *Driver) exportViaHelper(ctx context.Context, sandboxID, imageRef, workD
 	}
 	// Jailed, the drive must be inside the chroot, which is on disk. Not
 	// jailed, the run dir is tmpfs, and a disk copy there would be held in
-	// memory: it goes in the export's work dir.
-	diskDir := workDir
+	// memory: it goes in the export's work dir. In privilege mode split the
+	// copy is built in the jail's stage folder and moved in as the
+	// jailer's under the overlay's name, the writable disk name the helper
+	// takes (M1 PR 18).
+	diskDir, diskName := workDir, exportDiskFileName
 	if d.cfg.UseJailer {
-		diskDir = runDir
+		diskDir = stageDirOf(handle)
 	}
-	diskCopy := filepath.Join(diskDir, exportDiskFileName)
+	if d.split != nil {
+		diskName = overlayFileName
+	}
+	diskCopy := filepath.Join(diskDir, diskName)
 	if err := fill(diskCopy); err != nil {
 		return "", err
 	}
@@ -235,6 +257,13 @@ func (d *Driver) exportViaHelper(ctx context.Context, sandboxID, imageRef, workD
 	}
 	if err := client.Action(ctx, firecracker.Action{ActionType: "InstanceStart"}); err != nil {
 		return "", fmt.Errorf("export VM: start instance: %w", err)
+	}
+	if d.split != nil {
+		// The vsock socket is bound now: the helper gives it to
+		// sandboxd's group, as on a cold boot.
+		if err := shareSockets(ctx, handle); err != nil {
+			return "", fmt.Errorf("export VM: share sockets: %w", err)
+		}
 	}
 	vsockPath := filepath.Join(runDir, hostVsockUDSName)
 	if err := d.vsockHandshake(ctx, vsockPath, exportHelperCID); err != nil {
@@ -276,7 +305,7 @@ func (d *Driver) configureExportHelper(ctx context.Context, client VMMClient, ru
 	}); err != nil {
 		return fmt.Errorf("export VM: root drive: %w", err)
 	}
-	disk, err := d.chrootFilePath(runDir, diskCopy, exportDiskFileName)
+	disk, err := d.chrootFilePath(runDir, diskCopy, filepath.Base(diskCopy))
 	if err != nil {
 		return fmt.Errorf("export VM: stage the disk copy: %w", err)
 	}

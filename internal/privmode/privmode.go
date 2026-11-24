@@ -50,21 +50,16 @@ type Step string
 // The steps split mode does not cover yet, each with the helper calls it
 // waits for (plan §3.5).
 const (
-	StepImageUser           Step = "image_user"
-	StepDiskQuota           Step = "disk_quota"
-	StepFirecrackerWarmPool Step = "firecracker_warm_pool"
-	StepFirecrackerImages   Step = "firecracker_images"
-	StepContainerFile       Step = "container_files"
+	StepImageUser     Step = "image_user"
+	StepDiskQuota     Step = "disk_quota"
+	StepContainerFile Step = "container_files"
 )
 
 // steps say what each step is, for the operator who meets the error.
 var steps = map[Step]string{
-	StepImageUser: "reading an image's users from its root filesystem",
-	StepDiskQuota: "the disk quota on a sandbox's writable layer",
-	StepFirecrackerWarmPool: "the Firecracker warm VM pool (SB_FIRECRACKER_VMM_POOL_ENABLED), whose paused VMs run under their slot's ID " +
-		"until a sandbox claims them",
-	StepFirecrackerImages: "a Firecracker sandbox's disk saved as a container image, which a second VM reads",
-	StepContainerFile:     "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
+	StepImageUser:     "reading an image's users from its root filesystem",
+	StepDiskQuota:     "the disk quota on a sandbox's writable layer",
+	StepContainerFile: "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
 }
 
 // Gap is root work this build's split mode cannot do yet. It matches

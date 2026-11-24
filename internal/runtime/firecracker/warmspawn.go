@@ -101,10 +101,15 @@ type WarmHandle interface {
 //     Acquire path PATCHes the drive's path_on_host before Resume.
 //
 //   - Issuing PATCH /vm state=Resumed and the vsock handshake.
+//
+// In privilege mode split (M1 PR 18) the slot's jail, group and jailer run
+// under the slot's ID for the VM's whole life, claimed or not: the root
+// helper knows a VM by that name alone. The template's memory, state and
+// disk go in read-only in one helper call, the overlay placeholder is built
+// in the stage folder and moved in, and the helper gives the VM's sockets to
+// sandboxd's group after the load, so a claim needs no helper call of its
+// own (tryAcquireWarm).
 func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandle, error) {
-	if err := d.splitGap(errSplitWarmPool); err != nil {
-		return nil, fmt.Errorf("firecracker warm-spawn: %w", err)
-	}
 	if d.cfg.KernelImage == "" {
 		return nil, fmt.Errorf("firecracker warm-spawn: KernelImage not configured (SB_FIRECRACKER_KERNEL): %w",
 			models.ErrRuntimeNotImplemented)
@@ -227,9 +232,20 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	// paused so the Acquire code can PATCH per-sandbox state on top
 	// of the snapshot's references before issuing Resume.
 	client := d.newClient(handle.APISocket())
-	snapshotMemoryPath, snapshotStatePath, err := d.stageSnapshotLoadPaths(handle.RunDir(), req.SnapshotMemoryPath, req.SnapshotStatePath)
-	if err != nil {
-		return nil, fmt.Errorf("firecracker warm-spawn: stage snapshot load artifacts: %w", err)
+	var snapshotMemoryPath, snapshotStatePath string
+	if d.split != nil {
+		// The three read-only files in one helper call, as the cold load
+		// shares them; they stay sandboxd's, with the jailer's group reading.
+		if err := d.splitShare(ctx, handle.RunDir(), sharedFile{sandboxSnapshotMemoryFileName, req.SnapshotMemoryPath},
+			sharedFile{sandboxSnapshotStateFileName, req.SnapshotStatePath}, sharedFile{rootfsFileName, req.RootfsPath}); err != nil {
+			return nil, fmt.Errorf("firecracker warm-spawn: stage snapshot load artifacts: %w", err)
+		}
+		snapshotMemoryPath, snapshotStatePath = sandboxSnapshotMemoryFileName, sandboxSnapshotStateFileName
+	} else {
+		snapshotMemoryPath, snapshotStatePath, err = d.stageSnapshotLoadPaths(handle.RunDir(), req.SnapshotMemoryPath, req.SnapshotStatePath)
+		if err != nil {
+			return nil, fmt.Errorf("firecracker warm-spawn: stage snapshot load artifacts: %w", err)
+		}
 	}
 	// The snapshot's root drive names rootfs.ext4 (chroot-relative under
 	// the jailer), and LoadSnapshot opens it, so it is staged here, the
@@ -240,15 +256,17 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	// to the template's inode is never written through this VM; the guest
 	// writes to the overlay. The pool-hit path reuses this file: it is the
 	// rootfs the paused VM was loaded against.
-	rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
-	if err := linkOrCopyRootfs(req.RootfsPath, rootfsPath); err != nil {
-		return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
-	}
-	if _, err := d.chrootFilePath(handle.RunDir(), rootfsPath, rootfsFileName); err != nil {
-		return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
+	if d.split == nil {
+		rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
+		if err := linkOrCopyRootfs(req.RootfsPath, rootfsPath); err != nil {
+			return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
+		}
+		if _, err := d.chrootFilePath(handle.RunDir(), rootfsPath, rootfsFileName); err != nil {
+			return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
+		}
 	}
 	if req.HasOverlay {
-		overlayPath := filepath.Join(handle.RunDir(), overlayFileName)
+		overlayPath := filepath.Join(stageDirOf(handle), overlayFileName)
 		if err := allocateSparse(overlayPath, overlayPlaceholderBytes); err != nil {
 			return nil, fmt.Errorf("firecracker warm-spawn: overlay placeholder alloc: %w", err)
 		}
@@ -270,6 +288,13 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 		}},
 	}); err != nil {
 		return nil, fmt.Errorf("firecracker warm-spawn: LoadSnapshot: %w", err)
+	}
+	if d.split != nil {
+		// The load bound the vsock socket: the helper gives it to
+		// sandboxd's group now, off the create path.
+		if err := shareSockets(ctx, handle); err != nil {
+			return nil, fmt.Errorf("firecracker warm-spawn: share sockets: %w", err)
+		}
 	}
 
 	d.logger.Info("firecracker warm-spawn: paused VMM ready",

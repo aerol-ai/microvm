@@ -64,6 +64,16 @@ func (d *Driver) cleanupOrphanWarmSlot(ctx context.Context, slot vmmpool.Slot) e
 	if slot.RunDir == "" {
 		return nil
 	}
+	if d.split != nil {
+		// In privilege mode split the slot's jail is the root helper's: it
+		// goes by the slot's ID, and only when the row's run dir is that
+		// very jail (M1 PR 18).
+		jail, root, _, err := d.splitJailOf(slot.RunDir)
+		if err != nil || jail != slot.ID || slot.RunDir != root {
+			return fmt.Errorf("refusing to remove a jail that is not slot %s's own: %s", slot.ID, slot.RunDir)
+		}
+		return d.split.StopFirecracker(ctx, slot.ID)
+	}
 	// The same guard as vmm.Cleanup: never a path outside the run dir root.
 	root := d.runDirRoot()
 	if root == "" || !strings.HasPrefix(slot.RunDir, root+string(filepath.Separator)) {

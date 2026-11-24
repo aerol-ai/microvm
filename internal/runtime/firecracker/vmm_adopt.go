@@ -416,8 +416,12 @@ func (d *Driver) AdoptRunningVMs(ctx context.Context, keep VMMKeeper) int {
 func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) bool {
 	var proc liveProcess
 	var err error
+	jail := ""
 	if d.split != nil {
-		proc, err = d.splitOpenProcess(ctx, rec.SandboxID, rec.PID, rec.StartTicks)
+		// The helper knows the VM by its jail: the sandbox's for a cold
+		// boot, the warm slot's for one claimed from the pool (M1 PR 18).
+		jail = d.splitRecordJail(rec)
+		proc, err = d.splitOpenProcess(ctx, jail, rec.PID, rec.StartTicks)
 	} else {
 		proc, err = openProcess(rec.PID, rec.StartTicks)
 	}
@@ -429,6 +433,15 @@ func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) boo
 		return false
 	}
 	handle := &adoptedVMM{rec: rec, proc: proc, cleanupRoot: d.runDirRoot()}
+	if d.split != nil {
+		// sandboxd cannot remove a jail: the helper does, by its name.
+		h := d.split
+		handle.removeJail = func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), splitCallWait)
+			defer cancel()
+			return h.StopFirecracker(ctx, jail)
+		}
+	}
 	want, err := keep(ctx, rec.SandboxID)
 	if err != nil {
 		// Unknown is not "stopped": keep the VM, and reconcile decides
@@ -610,6 +623,9 @@ type adoptedVMM struct {
 	proc        liveProcess
 	cleanupRoot string
 	closeOnce   sync.Once
+	// removeJail removes the VM's jail through the root helper (privilege
+	// mode split); nil in single mode, where Cleanup removes the run dir.
+	removeJail func() error
 }
 
 func (h *adoptedVMM) APISocket() string { return h.rec.APISocket }
@@ -681,6 +697,9 @@ func (h *adoptedVMM) close() {
 func (h *adoptedVMM) Cleanup() error {
 	if !h.rec.OwnsRunDir || h.rec.RunDir == "" {
 		return nil
+	}
+	if h.removeJail != nil {
+		return h.removeJail()
 	}
 	if h.cleanupRoot == "" || !strings.HasPrefix(h.rec.RunDir, h.cleanupRoot+string(filepath.Separator)) {
 		return fmt.Errorf("vmm: refusing to clean up path outside %q: %s", h.cleanupRoot, h.rec.RunDir)
