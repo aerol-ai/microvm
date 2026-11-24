@@ -11,6 +11,23 @@ The AerolVM server, `sandboxd`, reads every API request. It also sets up each sa
 
 Use split when you run code from people you do not trust. Use it too when your security team asks that no internet-facing code runs as root. It is new in v0.7.8. The default is still `single`, the mode every earlier release used.
 
+## Before you start
+
+- **AerolVM v0.7.8 or later, with a signed helper.** Split runs only a helper signed with an AerolVM release key. See [Limits](#limits).
+- **The containerd engine.** Docker, and so every local install (`--local`), runs in `single` only. Split also needs containerd's pool of network namespaces turned on. The installer and the Helm chart turn both on. Terraform and Ansible refuse a config without them.
+- **The runtimes' fences left on.** Firecracker runs through its jailer, and V8 isolates in their jail. WebAssembly runs on the default engine, wazero, with each worker dropped to its own user. All three are the defaults.
+- **On Kubernetes, Firecracker off.** The chart does not run Firecracker in a split worker pod yet.
+- **On Terraform, the module's one-line join.** See [A Terraform cluster](#a-terraform-cluster). The plan lists anything else split cannot run with.
+- **For image builds on a server, a kernel with ACLs on `/run`** (tmpfs ACLs, as Ubuntu and Amazon Linux have). Without them, sandboxes still work but builds fail.
+- **S3 mounts with their own keys.** See [What changes for your code](#what-changes-for-your-code).
+
+Words used on this page:
+
+- **Typed call:** a request with fixed fields, such as a sandbox ID or a network policy, instead of free text such as a command to run.
+- **Warm pool:** sandboxes started ahead of time and kept waiting, so a create can claim one instead of starting from nothing.
+- **Move:** on Kubernetes, taking a running sandbox to another worker when its machine is replaced. A gVisor move keeps the sandbox's memory.
+- **Toolbox token:** the secret `sandboxd` uses to reach `toolboxd`, the small agent inside each sandbox that runs its commands and moves its files.
+
 ## How it works
 
 ```mermaid
@@ -25,7 +42,7 @@ flowchart LR
 ```
 
 - **The helper lets in one caller.** It checks the user of every process that connects to its socket. It refuses all but `sandboxd`'s. On a VM it also checks that the caller runs inside `sandboxd`'s own service.
-- **Its calls are typed.** `sandboxd` asks for things like "a network for this sandbox" or "these firewall rules for this policy". It never sends a path, a command line or the text of a rule. The helper builds those itself, from its own settings.
+- **Its calls are typed.** `sandboxd` asks for things like "a network for this sandbox" or "these firewall rules for this policy". It never sends a command to run or the text of a firewall rule. The helper builds those itself, from its own settings. When a call carries a path or a tool option, such as a mount option or a volume's folder, the helper checks it against fixed rules first.
 - **containerd sits behind a gate.** containerd is the program that runs containers. Whoever can write to its socket can start a container with full root rights. In split, `sandboxd` reaches containerd only through the helper. The gate passes a fixed list of 41 calls and refuses the rest. When `sandboxd` creates or changes a container, the gate checks its settings:
   - no extra rights, and the system call filter in place;
   - no folders from the machine, except AerolVM's own;
@@ -172,7 +189,7 @@ Add `--with-containerd-engine --privilege-mode split` to the [install command](/
 
 - the `sandboxd` user (uid 65531), which the server runs as;
 - `aerolvm-rootd.service`, which runs the helper as root;
-- a locked-down `sandboxd.service`, with no capabilities, `NoNewPrivileges=yes`, `ProtectSystem=strict`, and write access to its own folders only.
+- a locked-down `sandboxd.service`, with no capabilities, `NoNewPrivileges=yes`, `ProtectSystem=strict`, and write access only to its own data, run and certificate folders.
 
 Split also runs image builds in rootless BuildKit: the image builder runs as a normal user too. It works with `--with-isolate` and `--with-firecracker`. [Run the server without root](/getting-started/installer-options/#run-the-server-without-root) on the installer page lists every file and user it makes.
 
@@ -185,7 +202,7 @@ container_engine: "containerd"
 privilege_mode: "split"
 ```
 
-The module passes `--privilege-mode split` to the installer on every node. It needs the module's default join (`one_line_join = true`). If you set something split cannot run with, `terraform plan` fails and lists each problem. The [Terraform README](https://github.com/aerol-ai/microvm/blob/main/Terraform/README.md#privilege-mode-split) has the full list.
+The module passes `--privilege-mode split` to the installer on every node. It needs the module's default join (`one_line_join = true`). A cluster built from a copy of the code (`Terraform/root`, through `scripts/terraform.sh`) has `one_line_join = false` by default, so split's plan fails there. Setting it to `true` on such a running cluster replaces every node. If you set something split cannot run with, `terraform plan` fails and lists each problem. The [Terraform README](https://github.com/aerol-ai/microvm/blob/main/Terraform/README.md#privilege-mode-split) has the full list.
 
 <Aside type="caution" title="Choose it before your first apply">
 This setting changes every node's setup. On a running cluster, Terraform then replaces every node, and the sandboxes on them are lost.
@@ -209,7 +226,7 @@ privilegeMode: split
 | `split` | The `agent` container runs as uid 65531 with no capabilities and a read-only root. The helper runs in the `runtime` container, which is privileged in both modes. |
 | `auto` | `split` for a new install, unless you turned on something split cannot run yet, such as Firecracker. An upgrade keeps the mode the workers have now. |
 
-`helm template` cannot see the cluster, so it renders `auto` as a new install, which is `split`. Every worker made after that would come up in split. So if a GitOps tool such as Argo CD or Flux renders the chart, set `single` or `split` yourself. [Security](/kubernetes/security/#privilege-mode) shows every container and folder in a split worker pod.
+`helm template` cannot see the cluster, so it renders `auto` as a new install. That is `split`, or `single` when you turned on something split cannot run yet, such as Firecracker. Every worker made after that would come up in that mode. So if a GitOps tool such as Argo CD or Flux renders the chart, set `single` or `split` yourself. [Security](/kubernetes/security/#privilege-mode) shows every container and folder in a split worker pod.
 
 ## What runs in split
 
@@ -228,7 +245,7 @@ privilegeMode: split
 - **One server.** Run the installer again with `--privilege-mode split` and your other flags. Running sandboxes keep running. To go back, run it with `--privilege-mode single`. If you think the server was broken into, rebuild the machine instead of switching back.
 - **Terraform.** Changing `privilege_mode` replaces every node, as the caution above says.
 - **Ansible.** Switch each node with the installer, then change `privilege_mode` to match.
-- **Kubernetes.** A worker gets its mode when its pod is made. Change the value with `helm upgrade`, then replace the workers one at a time. Workers of both modes run side by side while you switch. [Switch the privilege mode](/kubernetes/operations/#switch-the-privilege-mode) has the steps.
+- **Kubernetes.** A worker gets its mode when its pod is made. Change the value with `helm upgrade`, then replace the workers one at a time. In cluster mode, replacing a worker moves or stops its sandboxes, as each one's failover policy says. In single mode the worker is one pod, and deleting it ends every sandbox on it. Workers of both modes run side by side while you switch. [Switch the privilege mode](/kubernetes/operations/#switch-the-privilege-mode) has the steps.
 
 ## What it costs
 
