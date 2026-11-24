@@ -98,7 +98,10 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if d.warmPool != nil && !restore {
 		if warm, warmErr := d.tryWarmAdopt(ctx, req, sandboxID, toolboxToken, hostMounts, effectiveRuntime); warmErr == nil {
 			return warm, nil
-		} else if errors.Is(warmErr, dockerpkg.ErrSandboxContainerExists) {
+		} else if errors.Is(warmErr, dockerpkg.ErrSandboxContainerExists) || errors.Is(warmErr, errClaimLeftover) {
+			// errClaimLeftover: the failed claim's container still runs
+			// in the namespace this sandbox id holds; a cold create would
+			// be handed it (discardClaimedSlot).
 			return nil, warmErr
 		} else if !errors.Is(warmErr, containerdpool.ErrNoSlot) {
 			d.logger.Warn("containerd warm adopt failed; falling back to cold create",

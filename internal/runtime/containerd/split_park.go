@@ -121,9 +121,14 @@ func (d *Driver) splitParkFiles(ctx context.Context, containerID, source string)
 //
 // The rollback rule: when either trip fails, the slot's egress block goes
 // back on before the claim returns, and only after the rules trip has
-// ended, so no lift can land after it. tryWarmAdopt then destroys the
-// slot. A claim that fails part way leaves its slot blocked until it is
-// removed, never open.
+// ended, so no lift can land after it. A lift whose call timed out here
+// is no exception: the helper runs a call only if it took the address's
+// lock while the call was still live there (rootd keyedLocks.lock). The
+// give-up reaches the helper before the block does, so a lift that runs
+// took the lock first, and the block waits for it. tryWarmAdopt then
+// destroys the slot
+// (discardClaimedSlot). A claim that fails part way leaves its slot
+// blocked until it is removed, never open.
 func (d *Driver) splitClaimFinish(ctx context.Context, container cntr.Container, labels map[string]string, slot *containerdpool.ParkedSlot, sandboxID string, req models.CreateSandboxRequest) error {
 	rules := make(chan error, 1)
 	go func() { rules <- d.applyAdoptNetworkPolicy(slot.ContainerIP, req) }()

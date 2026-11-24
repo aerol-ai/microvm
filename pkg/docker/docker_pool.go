@@ -192,9 +192,11 @@ func (c *Client) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 		// The slot left the pool at Acquire, so nothing else will free its
 		// park:<slot-id> capacity reservation — destroy AND release here, or
 		// every failed adopt permanently shrinks the node's admittable
-		// capacity.
-		_ = c.destroyParked(ctx, slot)
-		c.warmPool.ReleasePark(slot.ID)
+		// capacity. The teardown runs on a context of its own: a client
+		// that hangs up mid-adopt cancels ctx, and a removal on it failed
+		// at once and left the container. A removal that still fails goes
+		// to the pool's retry list, charged until the container is gone.
+		c.discardClaimedSlot(ctx, slot)
 		return nil, fmt.Errorf("warm adopt failed: %w", err)
 	}
 	if c.warmPool != nil {
@@ -522,6 +524,24 @@ func (c *Client) applyAdoptNetworkPolicy(containerIP string, req models.CreateSa
 	}
 	// The adopted sandbox keeps the slot's address: lift the park block.
 	return c.networkRules.LiftBlockAllEgress(containerIP)
+}
+
+// claimTeardownTimeout bounds a failed adopt's teardown, which no longer
+// ends with the create's context (the pool's own teardowns have the same
+// bound).
+const claimTeardownTimeout = 30 * time.Second
+
+// discardClaimedSlot tears down a slot whose adopt failed and releases its
+// park reservation, or hands it to the pool's retry list when the removal
+// fails (dockerpool RetainFailedDestroy).
+func (c *Client) discardClaimedSlot(ctx context.Context, slot *dockerpool.ParkedSlot) {
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTeardownTimeout)
+	defer cancel()
+	if err := c.destroyParked(dctx, slot); err != nil {
+		c.warmPool.RetainFailedDestroy(slot, err)
+		return
+	}
+	c.warmPool.ReleasePark(slot.ID)
 }
 
 func (c *Client) destroyParked(ctx context.Context, slot *dockerpool.ParkedSlot) error {
