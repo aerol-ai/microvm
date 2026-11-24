@@ -623,11 +623,25 @@ Each is small and stands alone. Together they shrink the root surface now.
       refusals of Firecracker, V8 isolates, WASM and the containerd warm
       pool went once sandboxd and install.sh ran them (#1423 to #1432).
       What is left is one list, the same in both: the containerd engine and
-      its netns pool, the jailer, `/srv/jailer` as the chroot base, a kernel
-      outside sandboxd's folders, and runtime folders inside them.
-      Terraform names each problem in one plan error
-      (`Terraform/privilege_mode.tf`); Ansible checks in
-      `tasks/privilege-mode-checks.yml`.
+      its netns pool, the jailer, `/srv/jailer` as the chroot base, clean
+      paths, the kernel and every binary root runs outside sandboxd's
+      folders, and runtime folders inside them. Terraform names each
+      problem in one plan error (`Terraform/privilege_mode.tf`); Ansible
+      checks in `tasks/privilege-mode-checks.yml`.
+    - **Root never acts on a path inside the agent's folders.** The agent
+      can swap any name there for a link, and root's tools follow links,
+      in the last part of a path and in every folder above it (Ansible's
+      `follow: false` covers only the last). The first cut of this work
+      had root make Firecracker's run and templates folders, stage the
+      WASM modules, and write the shared SSH host key in them, and Ansible
+      already made the secrets folder the agent's before writing keys
+      into it. In split now: sandboxd makes its own folders (its
+      `MkdirAll`s, and `aerolvm-rootd agent-folders` hands over what root
+      left, following no link); the WASM modules are staged as the agent;
+      the secrets folder stays root's (`root:sandboxd 0750`) with the
+      agent's owner-only files inside, and the shared SSH host key goes
+      there. Tests walk every split-mode Ansible task and the split
+      bootstrap render for a root action on an agent path.
     - **The helper reads `cluster.env`, so it must restart with sandboxd.**
       The bootstrap and Ansible add settings there after the helper started
       (WASM, Firecracker, platform volumes); restarting sandboxd alone left
@@ -635,9 +649,9 @@ Each is small and stands alone. Together they shrink the root surface now.
     - **Split Firecracker on Terraform goes through install.sh too**
       (`--with-firecracker`): only install.sh can let the split unit write
       `/srv/jailer`. The split kernel default moves to root's folder, and
-      unset jailer ids now mean the installer's `sandboxd-jailer`, not uid
-      1000 (`ubuntu`, which has sudo). Single renders byte for byte as
-      before.
+      with no jailer ids set split runs the VMs as a user of their own,
+      `sandboxd-jailer`. Single renders byte for byte as before, now
+      pinned for every single render.
 10c. Split mode's last containerd gaps (PR 13): the containerd warm pool
     and gVisor checkpoint moves.
     **What building it taught us (PR 13, 2026-11-23).**

@@ -349,14 +349,27 @@ warm pool (`containerd.pool.enabled`). What changes for them:
 - **The helper restarts with sandboxd** at the end of the bootstrap. It reads
   `cluster.env` too, and the WASM, Firecracker and volume settings are added
   there after it first starts.
+- **Root writes nothing in sandboxd's folders.** In split the `sandboxd` user
+  owns `/var/lib/sandboxd`, `/run/sandboxd` and a few more, and could leave a
+  link there for root to follow. So sandboxd makes Firecracker's run and
+  templates folders itself, and `/etc/sandboxd/secrets` stays root's
+  (`root:sandboxd`, mode 0750). The AOCR wrap key, the cluster PAT and the
+  shared SSH host key go there, as files the `sandboxd` user owns, and
+  `SB_SSH_HOST_KEY_PATH` points at the key there.
 
 The plan fails, and lists each problem, when split is set with:
 
 - `container_engine` other than `containerd`, or `one_line_join = false`;
 - `containerd.native_netns_pool_enabled: false`;
 - on a Firecracker node: `firecracker.use_jailer = false`, a
-  `jailer_chroot_base` other than `/srv/jailer`, or a `kernel_path` in
-  `/var/lib/sandboxd` or `/run/sandboxd`;
+  `jailer_chroot_base` other than `/srv/jailer`, or a `kernel_path`,
+  `binary_path`, `jailer_path`, `mkfs_bin` or `ip_binary` in a folder the
+  `sandboxd` user owns (root runs or links them). That covers
+  `/var/lib/sandboxd`, `/run/sandboxd`, `/run/aerolvm-procid`,
+  `/etc/sandboxd/tls`, `/etc/sandboxd/cluster-ca`, and any folder a node's
+  `sandboxd_env` moves them to;
+- a Firecracker or WASM path that is not clean and absolute (with `..`, `.`
+  or `//`);
 - a `firecracker.run_dir`, `firecracker.templates_dir`, `wasm.modules_dir` or
   `wasm.cache_dir` outside `/var/lib/sandboxd` and `/run/sandboxd`, the only
   folders sandboxd may write in split.
