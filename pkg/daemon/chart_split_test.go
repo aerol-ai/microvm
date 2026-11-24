@@ -758,15 +758,31 @@ func TestChartSplitNonRootReadsItsFiles(t *testing.T) {
 }
 
 // Single renders none of split: no setting, no helper, a privileged agent.
+// It shares one process namespace exactly when WASM or V8 isolates are on:
+// sandboxd starts their hosts in the runtime container's group, and they
+// outlive an agent restart only with the namespace shared (C14); without
+// them it stays off, so no container reads another's command lines.
 func TestChartSingleHasNoSplit(t *testing.T) {
 	helm := chartHelm(t)
-	hosts := []string{"--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true"}
-	for name, flags := range map[string][]string{"single": nil, "cluster": chartClusterFlags,
-		"single WASM and V8 isolates": hosts, "cluster WASM and V8 isolates": append(slices.Clone(chartClusterFlags), hosts...)} {
+	wasm, v8 := []string{"--set", "worker.wasm.enabled=true"}, []string{"--set", "worker.isolate.enabled=true"}
+	hosts := append(slices.Clone(wasm), v8...)
+	cluster := func(flags []string) []string { return append(slices.Clone(chartClusterFlags), flags...) }
+	for name, tc := range map[string]struct {
+		flags  []string
+		shared bool
+	}{
+		"single": {nil, false}, "cluster": {chartClusterFlags, false},
+		"single WASM and V8 isolates": {hosts, true}, "cluster WASM and V8 isolates": {cluster(hosts), true},
+		"single WASM": {wasm, true}, "cluster WASM": {cluster(wasm), true},
+		"single V8 isolates": {v8, true}, "cluster V8 isolates": {cluster(v8), true},
+	} {
 		t.Run(name, func(t *testing.T) {
-			out, err := renderChart(helm, flags...)
+			out, err := renderChart(helm, tc.flags...)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if shared, _ := workerSpec(t, out)["shareProcessNamespace"].(bool); shared != tc.shared {
+				t.Errorf("the worker pod shares one process namespace: %v, want %v", shared, tc.shared)
 			}
 			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime", "run-egress", "SB_EGRESS_GATEWAY_SOCKET",
 				"/srv/isolate-jail", "HostToContainer", "aerolvm-workerd", "supplementalGroups"} {
