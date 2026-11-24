@@ -834,6 +834,24 @@
         group: "{{ sandboxd_file_owner }}"
       notify: Apply sandboxd ops config
 
+    # A split node that an older play set up keeps a copy of the shared key
+    # in sandboxd's folder (sandboxd_ssh_host_key_path), unused while
+    # SB_SSH_HOST_KEY_PATH names the secrets folder. Were the shared key
+    # later taken out of the config, SB_SSH_HOST_KEY_PATH would name that
+    # copy again and sandboxd would serve the old shared key instead of
+    # making a key of its own. So it goes while the shared key is still set,
+    # removed as sandboxd's user: the folder is that user's, and root acts
+    # in it never.
+    - name: Remove the old copy of the shared SSH host key from sandboxd's folder (split)
+      when:
+        - sandboxd_privilege_mode == 'split'
+        - sandboxd_shared_ssh_host_key | bool
+        - sandboxd_ssh_host_key_path != sandboxd_split_ssh_host_key_path
+      become_user: sandboxd
+      ansible.builtin.file:
+        path: "{{ sandboxd_ssh_host_key_path }}"
+        state: absent
+
     # CNI plugins for containerd native netns (plans/containerd-engine.md Phase 5).
     # Mirrors scripts/install.sh install_cni_plugins; only when cluster.yml flips
     # container_engine to containerd. Idempotent: skip when bridge already present.
