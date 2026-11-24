@@ -306,7 +306,9 @@ func (s *Service) ExportMove(ctx context.Context, id, peer string, w io.Writer) 
 		return err
 	}
 	if sb.Status != models.SandboxStatusStopped {
-		return fmt.Errorf("export %s: %w", id, ErrNotSnapshotMovable)
+		// A state that can pass (its stop has not landed), not
+		// ErrNotSnapshotMovable, which says the move can never happen.
+		return fmt.Errorf("export %s: it is %s, not stopped for the move", id, sb.Status)
 	}
 	mover, err := s.snapshotMoverFor(sb)
 	if err != nil {

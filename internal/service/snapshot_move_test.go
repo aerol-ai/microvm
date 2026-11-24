@@ -217,6 +217,30 @@ func TestSnapshotMoveRefusals(t *testing.T) {
 	}
 }
 
+// A bundle asked for while the row is not stopped (its stop has not
+// landed) is refused with an error that may pass, never as a move that can
+// never happen (runtime.ErrNotMovable).
+func TestExportMoveOfARowNotStoppedIsRetryable(t *testing.T) {
+	ctx := context.Background()
+	cipher, _ := secrets.NewCipher("", filepath.Join(t.TempDir(), "cluster.key"))
+	src, srcRT, _ := moveWorker(t, "worker-a", cipher)
+	srcRT.snapshot = []byte("vm memory")
+	if err := src.store.Create(ctx, &models.Sandbox{ID: "sb-vm", Name: "sb-vm", Image: "alpine", Runtime: models.RuntimeFirecracker,
+		Status: models.SandboxStatusStarted, ContainerID: "vm", ToolboxToken: "guest-token"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-vm", "worker-b", ""); got != MoveReleased {
+		t.Fatalf("release = %q", got)
+	}
+	if err := src.store.UpdateStatus(ctx, "sb-vm", models.SandboxStatusStarted, ""); err != nil {
+		t.Fatal(err)
+	}
+	err := src.ExportMove(ctx, "sb-vm", "worker-b", &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "not stopped for the move") || errors.Is(err, runtime.ErrNotMovable) {
+		t.Fatalf("export of a started row = %v, want a retryable error", err)
+	}
+}
+
 // The service is the snapshot half the leader calls, and the Firecracker
 // driver the daemon hands it (SetFirecrackerRuntime) is the runtime half.
 var (
