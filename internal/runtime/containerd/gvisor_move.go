@@ -204,7 +204,7 @@ func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r 
 		return err
 	}
 	defer func() { _ = os.RemoveAll(staging) }()
-	if _, err := movebundle.ReadDir(ctx, r, staging, sandboxID); err != nil {
+	if _, err := movebundle.ReadDir(ctx, r, staging, sandboxID, movebundle.NoBound); err != nil {
 		return fmt.Errorf("containerd runtime: import %s: %w", sandboxID, err)
 	}
 	if !runscwrap.HasCheckpoint(staging) {

@@ -3,7 +3,8 @@
 // §10.5): a tar stream of regular files. The cluster seals the stream for
 // the one target and incarnation (pkg/secrets.NewSealWriter), so this
 // format only has to refuse what a move never sends: links, devices,
-// names outside the set, a file twice.
+// sparse entries, names outside the set, a file twice, more bytes than the
+// reader's bound.
 package movebundle
 
 import (
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +23,13 @@ import (
 
 // ManifestName is the first entry of a WriteDir stream.
 const ManifestName = "manifest.json"
+
+// NoBound is ReadDir's bound for a reader that takes a bundle of any size.
+const NoBound int64 = math.MaxInt64
+
+// ErrTooLarge is ReadDir's answer to a bundle whose files are more bytes
+// than its bound.
+var ErrTooLarge = errors.New("the bundle's files are larger than the bound")
 
 const (
 	manifestVersion = 1
@@ -71,14 +80,19 @@ func AddFile(tw *tar.Writer, path, name string) error {
 	return err
 }
 
-// CreateFile writes r to a new file at path, synced before it returns.
-func CreateFile(path string, r io.Reader) error {
+// CreateFile writes exactly size bytes of r to a new file at path, synced
+// before it returns. r holding fewer is an error; bytes past size are not
+// read.
+func CreateFile(path string, r io.Reader, size int64) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, r); err != nil {
+	if n, err := io.CopyN(f, r, size); err != nil {
 		_ = f.Close()
+		if errors.Is(err, io.EOF) {
+			err = fmt.Errorf("%s ends after %d of its %d bytes", filepath.Base(path), n, size)
+		}
 		return err
 	}
 	if err := f.Sync(); err != nil {
@@ -132,15 +146,23 @@ func WriteDir(ctx context.Context, w io.Writer, dir, sandboxID string) error {
 }
 
 // ReadDir reads a WriteDir stream for sandboxID into dir, an empty
-// directory: the manifest first, then exactly the files it names. On an
-// error dir may hold part of the stream; the caller removes it.
-func ReadDir(ctx context.Context, r io.Reader, dir, sandboxID string) (*Manifest, error) {
+// directory: the manifest first, then exactly the files it names. bound
+// limits the bytes it writes, all files together: an entry that would pass
+// it is refused (ErrTooLarge) before it is written, and each file gets
+// exactly the size its header gives. NoBound takes a bundle of any size.
+// Sparse entries are refused: a move never sends one, and their size on
+// disk is not the bytes the stream carries. On an error dir may hold part
+// of the stream; the caller removes it.
+func ReadDir(ctx context.Context, r io.Reader, dir, sandboxID string, bound int64) (*Manifest, error) {
+	if bound <= 0 {
+		return nil, fmt.Errorf("a bound of %d bytes: want one above 0", bound)
+	}
 	tr := tar.NewReader(r)
 	h, err := tr.Next()
 	if err != nil {
 		return nil, fmt.Errorf("no manifest: %w", err)
 	}
-	if h.Name != ManifestName || h.Typeflag != tar.TypeReg || h.Size > maxManifest {
+	if h.Name != ManifestName || h.Typeflag != tar.TypeReg || sparse(h) || h.Size > maxManifest {
 		return nil, fmt.Errorf("the manifest must come first, got %q", h.Name)
 	}
 	var m Manifest
@@ -155,6 +177,7 @@ func ReadDir(ctx context.Context, r io.Reader, dir, sandboxID string) (*Manifest
 		want[name] = true
 	}
 	got := map[string]bool{}
+	var written int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -167,20 +190,26 @@ func ReadDir(ctx context.Context, r io.Reader, dir, sandboxID string) (*Manifest
 			return nil, err
 		}
 		switch {
+		case sparse(h):
+			return nil, fmt.Errorf("%q is a sparse entry", h.Name)
 		case h.Typeflag != tar.TypeReg:
 			return nil, fmt.Errorf("%q is not a regular file", h.Name)
 		case !want[h.Name]:
 			return nil, fmt.Errorf("%q is not in the manifest", h.Name)
 		case got[h.Name]:
 			return nil, fmt.Errorf("%q sent twice", h.Name)
+		case h.Size < 0 || h.Size > bound-written:
+			// written never passes bound, so bound-written cannot overflow.
+			return nil, fmt.Errorf("%q, %d bytes after %d: %w", h.Name, h.Size, written, ErrTooLarge)
 		}
 		path, err := Inside(dir, h.Name)
 		if err != nil {
 			return nil, err
 		}
-		if err := CreateFile(path, tr); err != nil {
+		if err := CreateFile(path, tr, h.Size); err != nil {
 			return nil, err
 		}
+		written += h.Size
 		got[h.Name] = true
 	}
 	for _, name := range m.Files {
@@ -189,6 +218,21 @@ func ReadDir(ctx context.Context, r io.Reader, dir, sandboxID string) (*Manifest
 		}
 	}
 	return &m, nil
+}
+
+// sparse reports whether h is a sparse entry, in either of the forms Go's
+// tar reader expands on read: the old GNU typeflag, or GNU sparse PAX
+// records on a regular file's header.
+func sparse(h *tar.Header) bool {
+	if h.Typeflag == tar.TypeGNUSparse {
+		return true
+	}
+	for k := range h.PAXRecords {
+		if strings.HasPrefix(k, "GNU.sparse.") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manifest) check(sandboxID string) error {

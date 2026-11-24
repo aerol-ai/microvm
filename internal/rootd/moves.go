@@ -44,9 +44,10 @@ import (
 // format single mode sends; runsc itself restores only between workers of
 // one mode, cluster.CheckpointMovesLabel), and Import writes only what
 // that format carries: a manifest for this sandbox, then the regular files
-// it names, each once, by flat names. The bundle is bounded in bytes (a
-// refusal), the staged bundles in number (busy), and a bundle that is not
-// whole is never staged. The restored container's spec names <MovesDir>/in/<its own ID>,
+// it names, each once, by flat names, and no sparse entry. The bundle is
+// bounded in bytes (a refusal), both what the stream carries and what is
+// written to disk, the staged bundles in number (busy), and a bundle that
+// is not whole is never staged. The restored container's spec names <MovesDir>/in/<its own ID>,
 // which the gate checks (rootpolicy.CheckRestorePath).
 
 // MovesConfig is gVisor checkpoint moves' settings, from the helper's own
@@ -60,9 +61,10 @@ type MovesConfig struct {
 	// containerd namespace; the helper checkpoints only in its own
 	// namespace's (SB_ROOTD_RUNSC_ROOT, /run/containerd/runsc).
 	StateRoot string
-	// MaxBundleBytes bounds one imported bundle (SB_ROOTD_MOVE_MAX_BYTES):
-	// by default twice the node's memory, above what one sandbox's memory
-	// and root overlay can hold.
+	// MaxBundleBytes bounds one imported bundle (SB_ROOTD_MOVE_MAX_BYTES),
+	// the bytes its stream carries and the bytes its files take when
+	// written: by default twice the node's memory, above what one
+	// sandbox's memory and root overlay can hold.
 	MaxBundleBytes int64
 	// MaxStaged bounds the bundles staged or arriving at once
 	// (SB_ROOTD_MOVE_MAX_STAGED, 8: a worker's moves in parallel).
@@ -298,11 +300,14 @@ func (m *moveCalls) importBundle(ctx context.Context, recv func() (*rootdpb.Impo
 	if err != nil {
 		return nil, badRequest("%v", err)
 	}
+	// The bound holds twice: importReader counts what the stream carries,
+	// and ReadDir what it writes (a tar entry's size on disk is its header's,
+	// not the stream's bytes).
 	r := &importReader{recv: recv, buf: first.GetData(), max: m.cfg.MaxBundleBytes}
 	if r.n = int64(len(r.buf)); r.n > r.max {
 		return nil, m.importErr(ctx, id, errMoveTooLarge)
 	}
-	if _, err = movebundle.ReadDir(ctx, r, dir, id); err == nil {
+	if _, err = movebundle.ReadDir(ctx, r, dir, id, m.cfg.MaxBundleBytes); err == nil {
 		err = r.rest()
 	}
 	if err != nil {
@@ -367,7 +372,7 @@ func (m *moveCalls) importErr(ctx context.Context, id string, err error) error {
 	case errors.As(err, &fe):
 		// The helper's own answer (a newer agent's field): as it is.
 		return fe
-	case errors.Is(err, errMoveTooLarge):
+	case errors.Is(err, errMoveTooLarge), errors.Is(err, movebundle.ErrTooLarge):
 		return refusedRule(codes.InvalidArgument, rootpolicy.CheckMoveBundleSize(m.cfg.MaxBundleBytes+1, m.cfg.MaxBundleBytes))
 	case ctx.Err() != nil, errors.As(err, &se):
 		return fmt.Errorf("root helper: import %s: %w", id, err)

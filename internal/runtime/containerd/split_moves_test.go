@@ -89,7 +89,7 @@ func TestSplitMoveThroughTheRealHelper(t *testing.T) {
 	if err := from.ExportSandboxSnapshot(ctx, "sb-g", &bundle); err != nil {
 		t.Fatal(err)
 	}
-	if m, err := movebundle.ReadDir(ctx, bytes.NewReader(bundle.Bytes()), t.TempDir(), "sb-g"); err != nil || !slices.Equal(m.Files, []string{runscwrap.CheckpointFile, "pages.img"}) {
+	if m, err := movebundle.ReadDir(ctx, bytes.NewReader(bundle.Bytes()), t.TempDir(), "sb-g", movebundle.NoBound); err != nil || !slices.Equal(m.Files, []string{runscwrap.CheckpointFile, "pages.img"}) {
 		t.Fatalf("the export is not a move bundle: %v %v", m, err)
 	}
 

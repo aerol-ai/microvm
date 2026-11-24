@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -147,7 +148,7 @@ func TestMoveCheckpointExportImport(t *testing.T) {
 	}
 	// The bundle is the format single mode sends: a single node reads it.
 	staging := t.TempDir()
-	if m, err := movebundle.ReadDir(ctx, bytes.NewReader(bundle), staging, "sb-1"); err != nil || !slices.Equal(m.Files, []string{runscwrap.CheckpointFile, "pages.img"}) {
+	if m, err := movebundle.ReadDir(ctx, bytes.NewReader(bundle), staging, "sb-1", movebundle.NoBound); err != nil || !slices.Equal(m.Files, []string{runscwrap.CheckpointFile, "pages.img"}) {
 		t.Fatalf("the export is not a move bundle: %v %v", m, err)
 	}
 	// And a bundle a single node wrote is one the helper takes, here in
@@ -308,6 +309,10 @@ func TestMoveBrokenAgentImports(t *testing.T) {
 		{"a file cut short", "sb-1", bundleMsgs(big[:len(big)-1024-1500]), string(rootpolicy.RuleMoveBundle)},
 		{"bytes after the bundle", "sb-1", bundleMsgs(append(slices.Clone(good), 'x')), string(rootpolicy.RuleMoveBundle)},
 		{"larger than the node takes", "sb-1", bundleMsgs(tarBundle(t, man("sb-1", ckpt.name), tarEntry{name: ckpt.name, body: strings.Repeat("x", 1<<20)})), string(rootpolicy.RuleMoveBundle)},
+		// A few KiB of stream for a file of 64 MiB, under a 1 MiB bound:
+		// bundle sizes are bounded by what is written, and sparse entries
+		// are refused.
+		{"a sparse entry", "sb-1", bundleMsgs(sparseMoveBundle(t, "sb-1", ckpt.name, 64<<20)), string(rootpolicy.RuleMoveBundle)},
 		// A whole bundle past the bound, all in the first message: the bound
 		// holds before a byte of it is written.
 		{"a first message past the bound", "sb-1", func() []*rootdpb.ImportMoveRequest {
@@ -343,6 +348,51 @@ func TestMoveBrokenAgentImports(t *testing.T) {
 			}
 		})
 	}
+}
+
+// sparseMoveBundle is a bundle whose one file is a PAX sparse entry of size
+// bytes, all of it a hole, so its stream is a few headers. Go's tar writer
+// does not write sparse entries: the blocks are built here, as in
+// movebundle's own test.
+func sparseMoveBundle(t *testing.T, id, name string, size int64) []byte {
+	t.Helper()
+	out := tarBundle(t, &movebundle.Manifest{Version: 1, SandboxID: id, Files: []string{name}})
+	out = out[:len(out)-1024] // the end marker goes after the sparse entry
+	record := func(k, v string) string {
+		body := " " + k + "=" + v + "\n"
+		n := len(body) + 1
+		for len(fmt.Sprint(n))+len(body) != n {
+			n = len(fmt.Sprint(n)) + len(body)
+		}
+		return fmt.Sprint(n) + body
+	}
+	block := func(name string, typeflag byte, size int64) []byte {
+		b := make([]byte, 512)
+		copy(b[0:100], name)
+		copy(b[100:108], "0000600\x00")
+		copy(b[108:116], "0000000\x00")
+		copy(b[116:124], "0000000\x00")
+		copy(b[124:136], fmt.Sprintf("%011o\x00", size))
+		copy(b[136:148], fmt.Sprintf("%011o\x00", 0))
+		copy(b[148:156], "        ")
+		b[156] = typeflag
+		copy(b[257:263], "ustar\x00")
+		copy(b[263:265], "00")
+		var sum int64
+		for _, c := range b {
+			sum += int64(c)
+		}
+		copy(b[148:156], fmt.Sprintf("%06o\x00 ", sum))
+		return b
+	}
+	pad := func(b []byte) []byte { return append(b, make([]byte, (512-len(b)%512)%512)...) }
+	pax := record("GNU.sparse.major", "1") + record("GNU.sparse.minor", "0") +
+		record("GNU.sparse.name", name) + record("GNU.sparse.realsize", fmt.Sprint(size))
+	out = append(out, block("PaxHeaders/"+name, tar.TypeXHeader, int64(len(pax)))...)
+	out = append(out, pad([]byte(pax))...)
+	out = append(out, block("GNUSparseFile.0/"+name, tar.TypeReg, 512)...)
+	out = append(out, pad([]byte("0\n"))...)
+	return append(out, make([]byte, 1024)...)
 }
 
 // bundleMsgs is a bundle as the import's later messages, 512 bytes each.
@@ -644,6 +694,8 @@ func TestImportErr(t *testing.T) {
 		code   codes.Code
 	}{
 		{"too large", live, errMoveTooLarge, string(rootpolicy.RuleMoveBundle), codes.InvalidArgument},
+		// Bytes written past the bound read as the bound's own refusal.
+		{"its files too large", live, fmt.Errorf("%q: %w", "pages.img", movebundle.ErrTooLarge), string(rootpolicy.RuleMoveBundle), codes.InvalidArgument},
 		{"not a bundle", live, errors.New("the manifest must come first"), string(rootpolicy.RuleMoveBundle), codes.InvalidArgument},
 		{"the stream broke", live, &streamErr{err: io.ErrClosedPipe}, "", codes.Internal},
 		{"the caller gave up", gone, errors.New("the manifest must come first"), "", codes.Canceled},
@@ -657,6 +709,9 @@ func TestImportErr(t *testing.T) {
 			reason, refused := rootdpb.RefusalReason(err)
 			if refused != (tc.reason != "") || reason != tc.reason || status.Code(err) != tc.code {
 				t.Fatalf("%v: refused %v %q, code %v; want %q %v", err, refused, reason, status.Code(err), tc.reason, tc.code)
+			}
+			if strings.HasSuffix(tc.name, "too large") && !strings.Contains(err.Error(), "the move bundle is more than 10 bytes") {
+				t.Fatalf("%v: want the bound's refusal", err)
 			}
 		})
 	}
