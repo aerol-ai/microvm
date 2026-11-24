@@ -1,0 +1,74 @@
+# values.yaml: the chart values for the M1 EKS drill (m1-eks.sh install).
+# Cluster mode on a small two-zone cell. It starts in privilegeMode single;
+# the switch steps change only privilegeMode (helm upgrade --reuse-values).
+# Placeholders in @@...@@ are filled by m1-eks.sh.
+#
+# Smaller than the cell (cell/values.yaml) on purpose: two system machines of
+# 2 CPUs, so the servers and gateways ask for less than the chart's default.
+# The drill makes a few creates a second at most; Raft needs little.
+mode: cluster
+privilegeMode: single
+image:
+  registry: "@@REGISTRY@@"
+  tag: "@@TAG@@"
+  pullPolicy: IfNotPresent
+worker:
+  defaultRuntime: gvisor
+  blockPrivateByDefault: true
+  # The sandbox volume is the machine's root disk (an emptyDir), as in the
+  # cell: kubelet evicts at 10% free, so the floor stays well above it.
+  diskFloorRatio: "0.30"
+  # gVisor moves on in both modes: the default is off in split, and the
+  # drill moves a gVisor sandbox split to split and checks the cross-mode
+  # refusal. Each worker then carries the label
+  # aerolvm.io/gvisor-checkpoint-moves ("true" in single, "split" in split),
+  # but placement does not match on it (live run m1d-2), so the drill pins
+  # a worker with AerolVM's cordon on the others instead.
+  gvisor:
+    checkpointMoves: true
+  # Empty: on in split, off in single (the chart's default). OV-E2 mounts
+  # only on split workers.
+  externalStorage:
+    enabled: ~
+  extraEnv:
+    # The containerd warm pool, for N1's warm creates (gVisor, alpine).
+    SB_CONTAINERD_POOL_ENABLED: "true"
+    SB_CONTAINERD_POOL_DEPTH: "5"
+    SB_CONTAINERD_POOL_IMAGES: "public.ecr.aws/docker/library/alpine:3.20"
+networkPolicy:
+  enabled: true
+cluster:
+  name: aerolvm
+  version: "@@TAG@@"
+  cell: 1
+  zones: [@@ZONES@@]
+  servers:
+    count: 3
+    storage: { size: 10Gi, storageClassName: gp3 }
+    resources:
+      requests: { cpu: 250m, memory: 768Mi }
+      limits: { cpu: "1", memory: 2Gi }
+  gateways:
+    # One per zone, the least the operator allows.
+    minReplicas: 2
+    service: { type: ClusterIP }
+    resources:
+      requests: { cpu: 250m, memory: 256Mi }
+      limits: { cpu: "1", memory: 1Gi }
+  workerPools:
+    - name: general
+      runtimes: [gvisor, docker]
+      nodeSelector: { aerolvm.io/pool: phase0 }
+      tolerations: [{ key: aerolvm.io/worker, operator: Exists, effect: NoSchedule }]
+      # m7i.xlarge.
+      machine: { cpu: 4, memoryGiB: 16 }
+      minWorkers: 3
+      maxWorkers: 3
+      headroomPercent: 15
+      provisioner: eks-managed
+      # Short, so a switch or a move pass does not wait out the defaults.
+      decommission: { drainWindow: 1m, deadline: 10m }
+  createPolicy:
+    version: 1
+    runtimes: [gvisor, docker]
+    limits: { max_cpu: 2, max_memory_mb: 4096 }

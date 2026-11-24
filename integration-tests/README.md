@@ -1065,6 +1065,18 @@ files (a worktree cleanup, `git clean -x`) while the run is up: `down` needs
 the state. If it is lost anyway, `reap.sh` finds every part of the run by
 its tags once its TTL has passed.
 
+## M1 split-mode drill on EKS
+
+`k8s/m1/` holds the live drill for privilege mode `split`
+(`plans/security-gaps-m1-m4.md` §3.6, D10): one small EKS cluster whose
+workers switch from `single` to `split` one at a time, with checks for
+moves, an in-place rollout, the signed helper, memory pressure, pod
+deletes and create latency (N1); and one EC2 machine for WASM and V8
+create latency. It costs real money (about $2 to $3.50 for the cluster,
+well under $1 for the machine) and needs the owner's yes before each run.
+[`k8s/m1/README.md`](k8s/m1/README.md) has the checklist, the cost guards,
+and how to run, stop, tear down and leak-check it.
+
 ## What runs where
 
 | Layer | Command | Needs AWS? |
