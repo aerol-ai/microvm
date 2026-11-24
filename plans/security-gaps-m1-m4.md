@@ -921,11 +921,11 @@ Each is small and stands alone. Together they shrink the root surface now.
         is `/run/aerolvm-rootd/shared/wasm`, set for both, a folder the
         helper makes beside its own socket's (only root and the agent's
         group enter the shared folder). The agent shares each sandbox's
-        files with its worker by group, so the pod gets supplemental
-        group 61000 (sandboxd refuses to start outside it,
-        `checkSplitWasm`). The group reaches every container, but only the
-        agent's own folders hold such files, and the workers and the
-        egress gateway drop every group.
+        files with its worker by group 61000 (sandboxd refuses to start
+        outside it, `checkSplitWasm`). The agent image lists uid 65531 in
+        that group, so the container runtime gives it to the agent alone;
+        the pod sets no such group (follow-up to #1441). The workers drop
+        every group.
       - **The compile cache.** The helper hands each WASM host its cache
         open, from the agent's cache root; on a VM that is in sandboxd's
         data folder, which the runtime container does not mount here. It
