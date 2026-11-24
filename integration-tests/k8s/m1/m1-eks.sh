@@ -138,14 +138,14 @@ switch_machine() {
   old="$(worker_on "$m")"
   t0=$(now)
   say "$label: cordon $m (worker $old)"
-  k cordon "$m" >/dev/null
+  node_cordon "$m"
   # An optional check that must run while the old worker decommissions.
   [[ -n "$hook" ]] && "$hook" "$old" >&2
   if ! wait_until 1500 "$old decommissioned and its pod gone" pod_gone "$old"; then
-    diag "$label"; k uncordon "$m" >/dev/null || true; return 1
+    diag "$label"; node_uncordon "$m" || true; return 1
   fi
   say "$label: $old gone after $(( $(now) - t0 ))s; uncordon $m"
-  k uncordon "$m" >/dev/null
+  node_uncordon "$m"
   if ! wait_until 900 "a new worker on $m Serving" new_on "$m" "$old"; then diag "$label"; return 1; fi
   new="$(worker_on "$m")"
   say "$label: $new serving on $m in $(mode_of "$new") mode, $(( $(now) - t0 ))s after the cordon"
@@ -843,18 +843,24 @@ check_pid=""
 # anything whose status a || or && tests, that subshell included, so a
 # check went on past a failed command and could still grade PASS. In the
 # background with a wait, so a signal to this shell is handled at once,
-# not when the check's current command ends.
+# not when the check's current command ends. A job of its own (set -m): the
+# check and everything it starts, background children too (f10's fills),
+# share one process group, which stop_check ends at once. Its stdin is
+# /dev/null: a job outside the terminal's group that read it would stop.
 run_check() {
   local s="$1" rc=0
   set +e
+  set -m
   (
+    set +m
     set -e
     trap check_exit EXIT
     trap 'exit 143' TERM
     trap 'exit 130' INT
     "step_$s"
-  ) &
+  ) < /dev/null &
   check_pid=$!
+  set +m
   wait "$check_pid"
   rc=$?
   check_pid=""
@@ -864,9 +870,10 @@ run_check() {
   elif [[ "$rc" != 0 ]]; then result FAIL "$s" "the step exited $rc"; diag "$s"; fi
   return 0
 }
-# check_exit: a check's EXIT trap. It lifts the AerolVM cordons the check
-# placed and did not lift (m1-lib.sh api_cordon), so a check that failed
-# or was stopped part way leaves no worker closed to new sandboxes. Not
+# check_exit: a check's EXIT trap. It lifts the cordons the check placed
+# and did not lift: AerolVM's (m1-lib.sh api_cordon) and a machine's
+# Kubernetes cordon (node_cordon, a switch), so a check that failed or was
+# stopped part way leaves no worker or machine closed. Not
 # when on_exit tears the run down next ($sd/.teardown-next): they go with
 # the cluster.
 check_exit() {
@@ -880,18 +887,21 @@ kill_tree() {
   for kid in $(pgrep -P "$1" 2>/dev/null || true); do kill_tree "$kid"; done
   kill -TERM "$1" 2>/dev/null || true
 }
-# stop_check: on_exit's first act while a check runs: TERM to the check;
-# if a foreground child still holds it after 5 s (bash runs a trap only
-# when that child ends), TERM to the whole tree.
+# stop_check: on_exit's first act while a check runs: TERM to the check's
+# whole process group at once, so no child of it (a background fill, a
+# curl) outlives it; the check's own TERM trap then runs its exit handler.
+# If the check still runs after 5 s, TERM to its tree; then once more to
+# whatever of the group is left.
 stop_check() {
   [[ -n "$check_pid" ]] || return 0
+  local _
   if kill -0 "$check_pid" 2>/dev/null; then
-    kill -TERM "$check_pid" 2>/dev/null || true
-    local _
+    kill -TERM -- "-$check_pid" 2>/dev/null || kill -TERM "$check_pid" 2>/dev/null || true
     for _ in $(seq 1 50); do kill -0 "$check_pid" 2>/dev/null || break; sleep 0.1; done
     if kill -0 "$check_pid" 2>/dev/null; then kill_tree "$check_pid"; fi
     wait "$check_pid" 2>/dev/null || true
   fi
+  kill -TERM -- "-$check_pid" 2>/dev/null || true
   check_pid=""
 }
 

@@ -91,7 +91,13 @@ id="" sg=""
 # deleted once the machine is gone (a group in use cannot be deleted).
 # Both carry the run's tags, so leak-check.sh lists either if it is left.
 finish_vm() {
-  [[ -z "$id" ]] || x aws ec2 terminate-instances --region "$region" --instance-ids "$id" >/dev/null || true
+  # From here a second Ctrl-C (or a TERM) stops nothing: it used to end
+  # this handler during the wait below, before the group was deleted, and
+  # a rerun of the same name then could not make its group. The aws calls
+  # inherit INT and TERM ignored, so the wait runs to its end.
+  trap '' INT TERM
+  [[ -z "$id" ]] || x aws ec2 terminate-instances --region "$region" --instance-ids "$id" >/dev/null ||
+    say "instance $id may be left: aws ec2 terminate-instances --region $region --instance-ids $id"
   [[ "$dry" == 1 || -z "$id" ]] || date +%s > "$sd/ended-at"
   if [[ -n "$sg" ]]; then
     [[ -z "$id" ]] || x aws ec2 wait instance-terminated --region "$region" --instance-ids "$id" || true
@@ -104,6 +110,9 @@ keep_vm() {
   [[ -z "$sg" ]] || say "M1_VM_KEEP=1: once $id has ended, delete its group: aws ec2 delete-security-group --region $region --group-id $sg"
 }
 if [[ "${M1_VM_KEEP:-0}" == 1 ]]; then trap keep_vm EXIT; else trap finish_vm EXIT; fi
+# A Ctrl-C or TERM exits through the EXIT trap above.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # The VM's own security group in the default VPC: a new group has no
 # inbound rule and lets everything out (the downloads), so nothing can
 # reach the machine.

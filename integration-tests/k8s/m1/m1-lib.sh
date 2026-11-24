@@ -291,18 +291,37 @@ helper() {
 # never target it). The operator never lifts it, so each cordon a check
 # places is written down ($sd/check-cordons) until it lifts it, and the
 # check's exit handler (m1-eks.sh check_exit) lifts what is left: a check
-# that fails or is stopped part way leaves no worker closed.
-api_cordon() { api POST "/v1/cluster/nodes/$1/cordon" >/dev/null; echo "$1" >> "$sd/check-cordons"; }
+# that fails or is stopped part way leaves no worker closed. Written down
+# before the call, so a check stopped during it still lifts it.
+api_cordon() { echo "$1" >> "$sd/check-cordons"; api POST "/v1/cluster/nodes/$1/cordon" >/dev/null; }
 api_uncordon() {
   api POST "/v1/cluster/nodes/$1/uncordon" >/dev/null
-  [[ -f "$sd/check-cordons" ]] || return 0
-  grep -vxF -- "$1" "$sd/check-cordons" > "$sd/check-cordons.new" || true
-  mv "$sd/check-cordons.new" "$sd/check-cordons"
+  forget "$sd/check-cordons" "$1"
+}
+# node_cordon / node_uncordon <machine>: a machine's Kubernetes cordon (a
+# switch's: the operator then decommissions its worker), written down the
+# same way ($sd/check-node-cordons). In a run that is not `all`, a switch
+# stopped while it waited used to leave the machine cordoned.
+node_cordon() { echo "$1" >> "$sd/check-node-cordons"; k cordon "$1" >/dev/null; }
+node_uncordon() {
+  k uncordon "$1" >/dev/null
+  forget "$sd/check-node-cordons" "$1"
+}
+# forget <file> <line>: that line out of the file.
+forget() {
+  [[ -f "$1" ]] || return 0
+  grep -vxF -- "$2" "$1" > "$1.new" || true
+  mv "$1.new" "$1"
 }
 lift_cordons() {
   local n
-  [[ -s "$sd/check-cordons" ]] || return 0
-  for n in $(sort -u "$sd/check-cordons"); do api_uncordon "$n"; done
+  if [[ -s "$sd/check-cordons" ]]; then
+    for n in $(sort -u "$sd/check-cordons"); do api_uncordon "$n"; done
+  fi
+  if [[ -s "$sd/check-node-cordons" ]]; then
+    for n in $(sort -u "$sd/check-node-cordons"); do node_uncordon "$n" || true; done
+  fi
+  return 0
 }
 
 # node_sh <machine> <shell>: runs the shell as root on the machine (a node

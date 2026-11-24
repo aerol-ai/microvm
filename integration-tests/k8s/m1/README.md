@@ -100,7 +100,9 @@ The cost guards:
 - **One account, one cluster.** Every step after `up` talks only to the
   kubeconfig `cluster.sh` wrote for this run, only if it names this EKS
   cluster, and only with this account's credentials. A refused step changes
-  nothing. A check that fails part way lifts the cordons it placed.
+  nothing. A check that fails or is stopped part way lifts the cordons it
+  placed (AerolVM's, and a switch's cordon of its machine) and leaves no
+  process of its own running.
 
 ## How to run it
 
