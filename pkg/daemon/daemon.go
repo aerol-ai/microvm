@@ -2601,6 +2601,11 @@ func hostLabels(cfg config.Config) map[string]string {
 	for k, v := range cfg.NodeLabels {
 		out[k] = v
 	}
-	out[cluster.CheckpointMovesLabel] = "true"
+	// Its value is the privilege mode: a gVisor sandbox moves only between
+	// workers of one mode (cluster.CheckpointMovesLabel).
+	out[cluster.CheckpointMovesLabel] = cluster.CheckpointMovesSingle
+	if cfg.PrivilegeMode == privmode.Split {
+		out[cluster.CheckpointMovesLabel] = cluster.CheckpointMovesSplit
+	}
 	return out
 }

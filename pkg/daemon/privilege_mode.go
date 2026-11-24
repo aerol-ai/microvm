@@ -64,10 +64,9 @@ func checkPrivilegeMode(cfg config.Config) error {
 	// IPv6 fence are the helper's from M1 PR 5 (split_firewall.go); the
 	// hostname gateway's host side (SB_EGRESS_FQDN_ENABLED, split_egress.go)
 	// and ingress proxy routing's host ports (SB_INGRESS_PROXY_ROUTING,
-	// splitHostPortForwarder) from PR 5b.
-	if cfg.ContainerdPoolEnabled {
-		gaps = append(gaps, privmode.StepWarmPool)
-	}
+	// splitHostPortForwarder) from PR 5b. The containerd warm pool
+	// (SB_CONTAINERD_POOL_ENABLED) is a create's root work plus the park
+	// socket's name, the helper's from M1 PR 13 (containerd split_park.go).
 	// V8 isolate groups are the helper's from M1 PR 9 (split_hosts.go): it
 	// builds each group's jail and runs workerd; it jails every group, so
 	// an unjailed one is single mode only.
@@ -98,9 +97,10 @@ func checkPrivilegeMode(cfg config.Config) error {
 			gaps = append(gaps, privmode.StepFirecrackerWarmPool)
 		}
 	}
-	if cfg.GvisorCheckpointMoves {
-		gaps = append(gaps, privmode.StepMoves)
-	}
+	// gVisor checkpoint moves (SB_GVISOR_CHECKPOINT_MOVES) are the
+	// helper's from M1 PR 13: it runs runsc checkpoint and keeps both
+	// sides' checkpoints in its own moves folder (containerd
+	// split_moves.go, rootd moves.go).
 	return privmode.NotYet("start sandboxd", gaps...)
 }
 

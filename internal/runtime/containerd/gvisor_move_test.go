@@ -80,7 +80,7 @@ func TestCheckpointMoveSourceToTarget(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 	out := mustMoveDir(t, src, moveOut, "sb-g")
-	want := []string{"--root=/run/containerd/runsc/aerolvm", "checkpoint", "--image-path=" + out, "sb-g"}
+	want := []string{"--root=/run/containerd/runsc/aerolvm", "checkpoint", "--image-path=" + out, "--", "sb-g"}
 	if len(*calls) != 1 || !slices.Equal((*calls)[0], want) {
 		t.Fatalf("runsc %q, want %q", *calls, want)
 	}

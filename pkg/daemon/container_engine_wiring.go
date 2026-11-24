@@ -77,6 +77,16 @@ func wireContainerEngineWith(ctx context.Context, cfg config.Config, logger *slo
 		// cgroup parent the driver asks for none.
 		driver.SetCgroupMarker(helper)
 		netHelper = helper
+		// gVisor checkpoint moves (M1 PR 13): the helper takes a move's
+		// checkpoints, in its own moves folder, with the same setting on
+		// in its own environment (containerd split_moves.go).
+		if cfg.GvisorCheckpointMoves {
+			m, ok := helper.(cntr.MoveHelper)
+			if !ok {
+				return nil, errors.New("privilege mode split: this root helper client has no gVisor move calls")
+			}
+			driver.SetMoveHelper(m)
+		}
 		if splitHostStepOn(cfg) {
 			fw, ok := helper.(firewallHelper)
 			if !ok {

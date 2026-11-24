@@ -208,6 +208,8 @@ type Server struct {
 	// each nil without Firecracker.
 	taps *tapCalls
 	gf   *guestFirewall
+	// moves serves gVisor checkpoint moves; nil without them (moves.go).
+	moves *moveCalls
 
 	// endless are the cancels of calls in flight that only their caller
 	// ends (endlessCalls); draining is set once Shutdown began.
@@ -260,16 +262,23 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 		mc.close()
 		return nil, err
 	}
+	mv, err := newMoveCalls(cfg, locks, log)
+	if err != nil {
+		f.close()
+		mc.close()
+		return nil, err
+	}
 	ln, sock := opts.Listener, os.FileInfo(nil)
 	if ln == nil {
 		if ln, sock, err = listen(cfg.Socket, cfg.SocketGID); err != nil {
 			f.close()
 			mc.close()
+			mv.close()
 			return nil, err
 		}
 	}
 	s.files, s.ln, s.sock = f, ln, sock
-	s.mounts = mc
+	s.mounts, s.moves = mc, mv
 	sopts := append(slices.Clone(opts.ServerOptions),
 		grpc.MaxConcurrentStreams(maxStreams),
 		grpc.Creds(peerCreds{check: peer, refused: s.peerRefused}),
@@ -288,7 +297,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
 		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts, tc: s.taps, gf: s.gf,
-		wm: newWasmMountCalls(cfg, opts, mc, s.hosts, log)})
+		wm: newWasmMountCalls(cfg, opts, mc, s.hosts, log), mv: mv})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -393,6 +402,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 		s.hosts.close()
 		s.taps.close()
 		s.gf.close()
+		s.moves.close()
 	})
 }
 
@@ -545,6 +555,8 @@ type helper struct {
 	// wm lends WASM sandboxes' mount points to their hosts; nil unless the
 	// helper serves both mounts and WASM hosts.
 	wm *wasmMountCalls
+	// mv serves gVisor checkpoint moves; nil without them.
+	mv *moveCalls
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -586,6 +598,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.wm != nil {
 		served = append(served, rootdpb.FeatureGrantWasmMounts)
+	}
+	if h.mv != nil {
+		served = append(served, moveFeatures...)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts(),
 		Hosts: h.hc.servedKinds()}, nil
@@ -969,6 +984,63 @@ func (h helper) GrantWasmMounts(ctx context.Context, req *rootdpb.GrantWasmMount
 	}
 	resp, err := h.wm.grant(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_GrantWasmMounts_FullMethodName, resp, err)
+}
+
+func (h helper) CheckpointMove(ctx context.Context, req *rootdpb.CheckpointMoveRequest) (*rootdpb.CheckpointMoveResponse, error) {
+	if h.mv == nil {
+		return nil, noMoves(rootdpb.FeatureCheckpointMove)
+	}
+	resp, err := h.mv.checkpoint(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_CheckpointMove_FullMethodName, resp, err)
+}
+
+// ExportMove is a stream, which the unary interceptor's field check does
+// not see: it checks its one request itself.
+func (h helper) ExportMove(req *rootdpb.ExportMoveRequest, stream grpc.ServerStreamingServer[rootdpb.MoveChunk]) error {
+	if h.mv == nil {
+		return noMoves(rootdpb.FeatureExportMove)
+	}
+	ctx := stream.Context()
+	err := noUnknownFields(req)
+	if err == nil {
+		err = h.mv.export(ctx, req, stream.Send)
+	}
+	_, err = answer(ctx, h, rootdpb.RootHelper_ExportMove_FullMethodName, struct{}{}, err)
+	return err
+}
+
+func (h helper) ImportMove(stream grpc.ClientStreamingServer[rootdpb.ImportMoveRequest, rootdpb.ImportMoveResponse]) error {
+	if h.mv == nil {
+		return noMoves(rootdpb.FeatureImportMove)
+	}
+	ctx := stream.Context()
+	resp, err := h.mv.importBundle(ctx, stream.Recv)
+	if resp, err = answer(ctx, h, rootdpb.RootHelper_ImportMove_FullMethodName, resp, err); err != nil {
+		return err
+	}
+	return stream.SendAndClose(resp)
+}
+
+func (h helper) StagedMove(ctx context.Context, req *rootdpb.StagedMoveRequest) (*rootdpb.StagedMoveResponse, error) {
+	if h.mv == nil {
+		return nil, noMoves(rootdpb.FeatureStagedMove)
+	}
+	resp, err := h.mv.staged(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_StagedMove_FullMethodName, resp, err)
+}
+
+func (h helper) DropMove(ctx context.Context, req *rootdpb.DropMoveRequest) (*rootdpb.DropMoveResponse, error) {
+	if h.mv == nil {
+		return nil, noMoves(rootdpb.FeatureDropMove)
+	}
+	resp, err := h.mv.drop(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_DropMove_FullMethodName, resp, err)
+}
+
+// noMoves answers a move call on a helper whose settings take no gVisor
+// checkpoint moves, as one it lacks, which is what Version told the agent.
+func noMoves(call string) error {
+	return status.Errorf(codes.Unimplemented, "root helper %s: %s needs gVisor checkpoint moves (SB_GVISOR_CHECKPOINT_MOVES) in its own settings", version.Version, call)
 }
 
 // noFirecracker answers a Firecracker call on a helper whose settings run

@@ -125,6 +125,9 @@ type Config struct {
 	HostPorts rootpolicy.HostPortBounds
 	// Hosts are the host-process runtimes' settings (hosts.go).
 	Hosts HostsConfig
+	// Moves is gVisor checkpoint moves (moves.go); nil when this node
+	// takes none, and the helper serves no move call.
+	Moves *MovesConfig
 }
 
 // HostsConfig is what the helper starts host processes with (M1 PR 9),
@@ -440,7 +443,68 @@ func (c Config) Validate() error {
 	if err := c.Files.validate(c.Policy, filepath.Dir(c.Socket)); err != nil {
 		return err
 	}
+	if err := c.Moves.validate(); err != nil {
+		return err
+	}
 	return c.Mounts.validate(c)
+}
+
+// validate checks the move settings: runsc and its state root by clean
+// absolute paths, and a bound on bundles' size and number.
+func (m *MovesConfig) validate() error {
+	if m == nil {
+		return nil
+	}
+	for _, p := range []struct{ name, path string }{{"runsc", m.Runsc}, {"runsc state root", m.StateRoot}} {
+		if !filepath.IsAbs(p.path) || filepath.Clean(p.path) != p.path || p.path == "/" {
+			return fmt.Errorf("root helper: %s %q: want a clean absolute path other than /", p.name, p.path)
+		}
+	}
+	if m.MaxBundleBytes <= 0 || m.MaxStaged <= 0 || m.MaxStaged > maxStagedMoves {
+		return fmt.Errorf("root helper: move bundles of %d bytes, %d at once: want a size above 0 and 1 to %d at once",
+			m.MaxBundleBytes, m.MaxStaged, maxStagedMoves)
+	}
+	return nil
+}
+
+// maxStagedMoves bounds SB_ROOTD_MOVE_MAX_STAGED: every one is a folder of
+// a node's memory's size, at most.
+const maxStagedMoves = 256
+
+// movesFromEnv is Config.Moves, on with sandboxd's own
+// SB_GVISOR_CHECKPOINT_MOVES, so the operator sets one value for both. The
+// runsc the helper runs and the state it reads must not be in a folder the
+// agent writes.
+func movesFromEnv(getenv func(string) string, path func(k, def string) string, limits rootpolicy.Limits, agentDirs []string) (*MovesConfig, error) {
+	on, err := envBool(getenv, "SB_GVISOR_CHECKPOINT_MOVES")
+	if err != nil || !on {
+		return nil, err
+	}
+	staged, err := envInt(getenv, "SB_ROOTD_MOVE_MAX_STAGED", defaultMaxStagedMoves)
+	if err != nil {
+		return nil, err
+	}
+	// Twice the node's memory: one sandbox's memory and its root overlay
+	// cannot pass it. Capped, so the double cannot overflow.
+	size := int64(math.MaxInt64)
+	if limits.MemoryBytes > 0 && limits.MemoryBytes <= math.MaxInt64/2 {
+		size = 2 * limits.MemoryBytes
+	}
+	if v := strings.TrimSpace(getenv("SB_ROOTD_MOVE_MAX_BYTES")); v != "" {
+		if size, err = strconv.ParseInt(v, 10, 64); err != nil || size <= 0 {
+			return nil, fmt.Errorf("SB_ROOTD_MOVE_MAX_BYTES=%q: want a number of bytes above 0", v)
+		}
+	}
+	m := &MovesConfig{Runsc: path("SB_ROOTD_RUNSC", defaultRunsc), StateRoot: path("SB_ROOTD_RUNSC_ROOT", defaultRunscStateRoot),
+		MaxBundleBytes: size, MaxStaged: staged}
+	for _, a := range agentDirs {
+		for _, p := range []struct{ name, dir string }{{"SB_ROOTD_RUNSC", filepath.Dir(m.Runsc)}, {"SB_ROOTD_RUNSC_ROOT", m.StateRoot}} {
+			if p.dir == a || strings.HasPrefix(p.dir, a+"/") {
+				return nil, fmt.Errorf("%s: %s is in %s, which the agent writes", p.name, p.dir, a)
+			}
+		}
+	}
+	return m, nil
 }
 
 // validate checks the mount folders: the policy's mounts root, and none
@@ -688,6 +752,9 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.Hosts, err = hostsFromEnv(getenv, path, stateDir, uid, gid, enterprise, nodePorts, []string{runDir, mountsRoot, credDir, dataDir}); err != nil {
+		return Config{}, err
+	}
+	if cfg.Moves, err = movesFromEnv(getenv, path, limits, []string{runDir, mountsRoot, credDir, dataDir}); err != nil {
 		return Config{}, err
 	}
 	if pathErr != nil {

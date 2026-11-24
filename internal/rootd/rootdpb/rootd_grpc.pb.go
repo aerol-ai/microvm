@@ -70,6 +70,11 @@ const (
 	RootHelper_ShareFirecrackerFiles_FullMethodName   = "/aerolvm.rootd.v1.RootHelper/ShareFirecrackerFiles"
 	RootHelper_HandOutFirecrackerFiles_FullMethodName = "/aerolvm.rootd.v1.RootHelper/HandOutFirecrackerFiles"
 	RootHelper_GrantWasmMounts_FullMethodName         = "/aerolvm.rootd.v1.RootHelper/GrantWasmMounts"
+	RootHelper_CheckpointMove_FullMethodName          = "/aerolvm.rootd.v1.RootHelper/CheckpointMove"
+	RootHelper_ExportMove_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/ExportMove"
+	RootHelper_ImportMove_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/ImportMove"
+	RootHelper_StagedMove_FullMethodName              = "/aerolvm.rootd.v1.RootHelper/StagedMove"
+	RootHelper_DropMove_FullMethodName                = "/aerolvm.rootd.v1.RootHelper/DropMove"
 )
 
 // RootHelperClient is the client API for RootHelper service.
@@ -249,6 +254,23 @@ type RootHelperClient interface {
 	// over the same socket. Safe to retry and to repeat: a later loan
 	// replaces an earlier one.
 	GrantWasmMounts(ctx context.Context, in *GrantWasmMountsRequest, opts ...grpc.CallOption) (*GrantWasmMountsResponse, error)
+	// CheckpointMove saves a running gVisor sandbox for a move, in place of
+	// any checkpoint saved for it before. runsc ends the sandbox once it is
+	// saved.
+	CheckpointMove(ctx context.Context, in *CheckpointMoveRequest, opts ...grpc.CallOption) (*CheckpointMoveResponse, error)
+	// ExportMove sends the checkpoint CheckpointMove saved for a sandbox, as
+	// a move bundle (internal/runtime/movebundle).
+	ExportMove(ctx context.Context, in *ExportMoveRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MoveChunk], error)
+	// ImportMove takes a move bundle for a sandbox and stages it for the
+	// sandbox's restore, in place of any staged before. A bundle that is
+	// not whole is not staged.
+	ImportMove(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportMoveRequest, ImportMoveResponse], error)
+	// StagedMove says where the checkpoint staged for a sandbox is, for its
+	// restore's spec; empty when none is.
+	StagedMove(ctx context.Context, in *StagedMoveRequest, opts ...grpc.CallOption) (*StagedMoveResponse, error)
+	// DropMove makes sure a sandbox's checkpoints are gone, on the sides the
+	// request names.
+	DropMove(ctx context.Context, in *DropMoveRequest, opts ...grpc.CallOption) (*DropMoveResponse, error)
 }
 
 type rootHelperClient struct {
@@ -649,6 +671,68 @@ func (c *rootHelperClient) GrantWasmMounts(ctx context.Context, in *GrantWasmMou
 	return out, nil
 }
 
+func (c *rootHelperClient) CheckpointMove(ctx context.Context, in *CheckpointMoveRequest, opts ...grpc.CallOption) (*CheckpointMoveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckpointMoveResponse)
+	err := c.cc.Invoke(ctx, RootHelper_CheckpointMove_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) ExportMove(ctx context.Context, in *ExportMoveRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MoveChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RootHelper_ServiceDesc.Streams[0], RootHelper_ExportMove_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ExportMoveRequest, MoveChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RootHelper_ExportMoveClient = grpc.ServerStreamingClient[MoveChunk]
+
+func (c *rootHelperClient) ImportMove(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportMoveRequest, ImportMoveResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &RootHelper_ServiceDesc.Streams[1], RootHelper_ImportMove_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ImportMoveRequest, ImportMoveResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RootHelper_ImportMoveClient = grpc.ClientStreamingClient[ImportMoveRequest, ImportMoveResponse]
+
+func (c *rootHelperClient) StagedMove(ctx context.Context, in *StagedMoveRequest, opts ...grpc.CallOption) (*StagedMoveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StagedMoveResponse)
+	err := c.cc.Invoke(ctx, RootHelper_StagedMove_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *rootHelperClient) DropMove(ctx context.Context, in *DropMoveRequest, opts ...grpc.CallOption) (*DropMoveResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DropMoveResponse)
+	err := c.cc.Invoke(ctx, RootHelper_DropMove_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // RootHelperServer is the server API for RootHelper service.
 // All implementations must embed UnimplementedRootHelperServer
 // for forward compatibility.
@@ -826,6 +910,23 @@ type RootHelperServer interface {
 	// over the same socket. Safe to retry and to repeat: a later loan
 	// replaces an earlier one.
 	GrantWasmMounts(context.Context, *GrantWasmMountsRequest) (*GrantWasmMountsResponse, error)
+	// CheckpointMove saves a running gVisor sandbox for a move, in place of
+	// any checkpoint saved for it before. runsc ends the sandbox once it is
+	// saved.
+	CheckpointMove(context.Context, *CheckpointMoveRequest) (*CheckpointMoveResponse, error)
+	// ExportMove sends the checkpoint CheckpointMove saved for a sandbox, as
+	// a move bundle (internal/runtime/movebundle).
+	ExportMove(*ExportMoveRequest, grpc.ServerStreamingServer[MoveChunk]) error
+	// ImportMove takes a move bundle for a sandbox and stages it for the
+	// sandbox's restore, in place of any staged before. A bundle that is
+	// not whole is not staged.
+	ImportMove(grpc.ClientStreamingServer[ImportMoveRequest, ImportMoveResponse]) error
+	// StagedMove says where the checkpoint staged for a sandbox is, for its
+	// restore's spec; empty when none is.
+	StagedMove(context.Context, *StagedMoveRequest) (*StagedMoveResponse, error)
+	// DropMove makes sure a sandbox's checkpoints are gone, on the sides the
+	// request names.
+	DropMove(context.Context, *DropMoveRequest) (*DropMoveResponse, error)
 	mustEmbedUnimplementedRootHelperServer()
 }
 
@@ -952,6 +1053,21 @@ func (UnimplementedRootHelperServer) HandOutFirecrackerFiles(context.Context, *F
 }
 func (UnimplementedRootHelperServer) GrantWasmMounts(context.Context, *GrantWasmMountsRequest) (*GrantWasmMountsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GrantWasmMounts not implemented")
+}
+func (UnimplementedRootHelperServer) CheckpointMove(context.Context, *CheckpointMoveRequest) (*CheckpointMoveResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckpointMove not implemented")
+}
+func (UnimplementedRootHelperServer) ExportMove(*ExportMoveRequest, grpc.ServerStreamingServer[MoveChunk]) error {
+	return status.Error(codes.Unimplemented, "method ExportMove not implemented")
+}
+func (UnimplementedRootHelperServer) ImportMove(grpc.ClientStreamingServer[ImportMoveRequest, ImportMoveResponse]) error {
+	return status.Error(codes.Unimplemented, "method ImportMove not implemented")
+}
+func (UnimplementedRootHelperServer) StagedMove(context.Context, *StagedMoveRequest) (*StagedMoveResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StagedMove not implemented")
+}
+func (UnimplementedRootHelperServer) DropMove(context.Context, *DropMoveRequest) (*DropMoveResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DropMove not implemented")
 }
 func (UnimplementedRootHelperServer) mustEmbedUnimplementedRootHelperServer() {}
 func (UnimplementedRootHelperServer) testEmbeddedByValue()                    {}
@@ -1676,6 +1792,78 @@ func _RootHelper_GrantWasmMounts_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RootHelper_CheckpointMove_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckpointMoveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).CheckpointMove(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_CheckpointMove_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).CheckpointMove(ctx, req.(*CheckpointMoveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_ExportMove_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ExportMoveRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(RootHelperServer).ExportMove(m, &grpc.GenericServerStream[ExportMoveRequest, MoveChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RootHelper_ExportMoveServer = grpc.ServerStreamingServer[MoveChunk]
+
+func _RootHelper_ImportMove_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(RootHelperServer).ImportMove(&grpc.GenericServerStream[ImportMoveRequest, ImportMoveResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type RootHelper_ImportMoveServer = grpc.ClientStreamingServer[ImportMoveRequest, ImportMoveResponse]
+
+func _RootHelper_StagedMove_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StagedMoveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).StagedMove(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_StagedMove_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).StagedMove(ctx, req.(*StagedMoveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RootHelper_DropMove_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DropMoveRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RootHelperServer).DropMove(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RootHelper_DropMove_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RootHelperServer).DropMove(ctx, req.(*DropMoveRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // RootHelper_ServiceDesc is the grpc.ServiceDesc for RootHelper service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1839,7 +2027,30 @@ var RootHelper_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "GrantWasmMounts",
 			Handler:    _RootHelper_GrantWasmMounts_Handler,
 		},
+		{
+			MethodName: "CheckpointMove",
+			Handler:    _RootHelper_CheckpointMove_Handler,
+		},
+		{
+			MethodName: "StagedMove",
+			Handler:    _RootHelper_StagedMove_Handler,
+		},
+		{
+			MethodName: "DropMove",
+			Handler:    _RootHelper_DropMove_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ExportMove",
+			Handler:       _RootHelper_ExportMove_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ImportMove",
+			Handler:       _RootHelper_ImportMove_Handler,
+			ClientStreams: true,
+		},
+	},
 	Metadata: "rootd.proto",
 }

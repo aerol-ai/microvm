@@ -124,6 +124,10 @@ func TestHostLabels(t *testing.T) {
 			map[string]string{"aerolvm.io/pool": "general", cluster.CheckpointMovesLabel: "true"}},
 		{"switch on, no labels of its own", config.Config{GvisorCheckpointMoves: true, ContainerEngine: models.ContainerEngineContainerd},
 			map[string]string{cluster.CheckpointMovesLabel: "true"}},
+		// M1 PR 13: the value is the privilege mode; a split worker moves
+		// gVisor sandboxes only to another split worker.
+		{"switch on, privilege mode split", config.Config{NodeLabels: pool, GvisorCheckpointMoves: true, ContainerEngine: models.ContainerEngineContainerd,
+			PrivilegeMode: privmode.Split}, map[string]string{"aerolvm.io/pool": "general", cluster.CheckpointMovesLabel: "split"}},
 	} {
 		got := hostLabels(tc.cfg)
 		if !maps.Equal(got, tc.labels) {

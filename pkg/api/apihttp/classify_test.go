@@ -80,7 +80,7 @@ func TestClassify(t *testing.T) {
 		{"runtime not implemented", models.ErrRuntimeNotImplemented, http.StatusNotImplemented, 0, "", ErrKindOther},
 		// A split-mode node's refusal of a step it does not cover yet,
 		// wrapped as a caller wraps it: 501, not a 5xx a client retries.
-		{"refused by privilege mode split", fmt.Errorf("create sandbox: %w", privmode.NotYet("claim a warm sandbox", privmode.StepWarmPool)), http.StatusNotImplemented, 0, "", ErrKindOther},
+		{"refused by privilege mode split", fmt.Errorf("create sandbox: %w", privmode.NotYet("claim a warm VM", privmode.StepFirecrackerWarmPool)), http.StatusNotImplemented, 0, "", ErrKindOther},
 		// The root helper: down, or older than the agent (M1). Both clear
 		// on their own (a restart, the staged helper's swap), so 503.
 		{"root helper unavailable", fmt.Errorf("%w at /run/aerolvm/root.sock: connection refused", rootclient.ErrUnavailable), http.StatusServiceUnavailable, 5, "", ErrKindOther},

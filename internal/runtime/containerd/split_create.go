@@ -101,6 +101,9 @@ type splitCreate struct {
 	config ocispec.Image
 	// ready is the agent's ready socket, bound before the call named it.
 	ready *dockerpkg.ReadyListener
+	// parkSocket is a warm-pool slot's park socket, named in the helper's
+	// folder (createParts.Park); "" for any other create.
+	parkSocket string
 	// leaseCtx carries the snapshot's lease, for the container's create;
 	// done ends the lease once the container holds the snapshot.
 	leaseCtx context.Context
@@ -155,7 +158,8 @@ func (d *Driver) prepareSplitCreate(ctx context.Context, client *Client, image c
 		s.release(uctx)
 	}()
 	var nonce string
-	if d.cfg.ReadyEnabled {
+	// A park's socket is the parked listener its caller bound already.
+	if d.cfg.ReadyEnabled && !req.Park {
 		if err = dockerpkg.EnsureReadyDir(d.cfg.ReadyDir); err != nil {
 			return nil, err
 		}
@@ -190,6 +194,13 @@ func (d *Driver) prepareSplitCreate(ctx context.Context, client *Client, image c
 		}
 		d.imageUsers.put(cacheKey, s.user)
 	}
+	if req.Park {
+		// After the files part: its answer is checked first, and the undo
+		// above removes this name with the container's other files.
+		if s.parkSocket, err = d.parkSocketName(ctx, sandboxID); err != nil {
+			return nil, err
+		}
+	}
 	return s, nil
 }
 
@@ -199,6 +210,10 @@ type createParts struct {
 	Restore    bool
 	// DiskBytes is the disk limit, 0 for none.
 	DiskBytes uint64
+	// Park is a warm-pool slot's create (split_park.go): its ready socket
+	// is the park socket its caller bound, which the helper names with no
+	// nonce, after the files part.
+	Park bool
 }
 
 // readSplitImageConfig reads image's config once, for the whole split

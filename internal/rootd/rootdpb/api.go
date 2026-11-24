@@ -78,6 +78,14 @@ const (
 
 	// A WASM sandbox's external mounts, lent to its host (M1 PR 15).
 	FeatureGrantWasmMounts = "GrantWasmMounts"
+
+	// gVisor checkpoint moves (M1 PR 13). ExportMove and ImportMove are the
+	// helper's two streaming calls.
+	FeatureCheckpointMove = "CheckpointMove"
+	FeatureExportMove     = "ExportMove"
+	FeatureImportMove     = "ImportMove"
+	FeatureStagedMove     = "StagedMove"
+	FeatureDropMove       = "DropMove"
 )
 
 // The parts of PrepareSandbox and ReleaseSandbox (VersionResponse.parts).
@@ -135,7 +143,8 @@ func Features() []string {
 		FeatureEnsureTap, FeatureRemoveTap, FeatureMakeFilesystem,
 		FeatureEnsureGuestFirewall, FeatureSetGuestNodeGuard, FeatureSetGuestEgressFloor, FeatureGuestRules,
 		FeatureShareFirecrackerFiles, FeatureHandOutFirecrackerFiles,
-		FeatureGrantWasmMounts}
+		FeatureGrantWasmMounts,
+		FeatureCheckpointMove, FeatureExportMove, FeatureImportMove, FeatureStagedMove, FeatureDropMove}
 }
 
 // HostKindName is a host kind's name in VersionResponse.hosts, "" for

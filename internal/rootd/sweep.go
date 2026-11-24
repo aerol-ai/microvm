@@ -81,6 +81,21 @@ func (s *Server) SweepContainerFiles(ctx context.Context, lister ContainerLister
 	return removed, nil
 }
 
+// SweepMoves removes the move folders a crash left behind (moves.go): a
+// staged bundle older than grace, and a saved checkpoint older than grace
+// whose container the lister no longer has. It returns the sandboxes whose
+// folders it removed; none when this helper takes no moves.
+func (s *Server) SweepMoves(ctx context.Context, lister ContainerLister, grace time.Duration) ([]string, error) {
+	if s.moves == nil {
+		return nil, nil
+	}
+	live, err := lister.ContainerIDs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("root helper: list containers: %w", err)
+	}
+	return s.moves.sweep(ctx, live, grace), nil
+}
+
 // sweepLoop sweeps on sweepFirst, then every sweepEvery, until ctx ends.
 func (s *Server) sweepLoop(ctx context.Context, lister ContainerLister) {
 	t := time.NewTimer(sweepFirst)
@@ -97,6 +112,11 @@ func (s *Server) sweepLoop(ctx context.Context, lister ContainerLister) {
 			s.log.Warn("root helper: sweep of gone containers' files failed", "error", err)
 		case len(removed) > 0:
 			s.log.Info("root helper: removed gone containers' files", "containers", len(removed))
+		}
+		if moved, err := s.SweepMoves(ctx, lister, moveSweepGrace); err != nil && ctx.Err() == nil {
+			s.log.Warn("root helper: sweep of old move folders failed", "error", err)
+		} else if len(moved) > 0 {
+			s.log.Info("root helper: removed old move folders", "sandboxes", len(moved))
 		}
 		t.Reset(sweepEvery)
 	}

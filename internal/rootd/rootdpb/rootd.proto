@@ -296,6 +296,38 @@ service RootHelper {
   // over the same socket. Safe to retry and to repeat: a later loan
   // replaces an earlier one.
   rpc GrantWasmMounts(GrantWasmMountsRequest) returns (GrantWasmMountsResponse);
+
+  // The calls below are gVisor checkpoint moves (M1 PR 13; C21 of the
+  // Kubernetes plan): a running gVisor sandbox moves to another worker
+  // with its memory. On the source the helper runs runsc checkpoint, which
+  // saves the sandbox in the helper's moves folder and ends it, and sends
+  // that checkpoint out as a move bundle; on the target it takes a bundle
+  // in and stages it, where the restored sandbox's runsc reads it. The
+  // agent names a sandbox by its ID alone. The helper builds every path in
+  // its moves folder, which only root can open, reads only bundles of the
+  // move bundle format, and bounds their size and number.
+
+  // CheckpointMove saves a running gVisor sandbox for a move, in place of
+  // any checkpoint saved for it before. runsc ends the sandbox once it is
+  // saved.
+  rpc CheckpointMove(CheckpointMoveRequest) returns (CheckpointMoveResponse);
+
+  // ExportMove sends the checkpoint CheckpointMove saved for a sandbox, as
+  // a move bundle (internal/runtime/movebundle).
+  rpc ExportMove(ExportMoveRequest) returns (stream MoveChunk);
+
+  // ImportMove takes a move bundle for a sandbox and stages it for the
+  // sandbox's restore, in place of any staged before. A bundle that is
+  // not whole is not staged.
+  rpc ImportMove(stream ImportMoveRequest) returns (ImportMoveResponse);
+
+  // StagedMove says where the checkpoint staged for a sandbox is, for its
+  // restore's spec; empty when none is.
+  rpc StagedMove(StagedMoveRequest) returns (StagedMoveResponse);
+
+  // DropMove makes sure a sandbox's checkpoints are gone, on the sides the
+  // request names.
+  rpc DropMove(DropMoveRequest) returns (DropMoveResponse);
 }
 
 message VersionRequest {
@@ -1087,3 +1119,56 @@ message GrantWasmMountsResponse {
   // here.
   uint32 granted = 1;
 }
+
+message CheckpointMoveRequest {
+  // The sandbox: its containerd container, run by the gVisor shim in the
+  // helper's containerd namespace.
+  string sandbox_id = 1;
+}
+
+message CheckpointMoveResponse {}
+
+message ExportMoveRequest {
+  string sandbox_id = 1;
+}
+
+// MoveChunk is the next part of a move bundle's bytes.
+message MoveChunk {
+  bytes data = 1;
+}
+
+message ImportMoveRequest {
+  // The first message names the sandbox; the later ones leave it empty.
+  string sandbox_id = 1;
+  // The next part of the bundle's bytes.
+  bytes data = 2;
+}
+
+message ImportMoveResponse {
+  // The staged checkpoint's folder, for the restore's spec.
+  string restore_path = 1;
+}
+
+message StagedMoveRequest {
+  string sandbox_id = 1;
+}
+
+message StagedMoveResponse {
+  // The staged checkpoint's folder; empty when none is staged.
+  string restore_path = 1;
+}
+
+// MoveSide is one side of a move: the checkpoint a sandbox was saved to
+// here, or one staged here for its restore.
+enum MoveSide {
+  MOVE_SIDE_UNSPECIFIED = 0;
+  MOVE_SIDE_OUT = 1;
+  MOVE_SIDE_IN = 2;
+}
+
+message DropMoveRequest {
+  string sandbox_id = 1;
+  repeated MoveSide sides = 2;
+}
+
+message DropMoveResponse {}

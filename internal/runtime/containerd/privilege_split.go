@@ -32,7 +32,10 @@ import (
 //     names them, in the helper's own folders, and remove them with the
 //     container (M1 PR 7, split_files.go); and, in a create's same call,
 //     limit the writable layer and resolve the image's user from the
-//     image's own files (split_create.go).
+//     image's own files (split_create.go);
+//   - it parks, claims, starts and tears down the warm pool's slots the
+//     same way, with the helper's name for each slot's park socket (M1
+//     PR 13, split_park.go).
 //
 // The netns pool's build and teardown go through the helper too, in
 // pkg/daemon's wiring. The rest of a create and a start is root work the
@@ -49,15 +52,25 @@ type RootHelper interface {
 	NetnsAddrs(ctx context.Context, name string) (exists bool, ipv4 []string, err error)
 }
 
+// ParkSockets is the helper's EnsureReadySocket as the warm pool uses it
+// (*rootclient.Client): it names a warm-pool slot's park socket, which the
+// agent bound in its own ready folder, in the helper's folder, for the
+// slot's spec to bind (split_park.go).
+type ParkSockets interface {
+	EnsureReadySocket(ctx context.Context, containerID, nonce string) (string, error)
+}
+
 // SetRootHelper puts the driver in privilege mode split. Call it before
 // the first call that reaches containerd. A helper client with container
 // parts (ContainerParts) makes the containers' files too; one without
-// leaves creates and starts refused for want of them.
+// leaves creates and starts refused for want of them. One that also names
+// park sockets (ParkSockets) serves the warm pool.
 func (d *Driver) SetRootHelper(h RootHelper) {
 	d.clientMu.Lock()
 	defer d.clientMu.Unlock()
 	d.helper = h
 	d.parts, _ = h.(ContainerParts)
+	d.parkSockets, _ = h.(ParkSockets)
 }
 
 // connectHelperFn connects to containerd through the helper's gate; tests

@@ -139,7 +139,7 @@ helper).
 | Folders from the machine | none | `/sys/fs/cgroup`, read only, in `agent` alone: it reads its sandboxes' memory and CPU there, and cannot write a cgroup file |
 | External storage | off by default | on by default: the helper runs the mount tools as their own user, in the `runtime` container |
 | Folders root writes | n/a | none the `agent` can write: see below |
-| `split-folders` (first) | absent | root with `CAP_CHOWN` only; sets four folders' owners, then exits |
+| `split-folders` (first) | absent | root with `CAP_CHOWN` only; sets five folders' owners, then exits |
 
 **Folders shared with the `agent` in split.** No root process writes in a
 folder the `agent` can write. Three containers start as root: `runtime`,
@@ -161,14 +161,17 @@ container starts as root.
 | `cni-state` | not mounted | `split-folders` and `runtime` write | `split-folders` closes it to other users (0755); the CNI plugins' address records |
 | `run-containerd` | not mounted | `runtime` writes | containerd's socket |
 | `egress-state` | not mounted | `egress` writes | the gateway's rule snapshot and each sandbox's learn-mode record |
-| containerd's volume | one empty folder, read only | `runtime` writes | containerd's images and layers |
+| containerd's volume | one empty folder, read only | `split-folders` and `runtime` write | containerd's images and layers; in a folder of its own, `aerolvm-rootd-moves`, the helper's gVisor move checkpoints: `split-folders` makes it root's alone (0700) |
 | `host-cgroup` (machine) | read only | not mounted | none |
 
 What split does not run yet, refused by name at `helm install`: Firecracker,
-WASM and V8-isolate sandboxes, gVisor moves with memory, and the kubectl
-API's warm pools. `sandboxd` itself runs Firecracker in split, except with
-its VM pool; the chart refuses it because it does not wire Firecracker into
-a split pod yet, and no live run has proven it there.
+WASM and V8-isolate sandboxes. Since M1 PR 13 split runs the container
+warm pool, the kubectl API's warm pools and gVisor moves with memory
+(`worker.gvisor.checkpointMoves` stays off by default in split). A gVisor
+sandbox moves only between workers of one privilege mode. `sandboxd`
+itself runs Firecracker in split, except with its VM pool; the chart
+refuses it because it does not wire Firecracker into a split pod yet, and
+no live run has proven it there.
 
 What is proven so far, and how:
 

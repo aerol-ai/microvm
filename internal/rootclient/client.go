@@ -686,6 +686,17 @@ var retrySafe = map[string]bool{
 	// A WASM sandbox's mount points lent again (M1 PR 15) replace the
 	// host's earlier loan of the same folders.
 	rootdpb.FeatureGrantWasmMounts: true,
+	// gVisor checkpoint moves (M1 PR 13). StagedMove is a read and
+	// DropMove "make sure it is gone". CheckpointMove is not tried again:
+	// runsc ends the sandbox once it is saved, so a second try finds no
+	// sandbox and would clear the checkpoint the first one saved. The two
+	// streams are not either: an export has written part of the bundle
+	// already, and an import's reader has been read.
+	rootdpb.FeatureCheckpointMove: false,
+	rootdpb.FeatureExportMove:     false,
+	rootdpb.FeatureImportMove:     false,
+	rootdpb.FeatureStagedMove:     true,
+	rootdpb.FeatureDropMove:       true,
 }
 
 // Retries of a dropped call: a growing wait from retryFirstWait to
@@ -763,6 +774,9 @@ func (c *Client) callContext(ctx context.Context, feature string) (context.Conte
 	}
 	if mountCalls[feature] {
 		return context.WithTimeout(ctx, c.mountTimeout)
+	}
+	if moveCalls[feature] {
+		return context.WithTimeout(ctx, DefaultMoveTimeout)
 	}
 	return context.WithTimeout(ctx, c.timeout)
 }

@@ -20,7 +20,6 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
-	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
@@ -83,10 +82,17 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		return nil, err
 	}
 	// A move's recreate resumes a gVisor sandbox from the checkpoint staged
-	// here (gvisor_move.go), never from the warm pool.
+	// here (gvisor_move.go; the helper's in privilege mode split,
+	// split_moves.go), never from the warm pool.
 	restore := sbruntime.RestoreRequested(ctx)
-	if restore && (ociRuntime != "runsc" || !d.staged(sandboxID)) {
-		return nil, fmt.Errorf("containerd runtime: no gVisor checkpoint is staged for %s", sandboxID)
+	var restoreOpt oci.SpecOpts
+	if restore {
+		if ociRuntime != "runsc" {
+			return nil, errNotStaged(sandboxID)
+		}
+		if restoreOpt, err = d.restoreSpec(ctx, sandboxID); err != nil {
+			return nil, err
+		}
 	}
 
 	if d.warmPool != nil && !restore {
@@ -325,11 +331,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		specOpts = append(specOpts, runscSandboxAnnotationOpt())
 		mountSpecs = append(mountSpecs, runscCgroupMount())
 		if restore {
-			opt, err := d.restoreSpecOpt(sandboxID)
-			if err != nil {
-				return nil, err
-			}
-			specOpts = append(specOpts, opt)
+			specOpts = append(specOpts, restoreOpt)
 		}
 	}
 
@@ -545,7 +547,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if restore {
 		// Used: a later start of this container boots it, and the wrapper
 		// then passes the start through.
-		if dir, err := d.moveDir(moveIn, sandboxID); err == nil {
+		if d.helper != nil {
+			d.splitDropMove(ctx, sandboxID, rootdpb.MoveSide_MOVE_SIDE_IN)
+		} else if dir, err := d.moveDir(moveIn, sandboxID); err == nil {
 			_ = os.RemoveAll(dir)
 		}
 	}
@@ -646,7 +650,12 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 		return nil, fmt.Errorf("load container: %w", err)
 	}
 	// A move's checkpoint of this sandbox is stale once it runs here again.
-	if dir, err := d.moveDir(moveOut, containerRef); err == nil {
+	// In privilege mode split it is the helper's, and only a gVisor
+	// container has one: LoadContainer has just read the record, so its
+	// runtime costs no trip through the gate (splitStaleCheckpoint).
+	if d.helper != nil {
+		d.splitStaleCheckpoint(ctx, container)
+	} else if dir, err := d.moveDir(moveOut, containerRef); err == nil {
 		_ = os.RemoveAll(dir)
 	}
 	task, err := container.Task(ctx, nil)
@@ -670,7 +679,7 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 			return nil, fmt.Errorf("container host files: %w", err)
 		}
 	}
-	parked, err := d.parkedRestartListener(spec, sandboxID, toolboxToken)
+	parked, err := d.parkedRestartListener(spec, containerRef, sandboxID, toolboxToken)
 	if err != nil {
 		return nil, err
 	}
@@ -698,14 +707,19 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 		// Privilege mode split: the helper makes the container's files
 		// again (split_files.go): fresh FIFOs, the ready socket's new name,
 		// and the host files and toolbox, left as they are when unchanged.
+		// An adopted warm-pool container's ready socket is its park
+		// socket, which parked bound again above (split_park.go).
+		var files *rootdpb.SandboxFilePaths
+		var ferr error
 		if parked != nil {
-			return nil, privmode.NotYet("start a warm-pool container", privmode.StepWarmPool)
+			files, ferr = d.splitParkFiles(ctx, containerRef, specReadySource(spec))
+		} else {
+			rl, nonce := d.splitReadyResume(spec)
+			if rl != nil {
+				defer func() { _ = rl.Close() }()
+			}
+			files, ferr = d.helperFiles(ctx, containerRef, nonce, rootdpb.RunscConfig_RUNSC_CONFIG_UNSPECIFIED)
 		}
-		rl, nonce := d.splitReadyResume(spec)
-		if rl != nil {
-			defer func() { _ = rl.Close() }()
-		}
-		files, ferr := d.helperFiles(ctx, containerRef, nonce, rootdpb.RunscConfig_RUNSC_CONFIG_UNSPECIFIED)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -786,8 +800,13 @@ func (d *Driver) startTask(ctx context.Context, containerRef, sandboxID, toolbox
 // The hello must carry the bootstrap token and park nonce in the spec's env,
 // and it arrives on the host socket the spec's ready mount names, which must
 // be a park socket directly in the ready dir: the listener unlinks whatever
-// is at that path before it binds.
-func (d *Driver) parkedRestartListener(spec *specs.Spec, sandboxID, toolboxToken string) (*dockerpkg.ParkedListener, error) {
+// is at that path before it binds. In privilege mode split the spec binds
+// the helper's name for the slot's park socket instead, <helper ready>/
+// <slot>/ready.sock (split_park.go), and the listener binds the slot's
+// socket in the ready dir, which the start's files call names again. The
+// slot must be the container itself (containerRef): the helper names only
+// the socket of the container it is asked for.
+func (d *Driver) parkedRestartListener(spec *specs.Spec, containerRef, sandboxID, toolboxToken string) (*dockerpkg.ParkedListener, error) {
 	if spec == nil || spec.Process == nil {
 		return nil, nil
 	}
@@ -798,14 +817,15 @@ func (d *Driver) parkedRestartListener(spec *specs.Spec, sandboxID, toolboxToken
 	if strings.TrimSpace(sandboxID) == "" || strings.TrimSpace(toolboxToken) == "" {
 		return nil, errors.New("warm-pool container: a start needs the sandbox's identity to adopt it again")
 	}
-	var source string
-	for _, m := range spec.Mounts {
-		if m.Destination == dockerpkg.GuestReadySocketPath {
-			source = filepath.Clean(m.Source)
-			break
-		}
-	}
+	source := specReadySource(spec)
 	readyDir := filepath.Clean(strings.TrimSpace(d.cfg.ReadyDir))
+	if d.helper != nil {
+		slotID := splitParkSlot(source)
+		if slotID == "" || slotID != containerRef || strings.TrimSpace(d.cfg.ReadyDir) == "" {
+			return nil, fmt.Errorf("warm-pool container %s has no park socket of its own in the root helper's folder to be adopted over (mount %q)", containerRef, source)
+		}
+		return dockerpkg.NewParkedListener(readyDir, slotID, bootstrapToken, parkNonce)
+	}
 	slotID := strings.TrimSuffix(filepath.Base(source), ".sock")
 	if source == "" || source == "." || strings.TrimSpace(d.cfg.ReadyDir) == "" || filepath.Dir(source) != readyDir ||
 		!IsParkedSandboxID(slotID) || validateSandboxID(slotID) != nil {
@@ -928,6 +948,11 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	// helper removes what it made, by the same keys.
 	d.removeContainerFiles(sandbox.ID)
 	d.releaseHelperFiles(ctx, sandbox.ID)
+	// And, in split mode, a gVisor sandbox's move checkpoints, which are
+	// the helper's too (split_moves.go).
+	if d.helper != nil && sandbox.Runtime == models.RuntimeGvisor {
+		d.splitDropMove(ctx, sandbox.ID, rootdpb.MoveSide_MOVE_SIDE_OUT, rootdpb.MoveSide_MOVE_SIDE_IN)
+	}
 	if ref := strings.TrimSpace(sandbox.ContainerID); ref != "" && ref != sandbox.ID {
 		d.removeContainerFiles(ref)
 		d.releaseHelperFiles(ctx, ref)

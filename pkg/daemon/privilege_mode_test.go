@@ -88,6 +88,14 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		// M1 PR 14: and with them on, the guests' firewall is the helper's.
 		func(c *config.Config) { c.EnableFirecracker, c.UseJailer, c.EnableNetworkRules = true, true, true },
 		func(c *config.Config) { c.EnableFirecracker, c.UseJailer, c.EnterpriseMode = true, true, true },
+		// M1 PR 13: the containerd warm pool, with its firewall and cgroup
+		// parent too.
+		func(c *config.Config) { c.ContainerdPoolEnabled = true },
+		func(c *config.Config) {
+			c.ContainerdPoolEnabled, c.EnableNetworkRules, c.ContainerdCgroupParent = true, true, "/kubepods/aerolvm"
+		},
+		// And gVisor checkpoint moves.
+		func(c *config.Config) { c.GvisorCheckpointMoves = true },
 	} {
 		cfg := splitConfig()
 		set(&cfg)
@@ -103,7 +111,6 @@ func TestCheckPrivilegeMode(t *testing.T) {
 	}{
 		{"the Docker engine", func(c *config.Config) { c.ContainerEngine = models.ContainerEngineDocker }, "SB_CONTAINER_ENGINE=containerd", nil},
 		{"no netns pool", func(c *config.Config) { c.ContainerdNativeNetnsPoolEnabled = false }, "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", nil},
-		{"the warm pool", func(c *config.Config) { c.ContainerdPoolEnabled = true }, "warm pool", []privmode.Step{privmode.StepWarmPool}},
 		{"WASM workers kept root", func(c *config.Config) { wasmSplit(c); c.WasmWorkerDropPrivs = false }, "SB_WASM_WORKER_DROP_PRIVS", nil},
 		{"WASM on wasmtime", func(c *config.Config) { wasmSplit(c); c.WasmEngine = "wasmtime" }, "SB_WASM_ENGINE=wasmtime", nil},
 		{"WASM workers as sandboxd", func(c *config.Config) { wasmSplit(c); c.WasmWorkerUID = os.Getuid() }, "sandboxd's own uid", nil},
@@ -118,10 +125,14 @@ func TestCheckPrivilegeMode(t *testing.T) {
 			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
 		},
 			"warm VM pool", []privmode.Step{privmode.StepFirecrackerWarmPool}},
-		{"gVisor moves", func(c *config.Config) { c.GvisorCheckpointMoves = true }, "gVisor checkpoint", []privmode.Step{privmode.StepMoves}},
-		{"several at once, each named", func(c *config.Config) {
-			c.GvisorCheckpointMoves, c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true, true
-		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerWarmPool, privmode.StepMoves}},
+		// With the closed steps on beside it (the WASM warm pool, gVisor
+		// moves, the containerd warm pool), only the open one is named.
+		{"one gap among closed ones", func(c *config.Config) {
+			wasmSplit(c)
+			c.WasmResidentHostEnabled, c.WasmPoolEnabled = false, true
+			c.GvisorCheckpointMoves, c.ContainerdPoolEnabled = true, true
+			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
+		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerWarmPool}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()

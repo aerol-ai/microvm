@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +34,7 @@ func TestWriteDirReadDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := t.TempDir()
-	m, err := ReadDir(ctx, bytes.NewReader(buf.Bytes()), dst, "sb-1")
+	m, err := ReadDir(ctx, bytes.NewReader(buf.Bytes()), dst, "sb-1", NoBound)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +48,7 @@ func TestWriteDirReadDir(t *testing.T) {
 		}
 	}
 	// Another sandbox's stream does not open as this one.
-	if _, err := ReadDir(ctx, bytes.NewReader(buf.Bytes()), t.TempDir(), "sb-2"); err == nil {
+	if _, err := ReadDir(ctx, bytes.NewReader(buf.Bytes()), t.TempDir(), "sb-2", NoBound); err == nil {
 		t.Fatal("a stream for sb-1 was read as sb-2's")
 	}
 }
@@ -133,14 +135,14 @@ func TestReadDirRefusals(t *testing.T) {
 		{"a file missing", stream(t, good, reg("a"))},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := ReadDir(context.Background(), bytes.NewReader(tc.raw), t.TempDir(), "sb-1"); err == nil {
+			if _, err := ReadDir(context.Background(), bytes.NewReader(tc.raw), t.TempDir(), "sb-1", NoBound); err == nil {
 				t.Fatal("read")
 			}
 		})
 	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := ReadDir(cancelled, bytes.NewReader(stream(t, good, reg("a"), reg("b"))), t.TempDir(), "sb-1"); err == nil {
+	if _, err := ReadDir(cancelled, bytes.NewReader(stream(t, good, reg("a"), reg("b"))), t.TempDir(), "sb-1", NoBound); err == nil {
 		t.Fatal("a cancelled read went on")
 	}
 }
@@ -154,12 +156,143 @@ func TestAddFileAndCreateFile(t *testing.T) {
 		t.Fatal("a missing file was added")
 	}
 	p := filepath.Join(dir, "f")
-	if err := CreateFile(p, strings.NewReader("x")); err != nil {
+	if err := CreateFile(p, strings.NewReader("x"), 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := CreateFile(p, strings.NewReader("y")); err == nil {
+	if err := CreateFile(p, strings.NewReader("y"), 1); err == nil {
 		t.Fatal("an existing file was overwritten")
 	}
+	// Exactly size bytes: no more are read, and fewer is an error.
+	long := filepath.Join(dir, "long")
+	if err := CreateFile(long, strings.NewReader("xyz"), 2); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(long); string(got) != "xy" {
+		t.Fatalf("CreateFile wrote %q, want 2 bytes", got)
+	}
+	if err := CreateFile(filepath.Join(dir, "short"), strings.NewReader("x"), 2); err == nil || !strings.Contains(err.Error(), "ends after 1 of its 2 bytes") {
+		t.Fatalf("a short file: %v", err)
+	}
+}
+
+// The bound counts the bytes ReadDir writes, all files together: a bundle
+// at the bound is read whole; one byte past it is refused before the file
+// that would pass it is made.
+func TestReadDirBound(t *testing.T) {
+	good := Manifest{Version: 1, SandboxID: "sb-1", Files: []string{"a", "b"}}
+	raw := stream(t, good, &tar.Header{Name: "a", Mode: 0o600, Size: 3, Typeflag: tar.TypeReg},
+		&tar.Header{Name: "b", Mode: 0o600, Size: 4, Typeflag: tar.TypeReg})
+	if _, err := ReadDir(context.Background(), bytes.NewReader(raw), t.TempDir(), "sb-1", 7); err != nil {
+		t.Fatalf("a bundle at the bound: %v", err)
+	}
+	dir := t.TempDir()
+	_, err := ReadDir(context.Background(), bytes.NewReader(raw), dir, "sb-1", 6)
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("a bundle one byte past the bound: %v, want ErrTooLarge", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "b")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the file past the bound was made")
+	}
+	for _, bound := range []int64{0, -1} {
+		if _, err := ReadDir(context.Background(), bytes.NewReader(raw), t.TempDir(), "sb-1", bound); err == nil {
+			t.Fatalf("a bound of %d was taken", bound)
+		}
+	}
+}
+
+// A sparse entry is refused before anything of it is written, whatever
+// the bound, and in both of the forms a tar reader expands.
+func TestReadDirRefusesSparseEntries(t *testing.T) {
+	const realsize = 64 << 20
+	for _, tc := range []struct {
+		name  string
+		bound int64
+	}{{"under a bound", 1 << 20}, {"with no bound", NoBound}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			raw := sparseBundle(t, "sb-1", "checkpoint.img", realsize)
+			_, err := ReadDir(context.Background(), bytes.NewReader(raw), dir, "sb-1", tc.bound)
+			if err == nil || !strings.Contains(err.Error(), "sparse entry") {
+				t.Fatalf("a %d-byte stream holding a %d-byte sparse file: %v, want it refused", len(raw), realsize, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "checkpoint.img")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("the sparse entry's file was made")
+			}
+		})
+	}
+	for _, h := range []*tar.Header{
+		{Typeflag: tar.TypeGNUSparse},
+		{Typeflag: tar.TypeReg, PAXRecords: map[string]string{"GNU.sparse.major": "1"}},
+		{Typeflag: tar.TypeReg, PAXRecords: map[string]string{"GNU.sparse.size": "1"}},
+	} {
+		if !sparse(h) {
+			t.Errorf("%+v is not seen as sparse", h)
+		}
+	}
+	if sparse(&tar.Header{Typeflag: tar.TypeReg, PAXRecords: map[string]string{"path": "a"}}) {
+		t.Error("a plain PAX record is seen as sparse")
+	}
+}
+
+// sparseBundle is a bundle whose one file is a PAX sparse entry of size
+// bytes, all of it a hole: its stream holds a few headers only. Go's tar
+// writer does not write sparse entries, so its blocks are built here.
+func sparseBundle(t *testing.T, id, name string, size int64) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	raw, _ := json.Marshal(Manifest{Version: 1, SandboxID: id, Files: []string{name}})
+	if err := tw.WriteHeader(&tar.Header{Name: ManifestName, Mode: 0o600, Size: int64(len(raw)), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = tw.Write(raw)
+	if err := tw.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	pax := paxRecord("GNU.sparse.major", "1") + paxRecord("GNU.sparse.minor", "0") +
+		paxRecord("GNU.sparse.name", name) + paxRecord("GNU.sparse.realsize", fmt.Sprint(size))
+	out := append(buf.Bytes(), ustarBlock("PaxHeaders/"+name, tar.TypeXHeader, int64(len(pax)))...)
+	out = append(out, padBlock([]byte(pax))...)
+	// The data: the sparse map (no data regions), one block.
+	out = append(out, ustarBlock("GNUSparseFile.0/"+name, tar.TypeReg, 512)...)
+	out = append(out, padBlock([]byte("0\n"))...)
+	return append(out, make([]byte, 1024)...)
+}
+
+func ustarBlock(name string, typeflag byte, size int64) []byte {
+	b := make([]byte, 512)
+	copy(b[0:100], name)
+	copy(b[100:108], "0000600\x00")
+	copy(b[108:116], "0000000\x00")
+	copy(b[116:124], "0000000\x00")
+	copy(b[124:136], fmt.Sprintf("%011o\x00", size))
+	copy(b[136:148], fmt.Sprintf("%011o\x00", 0))
+	copy(b[148:156], "        ")
+	b[156] = typeflag
+	copy(b[257:263], "ustar\x00")
+	copy(b[263:265], "00")
+	var sum int64
+	for _, c := range b {
+		sum += int64(c)
+	}
+	copy(b[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	return b
+}
+
+func paxRecord(k, v string) string {
+	body := " " + k + "=" + v + "\n"
+	n := len(body) + 1
+	for len(fmt.Sprint(n))+len(body) != n {
+		n = len(fmt.Sprint(n)) + len(body)
+	}
+	return fmt.Sprint(n) + body
+}
+
+func padBlock(b []byte) []byte {
+	if r := len(b) % 512; r != 0 {
+		b = append(b, make([]byte, 512-r)...)
+	}
+	return b
 }
 
 func TestInside(t *testing.T) {

@@ -108,12 +108,12 @@ initContainers:
   # the root helper trusts a folder only when no one else can write it
   # (internal/rootfolder): the shared folder becomes root's, open to the
   # agent's group, with one folder of the agent's own inside; the CNI
-  # records' folder becomes root's alone; sandboxd's state volume becomes
-  # the agent's; the egress gateway's socket folder becomes the gateway
-  # user's alone (0755: the agent may dial the socket, not write there).
-  # As root with one right, CAP_CHOWN, and nothing else: root owns a
-  # folder while it sets the mode, so each step also runs again on a pod
-  # restart.
+  # records' folder and the helper's moves folder become root's alone;
+  # sandboxd's state volume becomes the agent's; the egress gateway's
+  # socket folder becomes the gateway user's alone (0755: the agent may
+  # dial the socket, not write there). As root with one right, CAP_CHOWN,
+  # and nothing else: root owns a folder while it sets the mode, so each
+  # step also runs again on a pod restart.
   - name: split-folders
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm-runtime") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
@@ -125,6 +125,8 @@ initContainers:
         chmod 0750 /run/aerolvm-rootd/shared
         install -d -o 65531 -g 65531 -m 0700 /run/aerolvm-rootd/shared/agent
         chmod 0755 /var/lib/cni
+        chown 0:0 /var/lib/aerolvm-rootd-moves
+        chmod 0700 /var/lib/aerolvm-rootd-moves
         chown 65531:65531 /var/lib/sandboxd
         chown 0:0 /run/aerolvm-egress
         chmod 0755 /run/aerolvm-egress
@@ -145,6 +147,7 @@ initContainers:
     volumeMounts:
       - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
       - { name: cni-state, mountPath: /var/lib/cni }
+      - { name: containerd, mountPath: /var/lib/aerolvm-rootd-moves, subPath: aerolvm-rootd-moves }
       - { name: state, mountPath: /var/lib/sandboxd }
       - { name: run-egress, mountPath: /run/aerolvm-egress }
   {{- end }}
@@ -228,6 +231,9 @@ containers:
       - { name: SB_CONTAINERD_NAMESPACE, value: aerolvm }
       - { name: SB_ENABLE_NETWORK_RULES, value: "true" }
       - { name: SB_EGRESS_GATEWAY_USER, value: "65532" }
+      # The helper takes gVisor checkpoints for moves only with this on in
+      # its own environment (M1 PR 13).
+      - { name: SB_GVISOR_CHECKPOINT_MOVES, value: {{ $moves | quote }} }
       {{- if $root.Values.edge.enabled }}
       - { name: SB_ENABLE_CADDY, value: "true" }
       - { name: SB_SANDBOX_NODE_INGRESS, value: "false" }
@@ -274,6 +280,11 @@ containers:
       - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
       - { name: rootd-stage, mountPath: /run/aerolvm-rootd-stage, readOnly: true }
       - { name: cni-state, mountPath: /var/lib/cni }
+      # The helper's gVisor moves: a checkpoint or a staged bundle is about
+      # a sandbox's memory in size, so it goes on the sandboxes' own disk,
+      # where the agent's disk floor counts it, not on this container's.
+      # A folder of containerd's volume, root's alone (split-folders).
+      - { name: containerd, mountPath: /var/lib/aerolvm-rootd/moves, subPath: aerolvm-rootd-moves }
       {{- else }}
       # The network namespaces the agent makes, where containerd starts
       # sandboxes in them. Bidirectional, so the supervisor's unmount
