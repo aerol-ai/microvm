@@ -308,7 +308,10 @@ var errOwnerRejoined = errors.New("cluster: owner rejoined during eviction")
 // re-materializes the container. All remaining placements are orphaned
 // (OwnerNodeID="") so the API surfaces ErrOrphaned (410 Gone). A
 // recreate-policy placement orphaned only for want of room is retried by
-// the leader's orphan loop (retryOrphanedRecoveries, R14). The dead-owner
+// the leader's orphan loop (retryOrphanedRecoveries, R14). A deleting
+// placement is not orphaned: a deleted node's is deleted here
+// (abandoned_placement.go), and one of a node that only died stays on it
+// until its delete fence's TTL (reconcileReservations). The dead-owner
 // loop and an operator's node delete (node_lifecycle.go) share it. A failure
 // is logged and returned after the steps that succeeded; every step is
 // idempotent, so the caller's retry finishes the job.
@@ -325,6 +328,13 @@ var errOwnerRejoined = errors.New("cluster: owner rejoined during eviction")
 // deleted node never counts as rejoined, so a delete always finishes.
 func (c *Cluster) evictOwnerPlacements(ctx context.Context, nodeID string) (reassigned, orphaned int, err error) {
 	ids := c.fsm.idsOwnedBy(nodeID)
+	finished := 0
+	defer func() {
+		if finished > 0 {
+			c.logger.Info("cluster: finished the deletes a deleted node had started",
+				"node_id", nodeID, "deleted", finished)
+		}
+	}()
 	for _, id := range ids {
 		if c.deadOwnerRejoined(nodeID, reassigned) {
 			return reassigned, 0, errOwnerRejoined
@@ -332,6 +342,20 @@ func (c *Cluster) evictOwnerPlacements(ctx context.Context, nodeID string) (reas
 		p, ok := c.fsm.get(id)
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(nodeID) {
 			// Deleted, or moved off the dead node since the listing.
+			continue
+		}
+		if p.IsDeleting() {
+			// opOrphanOwner leaves a deleting placement with its owner. A
+			// node that only died may be cut off and still finishing that
+			// delete, so its fence waits for the TTL (reconcileReservations).
+			// A deleted node can finish nothing (abandoned_placement.go):
+			// the delete is finished here, or it would stay on the node.
+			if c.fsm.isNodeDenied(nodeID) {
+				if err := c.finishDeletedNodeDelete(ctx, nodeID, p); err != nil {
+					return reassigned, 0, err
+				}
+				finished++
+			}
 			continue
 		}
 		if !placementWantsFailoverRecreate(p) {
@@ -390,7 +414,7 @@ func (c *Cluster) evictOwnerPlacements(ctx context.Context, nodeID string) (reas
 	if c.deadOwnerRejoined(nodeID, reassigned) {
 		return reassigned, 0, errOwnerRejoined
 	}
-	orphaned = len(c.fsm.idsOwnedBy(nodeID))
+	orphaned = c.fsm.orphanableCount(nodeID)
 	c.runEvictDeadOwnerStepHook(evictStepOrphan, "")
 	if err := c.orphanOwner(ctx, nodeID); err != nil {
 		c.logger.Warn("cluster: orphan dead-owner placements failed; will retry next tick",
@@ -431,6 +455,7 @@ type evictDeadOwnerStep string
 
 const (
 	evictStepReassign     evictDeadOwnerStep = "reassign"
+	evictStepFinishDelete evictDeadOwnerStep = "finish-delete"
 	evictStepOrphan       evictDeadOwnerStep = "orphan"
 	evictStepRemoveServer evictDeadOwnerStep = "remove-server"
 )

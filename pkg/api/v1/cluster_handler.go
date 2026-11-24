@@ -60,6 +60,13 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: apihttp.WriteError}, local)
 }
 
+// clusterDestroyForwardWrap is clusterForwardWrap for the sandbox DELETE: a
+// sandbox left on a deleted node is deleted by a server instead of
+// forwarded (clusterroute abandoned.go).
+func (h *handlers) clusterDestroyForwardWrap(local http.Handler) http.Handler {
+	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: apihttp.WriteError, Destroy: true}, local)
+}
+
 // clusterCreateWrap is the handler for POST /v1/sandboxes. It implements the
 // reservation-first flow that resolves B1+B2:
 //

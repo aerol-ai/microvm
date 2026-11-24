@@ -74,7 +74,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// The detail carries the envd access token, which opens the toolbox; a
 	// caller without sandbox.exec gets the detail without it.
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", d.Route(permRead, h.clusterForwardWrap(http.HandlerFunc(h.getSandbox))))
-	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Route(permWrite, h.clusterForwardWrap(http.HandlerFunc(h.deleteSandbox))))
+	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Route(permWrite, h.clusterDestroyForwardWrap(http.HandlerFunc(h.deleteSandbox))))
 	// Connect resumes the sandbox and hands back the envd token so the SDK
 	// can run commands in it: sandbox.exec.
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/connect", d.Route(permExec, h.clusterForwardWrap(http.HandlerFunc(h.connectSandbox))))
