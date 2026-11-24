@@ -508,6 +508,12 @@ func TestChartSplitHosts(t *testing.T) {
 			if !strings.Contains(scripts["workerd"], "/usr/local/bin/workerd") {
 				t.Error("the workerd init container copies no workerd")
 			}
+			// The helper runs no program from a folder anyone else can write
+			// (rootd checkRootBinaries). The kubelet makes an emptyDir root's
+			// and open to everyone, so the init container closes it.
+			if dir := filepath.Dir(workerd); w.path != dir || !strings.Contains(scripts["workerd"], "chmod 0755 "+dir+"\n") {
+				t.Errorf("the workerd init container leaves workerd's folder %s open to others (mount %+v)", dir, w)
+			}
 
 			// The helper's environment is the runtime container's, plus the
 			// cgroup parent the supervisor works out (internal/supervisor

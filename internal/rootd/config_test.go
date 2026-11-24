@@ -630,6 +630,18 @@ func TestHostsFromEnv(t *testing.T) {
 	if err != nil || cfg.Hosts.CgroupParent != "/b" {
 		t.Fatalf("parent %q, %v", cfg.Hosts.CgroupParent, err)
 	}
+	// Root links, mounts and removes in the jail base, and reads and
+	// copies workerd: neither may be in a folder the agent writes.
+	for _, tc := range []struct{ k, v string }{
+		{"SB_ISOLATE_JAIL_CHROOT_BASE", "/var/lib/sandboxd/isolate-jail"},
+		{"SB_ISOLATE_WORKERD_PATH", "/var/lib/sandboxd/bin/workerd"},
+		{"SB_ISOLATE_WORKERD_PATH", "/run/sandboxd/workerd"},
+	} {
+		_, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true", tc.k: tc.v}))
+		if err == nil || !strings.Contains(err.Error(), tc.k) || !strings.Contains(err.Error(), "which the agent writes") {
+			t.Errorf("%s=%s: %v, want a refusal naming it", tc.k, tc.v, err)
+		}
+	}
 	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
 	if _, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true"})); err == nil ||
 		!strings.Contains(err.Error(), "shim") {
@@ -766,7 +778,7 @@ func TestFirecrackerHostsFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := FirecrackerHostsConfig{JailerBinary: "/usr/local/bin/jailer", FirecrackerBinary: "/usr/local/bin/firecracker",
-		ChrootBase: "/srv/jailer", UID: 1500, GID: 1501, Kernel: "/var/lib/aerolvm-rootd/vmlinux", Mkfs4Bin: "/sbin/mkfs.ext4",
+		ChrootBase: "/srv/jailer", UID: 1500, GID: 1501, Kernel: "/var/lib/aerolvm-rootd/vmlinux", Mkfs4Bin: "/usr/sbin/mkfs.ext4",
 		Shim: "/usr/local/bin/aerolvm-rootd", AgentUID: 65531, SocketWait: 5 * time.Second, IPBinary: "/usr/sbin/ip",
 		TapBase: "172.16.0.0/20", TapPoolSize: 256}
 	if *c != want {
@@ -787,6 +799,11 @@ func TestFirecrackerHostsFromEnv(t *testing.T) {
 		{"a pool size that is no number", map[string]string{"SB_FIRECRACKER_TAP_POOL_SIZE": "x"}, "SB_FIRECRACKER_TAP_POOL_SIZE"},
 		{"a jailer flag that is no bool", map[string]string{"SB_FIRECRACKER_USE_JAILER": "maybe"}, "SB_FIRECRACKER_USE_JAILER"},
 		{"a kernel in the agent's folder (sandboxd's default)", map[string]string{"SB_FIRECRACKER_KERNEL": ""}, "SB_FIRECRACKER_KERNEL"},
+		// Root runs each of these (the jailer copies firecracker).
+		{"a jailer in the agent's folder", map[string]string{"SB_JAILER_BINARY": "/var/lib/sandboxd/bin/jailer"}, "SB_JAILER_BINARY"},
+		{"a firecracker in the agent's folder", map[string]string{"SB_FIRECRACKER_BINARY": "/run/sandboxd/firecracker"}, "SB_FIRECRACKER_BINARY"},
+		{"a mkfs.ext4 in the agent's folder", map[string]string{"SB_FIRECRACKER_MKFS_BIN": "/var/lib/sandboxd/mkfs.ext4"}, "SB_FIRECRACKER_MKFS_BIN"},
+		{"an ip in the agent's folder", map[string]string{"SB_FIRECRACKER_IP_BINARY": "/var/lib/sandboxd/ip"}, "SB_FIRECRACKER_IP_BINARY"},
 	} {
 		if _, err := read(tc.m); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)

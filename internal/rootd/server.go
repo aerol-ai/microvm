@@ -169,6 +169,9 @@ type Options struct {
 	TapSysctls func() error
 	// hostLaunchers stand in for the kinds' own parts in tests.
 	hostLaunchers map[rootpolicy.HostKind]hostLauncher
+	// checkBinary stands in for checkRootBinaryFile in tests, whose
+	// configs name programs this machine lacks. Nil: the real check.
+	checkBinary func(path string) error
 	// wasmOpenPoint and wasmLend stand in for the kernel and the WASM host
 	// in GrantWasmMounts' tests (wasm_mounts.go).
 	wasmOpenPoint func(root, sandboxID string, index int) (*os.File, error)
@@ -242,8 +245,16 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	if s.onRefusal == nil {
 		s.onRefusal = LogRefusal(log)
 	}
-	// The helper's folders come before the socket: a layout someone else
-	// can write stops the helper before any agent reaches it.
+	// The programs root runs, then the helper's folders, all before the
+	// socket: a program or a layout someone else can change stops the
+	// helper before any agent reaches it.
+	checkBinary := opts.checkBinary
+	if checkBinary == nil {
+		checkBinary = checkRootBinaryFile
+	}
+	if err := checkRootBinaries(cfg, checkBinary); err != nil {
+		return nil, err
+	}
 	f, err := openFiles(cfg)
 	if err != nil {
 		return nil, err

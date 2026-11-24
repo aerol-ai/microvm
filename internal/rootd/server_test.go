@@ -155,6 +155,9 @@ func newRig(t testing.TB, mutate func(*Config, *Options)) *rig {
 			r.refusals = append(r.refusals, ref)
 			r.mu.Unlock()
 		},
+		// The rigs' host configs name programs this machine lacks
+		// (/usr/local/bin/workerd); TestNewRefusesRootBinaries checks them.
+		checkBinary: func(string) error { return nil },
 	}
 	if mutate != nil {
 		mutate(&r.cfg, &opts)
