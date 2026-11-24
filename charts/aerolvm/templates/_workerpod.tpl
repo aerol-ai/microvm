@@ -60,25 +60,21 @@ securityContext:
     - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
 {{- end }}
 {{- $enterprise := ($root.Values.enterprise | default dict).enabled }}
-{{- if and $split (or $enterprise $wasm) }}
+{{- /* The WASM workers' group (SB_WASM_WORKER_GID, 61000) is not set here:
+a split agent shares each WASM sandbox's files with its worker by group,
+and the agent image puts its uid, 65531, in that group itself
+(packaging/images/aerolvm.Dockerfile). The container runtime gives a
+container the groups its image lists for its user, so the agent alone gets
+it, not every container in the pod. */}}
+{{- if and $split $enterprise }}
 {{- if not $root.Values.edge.enabled }}
 securityContext:
 {{- end }}
   supplementalGroups:
-    {{- if $enterprise }}
     # Enterprise mode: sandboxd gives the edge its public API socket by
     # group (SB_PUBLIC_API_SOCKET_GROUP), and a split agent, not root, can
     # hand a file only to a group it is in.
     - 65532
-    {{- end }}
-    {{- if $wasm }}
-    # The WASM workers' group (SB_WASM_WORKER_GID): a split agent shares
-    # each WASM sandbox's files with its worker by group, as on a VM, and
-    # refuses to start outside it. The group reaches every container here,
-    # but those files sit only in the agent's own volumes; the workers and
-    # the egress gateway drop every group.
-    - 61000
-    {{- end }}
 {{- end }}
 terminationGracePeriodSeconds: 30
 {{- if $cluster }}

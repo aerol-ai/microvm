@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -276,11 +277,12 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 				IsolateUseJail:                   boolOr("SB_ISOLATE_USE_JAIL", true),
 				WasmWorkerDropPrivs:              boolOr("SB_WASM_WORKER_DROP_PRIVS", true),
 				WasmWorkerUID:                    config.DefaultWasmWorkerID, WasmWorkerGID: config.DefaultWasmWorkerID}
-			// sandboxd's groups are the ones the pod gives the agent: its
-			// own and the pod's supplemental groups. A WASM worker needs it
-			// in the workers' group (checkSplitWasm).
+			// sandboxd's groups are the ones the container runtime gives
+			// the agent: its own, the groups its image lists for its user,
+			// and the pod's supplemental groups. A WASM worker needs it in
+			// the workers' group (checkSplitWasm).
 			spec := workerSpec(t, out)
-			groups := []int{65531}
+			groups := append([]int{65531}, agentImageGroups(t, 65531)...)
 			sup, _ := dig(spec, "securityContext")["supplementalGroups"].([]any)
 			for _, g := range sup {
 				if n, ok := g.(int); ok {
@@ -316,6 +318,78 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 				groups, _ := dig(workerSpec(t, out), "securityContext")["supplementalGroups"].([]any)
 				if !slices.ContainsFunc(groups, func(v any) bool { return fmt.Sprint(v) == g }) {
 					t.Errorf("SB_PUBLIC_API_SOCKET_GROUP=%s, but the pod's supplementalGroups are %v", g, groups)
+				}
+			}
+		})
+	}
+}
+
+// agentImageGroups are the groups the agent image's /etc/group lists for
+// the user its /etc/passwd names uid: the groups a container running the
+// image as uid gets besides its own (containerd and CRI-O read them from
+// the image). Read from the lines packaging/images/aerolvm.Dockerfile
+// writes.
+func agentImageGroups(t *testing.T, uid int) []int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "packaging", "images", "aerolvm.Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := ""
+	for _, m := range regexp.MustCompile(`'([a-z][a-z0-9-]*):x:(\d+):\d+:[^':]*:[^':]*:[^':]*'`).FindAllStringSubmatch(string(raw), -1) {
+		if m[2] == strconv.Itoa(uid) {
+			name = m[1]
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	var out []int
+	for _, m := range regexp.MustCompile(`'[a-z][a-z0-9-]*:x:(\d+):([a-z0-9,-]*)'`).FindAllStringSubmatch(string(raw), -1) {
+		if slices.Contains(strings.Split(m[2], ","), name) {
+			n, _ := strconv.Atoi(m[1])
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// The WASM workers' group reaches the split agent alone (review of PR
+// 1441): the agent image lists the agent's uid in it, and the pod gives it
+// to no container. No other container runs the agent's uid, so none gets
+// the image's groups for it.
+func TestChartSplitWasmGroupIsTheAgentsAlone(t *testing.T) {
+	helm := chartHelm(t)
+	if g := agentImageGroups(t, 65531); !slices.Contains(g, config.DefaultWasmWorkerID) {
+		t.Fatalf("the agent image lists uid 65531 in groups %v, want the WASM workers' %d", g, config.DefaultWasmWorkerID)
+	}
+	for _, uid := range []int{0, 65532} {
+		if g := agentImageGroups(t, uid); len(g) != 0 {
+			t.Errorf("the agent image lists uid %d in groups %v", uid, g)
+		}
+	}
+	wasm := []string{"--set", "privilegeMode=split", "--set", "worker.wasm.enabled=true"}
+	for name, flags := range map[string][]string{"single": wasm, "cluster": append(slices.Clone(chartClusterFlags), wasm...)} {
+		t.Run(name, func(t *testing.T) {
+			out, err := renderChart(helm, flags...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := workerSpec(t, out)
+			if sup, ok := dig(spec, "securityContext")["supplementalGroups"]; ok {
+				t.Errorf("the pod gives every container groups %v", sup)
+			}
+			for _, list := range []string{"initContainers", "containers"} {
+				cs, _ := spec[list].([]any)
+				for _, c := range cs {
+					m, _ := c.(map[string]any)
+					sc, _ := m["securityContext"].(map[string]any)
+					if uid := fmt.Sprint(sc["runAsUser"]); (uid == "65531") != (m["name"] == "agent") {
+						t.Errorf("container %s runs as uid %s; only the agent runs as 65531", m["name"], uid)
+					}
+					if _, ok := sc["supplementalGroups"]; ok {
+						t.Errorf("container %s sets its own groups", m["name"])
+					}
 				}
 			}
 		})
