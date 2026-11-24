@@ -162,7 +162,7 @@ func (r *installRig) mustRun(args ...string) (map[string]string, string, string)
 func (r *installRig) shell(dumpSh, body string) string {
 	r.t.Helper()
 	fns := ""
-	for _, name := range []string{"write_environment", "firecracker_environment", "write_caddy_env", "write_caddyfile",
+	for _, name := range []string{"write_environment", "firecracker_environment", "isolate_environment", "write_caddy_env", "write_caddyfile",
 		"write_local_environment", "secret_provider_lines", "node_setting_answer", "json_string", "write_node_settings"} {
 		fns += installShFunc(r.t, r.src, name)
 	}
