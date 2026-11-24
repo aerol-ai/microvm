@@ -596,6 +596,23 @@ func TestKeyedLocks(t *testing.T) {
 	if k.held() != 0 {
 		t.Fatalf("entries left: %d", k.held())
 	}
+	// #1437 review: a call whose context has ended never holds the lock,
+	// also when the lock is free (select alone would take it about half
+	// the time), and it leaves the lock free and no entry behind.
+	gone, cancelGone := context.WithCancel(ctx)
+	cancelGone()
+	for i := 0; i < 64; i++ {
+		if unlock, err := k.lock(gone, "a"); err == nil {
+			unlock()
+			t.Fatalf("try %d: a call whose caller had gone took the lock", i)
+		} else if status.Code(asStatus(err)) != codes.Canceled {
+			t.Fatalf("try %d: err %v, want Canceled", i, err)
+		}
+	}
+	if k.held() != 0 {
+		t.Fatalf("entries left: %d", k.held())
+	}
+	lock("a")()
 	var none *keyedLocks
 	unlock, err := none.lock(ctx, "x")
 	if err != nil {
