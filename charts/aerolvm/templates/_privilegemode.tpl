@@ -106,16 +106,18 @@ yet, and no live run has proven it there. */}}
 {{- end }}
 {{- /* gVisor moves, and the containerd warm pool that
 cluster.agentSandboxAPI's warm pools park in, are the root helper's from
-M1 PR 13: no refusal. */}}
-{{- if $w.wasm.enabled }}
-- worker.wasm.enabled is true: this chart does not wire WASM sandboxes into a split worker pod yet. Set it to false.
+M1 PR 13: no refusal. So are WASM and V8 isolates (worker.wasm.enabled,
+worker.isolate.enabled): the root helper starts their hosts in the runtime
+container, which _workerpod.tpl wires for them. */}}
+{{- if and (hasKey $env "SB_ENABLE_FIRECRACKER") (has (index $env "SB_ENABLE_FIRECRACKER" | toString | trim) $true) }}
+- worker.extraEnv.SB_ENABLE_FIRECRACKER turns on what split does not run yet. Remove it.
 {{- end }}
-{{- if $w.isolate.enabled }}
-- worker.isolate.enabled is true: this chart does not wire V8-isolate sandboxes into a split worker pod yet. Set it to false.
-{{- end }}
-{{- range $k := list "SB_ENABLE_FIRECRACKER" "SB_ENABLE_WASM" "SB_ENABLE_ISOLATE" }}
+{{- /* Turned on in extraEnv, they would get none of the pod's wiring for
+them: no socket folder the two containers share, no jail folder, no
+worker group. */}}
+{{- range $k, $value := dict "SB_ENABLE_WASM" "worker.wasm.enabled" "SB_ENABLE_ISOLATE" "worker.isolate.enabled" }}
 {{- if and (hasKey $env $k) (has (index $env $k | toString | trim) $true) }}
-- worker.extraEnv.{{ $k }} turns on what split does not run yet. Remove it.
+- worker.extraEnv.{{ $k }}: in split the worker pod needs the chart's wiring for it. Remove it and set {{ $value }}=true.
 {{- end }}
 {{- end }}
 {{- range $k := list "SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED" "SB_CONTAINERD_BUILDKIT_ROOTLESS" }}

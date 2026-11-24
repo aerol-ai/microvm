@@ -135,15 +135,17 @@ helper).
 |---|---|---|
 | `agent` | root, **privileged**; mounts containerd's root and socket, `/run/netns` two-way | user 65531; no capabilities; no privilege escalation; read-only root disk; `RuntimeDefault` seccomp; no containerd root or socket; no `/run/netns` |
 | `runtime` | root, privileged | root, privileged; also runs the root helper, only from a copy whose signature a release key built into the `aerolvm-runtime` image checks |
-| Pod | two-way mounts; one process namespace with external storage, WASM, V8 or Firecracker | no two-way mount; no shared process namespace |
+| Pod | two-way mounts; one process namespace with external storage, WASM, V8 or Firecracker | no shared process namespace; no two-way mount, except, with V8 isolates on, the jails' folder from `runtime` (below); with WASM on, the `agent` is in the WASM workers' group (61000) |
 | Folders from the machine | none | `/sys/fs/cgroup`, read only, in `agent` alone: it reads its sandboxes' memory and CPU there, and cannot write a cgroup file |
 | External storage | off by default | on by default: the helper runs the mount tools as their own user, in the `runtime` container |
 | Folders root writes | n/a | none the `agent` can write: see below |
-| `split-folders` (first) | absent | root with `CAP_CHOWN` only; sets five folders' owners, then exits |
+| `split-folders` (first) | absent | root with `CAP_CHOWN` only; sets five folders' owners (six with V8 isolates), then exits |
+| `workerd` (first, V8 isolates only) | absent | root with no capability; copies `workerd` from the `aerolvm` image into a volume of its own, then exits |
 
 **Folders shared with the `agent` in split.** No root process writes in a
 folder the `agent` can write. Three containers start as root: `runtime`,
-`egress` (until it drops to user 65532) and `split-folders`. A test in the
+`egress` (until it drops to user 65532) and `split-folders`; with V8
+isolates on, a fourth, `workerd`. A test in the
 AerolVM repository renders the pod and fails if any of them writes a
 volume the `agent` writes, other than the two named below, or if another
 container starts as root.
@@ -156,22 +158,30 @@ container starts as root.
 | `run-egress` (`/run/aerolvm-egress`) | read only | `split-folders` and `egress` write | `split-folders` gives the folder to the gateway's user (65532, 0755); the gateway makes its control socket there, and refuses a folder another user can write |
 | `toolbox` | writes `toolboxd` | `runtime`: read only | the helper copies it: no link followed, a regular file the agent owns, size bound |
 | `rootd-stage` | writes the helper and its signature | `runtime`: read only | the supervisor copies them into a folder of its own, then checks the copy's signature |
-| `rootd-shared` (`/run/aerolvm-rootd/shared`) | writes only in its own folder, `agent/` | `split-folders` and `runtime` write | `split-folders` makes the top root's (0750, the agent's group), then makes `agent/`; the helper makes its socket, ready sockets and task output in folders of its own there, and links ready sockets from `agent/` by handle |
+| `rootd-shared` (`/run/aerolvm-rootd/shared`) | writes only in its own folder, `agent/` | `split-folders` and `runtime` write | `split-folders` makes the top root's (0750, the agent's group), then makes `agent/`; the helper makes its socket, ready sockets, task output and the WASM hosts' sockets (`wasm/`) in folders of its own there, and links ready sockets from `agent/` by handle. With WASM on, the agent's compile cache is in `agent/`: the helper opens it, following no link, and hands it to each WASM host |
 | `tmp`, `run-sandboxd` | writes | not mounted | none |
 | `cni-state` | not mounted | `split-folders` and `runtime` write | `split-folders` closes it to other users (0755); the CNI plugins' address records |
 | `run-containerd` | not mounted | `runtime` writes | containerd's socket |
 | `egress-state` | not mounted | `egress` writes | the gateway's rule snapshot and each sandbox's learn-mode record |
 | containerd's volume | one empty folder, read only | `split-folders` and `runtime` write | containerd's images and layers; in a folder of its own, `aerolvm-rootd-moves`, the helper's gVisor move checkpoints: `split-folders` makes it root's alone (0700) |
 | `host-cgroup` (machine) | read only | not mounted | none |
+| `isolate-jail` (V8 isolates, `/srv/isolate-jail`) | read only, mounts taken in (`HostToContainer`) | `split-folders` and `runtime` write | `split-folders` makes the top root's (0755); the helper links each group's jail, mounts its `run` and `tmp` folders (a `tmpfs` each) and runs `workerd` there. Each `run` folder is the agent's (it writes `workerd`'s settings there), so the folder is two-way from `runtime` alone; the supervisor unmounts the jails when the pod ends |
+| `workerd` (V8 isolates) | not mounted | the `workerd` init container writes; `runtime`: read only | the helper reads `workerd`'s libraries and copies it into the jails' base |
 
-What split does not run yet, refused by name at `helm install`: Firecracker,
-WASM and V8-isolate sandboxes. Since M1 PR 13 split runs the container
-warm pool, the kubectl API's warm pools and gVisor moves with memory
-(`worker.gvisor.checkpointMoves` stays off by default in split). A gVisor
-sandbox moves only between workers of one privilege mode. `sandboxd`
-itself runs Firecracker in split, except with its VM pool; the chart
-refuses it because it does not wire Firecracker into a split pod yet, and
-no live run has proven it there.
+What split does not run yet, refused by name at `helm install`:
+Firecracker. `sandboxd` itself runs Firecracker in split, its VM pool
+included (M1 PR 18); the chart refuses it because it does not wire
+Firecracker into a split pod yet, and no live run has proven it there.
+
+WASM and V8-isolate sandboxes run in split. The helper starts their hosts
+in the `runtime` container, WASM workers as their own user (61000) and
+`workerd` in its jail, so they outlive an `agent` restart with no process
+namespace shared. With WASM on, the deny floor (the Kubernetes API
+server's addresses) reaches the `runtime` container too, where the helper
+keeps the WASM workers' network fence. Since M1 PR 13 split also runs the
+container warm pool, the kubectl API's warm pools and gVisor moves with
+memory (`worker.gvisor.checkpointMoves` stays off by default in split). A
+gVisor sandbox moves only between workers of one privilege mode.
 
 What is proven so far, and how:
 
@@ -208,6 +218,15 @@ What is proven so far, and how:
   the `agent` saw the socket there and could not write the folder, the
   `egress` container could not write `/run/aerolvm`, hostname allow lists
   through the gateway held, and every other check above passed again.
+- **WASM and V8 isolates in split, on kind** (2026-11-24, `split.sh` with
+  both on): a WASM sandbox and a V8 sandbox answered. Their processes ran
+  in the `runtime` container, WASM's as uid 61000 and `workerd` as the
+  jail's uid 1000, and the `agent` could not see either. The `agent`
+  could not write the jails' folder, only each jail's `run` folder. After
+  an `agent` restart the processes that held them still ran, both
+  sandboxes answered, and the new `agent` took both over. Both deleted. Every other
+  split check above passed with them on, and deleting the pod took 1
+  second and left none of the jails' mounts on the machine.
 - **Cluster mode on kind** (2026-11-24, after the first EKS drill found a
   split worker that could not read its join token): three servers, a
   gateway and one split worker pool. The worker's `setup` (uid 65531)

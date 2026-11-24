@@ -20,11 +20,17 @@
 #   hostport  a raw TCP port (expose --tcp) answers from another pod
 #   mount     an rclone mount of a MinIO bucket (../minio-store.sh) reaches
 #             the store from a gVisor sandbox
+#   hosts     with WASM and V8 isolates on (AEROL_K8S_WASM_V8=1 for
+#             k8s-dev.sh; skipped otherwise): a WASM and a V8 sandbox
+#             answer, their hosts run in the runtime container under the
+#             helper's users, an agent restart takes both over (the same
+#             processes, still answering), and both delete
 #   restarts  an agent restart, then a root helper restart: every sandbox
 #             (and the mount's writes) keep going, and new creates work
 #   verify    aerolvm k8s verify passes and reports the worker in split
 #   f8        deleting the pod with sandboxes running finishes, and leaves
-#             no namespace or mount behind on the machine
+#             no namespace or mount behind on the machine (the V8 jails'
+#             mounts included)
 #
 # It refuses any kubectl context but a local kind cluster's. No -e: each
 # check records its result and the run goes on to the next.
@@ -42,7 +48,7 @@ fi
 k() { kubectl --context "kind-$cluster" -n "$namespace" "$@"; }
 node="$(k get pod "$pod" -o jsonpath='{.spec.nodeName}')"
 steps=("$@")
-[[ ${#steps[@]} -eq 0 ]] && steps=(shape sandboxes egress hostport mount restarts verify f8)
+[[ ${#steps[@]} -eq 0 ]] && steps=(shape sandboxes egress hostport mount hosts restarts verify f8)
 
 failed=0
 pass() { echo "PASS $*"; }
@@ -73,9 +79,10 @@ api() { curl -sS -m 300 -H "Authorization: Bearer $SB_PAT_TOKEN" -H 'Content-Typ
 agent() { k exec "$pod" -c agent -- "$@"; }
 runtime() { k exec "$pod" -c runtime -- "$@"; }
 # The root helper's pid in the runtime container: the process whose program
-# is a verified copy in the supervisor's folder.
+# is a verified copy in the supervisor's folder, run with no argument. WASM
+# hosts run the same program with a flag.
 helper_pid() {
-  runtime sh -c 'for d in /proc/[0-9]*; do case "$(readlink "$d/exe" 2>/dev/null)" in /var/lib/aerolvm-supervisor/rootd/aerolvm-rootd-*) basename "$d";; esac; done' | head -1
+  runtime sh -c 'for d in /proc/[0-9]*; do case "$(readlink "$d/exe" 2>/dev/null)" in /var/lib/aerolvm-supervisor/rootd/aerolvm-rootd-*) [ "$(tr "\0" "\n" < "$d/cmdline" | wc -l)" -eq 1 ] && basename "$d";; esac; done' | head -1
 }
 mk() {
   local out
@@ -98,7 +105,12 @@ step_shape() {
   check "shape: the agent reaches the helper's socket" agent test -S /run/aerolvm-rootd/shared/sock/root.sock
   check "shape: the agent sees the egress gateway's socket, in a folder it cannot write" agent sh -c 'test -S "$SB_EGRESS_GATEWAY_SOCKET" && ! touch "$(dirname "$SB_EGRESS_GATEWAY_SOCKET")/agent-write-test" 2>/dev/null'
   check "shape: the egress container, which starts as root, reads /run/aerolvm only" bash -c '! kubectl --context "kind-$1" -n "$2" exec "$3" -c egress -- touch /run/aerolvm/egress-write-test 2>/dev/null' _ "$cluster" "$namespace" "$pod"
-  check "shape: no two-way mount, no shared process namespace" bash -c '! kubectl --context "kind-$1" -n "$2" get pod "$3" -o json | grep -q -e Bidirectional -e "\"shareProcessNamespace\": true"' _ "$cluster" "$namespace" "$pod"
+  # With V8 isolates on, one two-way mount is allowed: the runtime
+  # container's V8 jail folder, whose tmpfs mounts the agent takes in.
+  local two
+  two="$(k get pod "$pod" -o json | jq -r '.spec.containers[] | .name as $c | .volumeMounts[]? | select(.mountPropagation == "Bidirectional") | "\($c)/\(.name)"' | grep -vx runtime/isolate-jail)"
+  check "shape: no two-way mount${two:+ ($two)}, the V8 jail's in the runtime container aside" test -z "$two"
+  check "shape: no shared process namespace" test "$(k get pod "$pod" -o jsonpath='{.spec.shareProcessNamespace}')" != true
   local hp
   hp="$(helper_pid)"
   check "shape: the runtime container runs the verified helper (pid ${hp:-none})" test -n "$hp"
@@ -215,6 +227,93 @@ all_exec() {
     ok_exec "$id" || { echo "  exec failed in $id"; return 1; }
   done
 }
+# host_pids lists the pids of the runtime container's processes whose
+# command line holds $1, one per line, sorted: the shell that looks is not
+# one of them.
+host_pids() {
+  runtime sh -c 'for d in /proc/[0-9]*; do [ "${d#/proc/}" = "$$" ] && continue; case "$(tr "\0" " " < "$d/cmdline" 2>/dev/null)" in *"$1"*) basename "$d";; esac; done' _ "$1" | sort -n
+}
+# host_uids lists the distinct uids the runtime container's pids run as.
+host_uids() {
+  [[ $# -gt 0 ]] || return 0
+  runtime sh -c 'for p in "$@"; do awk "/^Uid:/{print \$2}" "/proc/$p/status" 2>/dev/null; done' _ "$@" | sort -u | tr '\n' ' '
+}
+# survivors prints the pids in both lists.
+survivors() { comm -12 <(tr ' ' '\n' <<<"$1" | sort) <(tr ' ' '\n' <<<"$2" | sort) | tr '\n' ' '; }
+step_hosts() {
+  local on
+  on="$(k get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="agent")].env[?(@.name=="SB_ENABLE_WASM")].value}/{.spec.containers[?(@.name=="agent")].env[?(@.name=="SB_ENABLE_ISOLATE")].value}')"
+  if [[ "$on" != true/true ]]; then
+    echo "SKIP hosts: WASM and V8 isolates are off (AEROL_K8S_WASM_V8=1 for k8s-dev.sh)"
+    return
+  fi
+  # The WASM test guest (pkg/wasm/testdata/aerolstdio; `args X` prints X),
+  # staged as a module file in the agent's modules folder.
+  if ! (cd "$ROOT" && GOOS=wasip1 GOARCH=wasm go build -o "$tmp/split-stdio.wasm" ./pkg/wasm/testdata/aerolstdio); then
+    fail "hosts: build the WASM test guest"
+    return
+  fi
+  k exec -i "$pod" -c agent -- sh -c 'mkdir -p /var/lib/sandboxd/wasm/modules && cat > /var/lib/sandboxd/wasm/modules/split-stdio.wasm' <"$tmp/split-stdio.wasm"
+  local out wasm_id v8_id ref
+  out="$(api -X POST "$SB_API_URL/v1/sandboxes" -d '{"runtime":"wasm","image":"split-stdio.wasm","module_ref":"split-stdio.wasm"}')"
+  wasm_id="$(jq -r '.id // empty' <<<"$out" 2>/dev/null)"
+  [[ -n "$wasm_id" ]] || { fail "hosts: WASM create: $(head -c 300 <<<"$out")"; return; }
+  out="$(api -X POST "$SB_API_URL/v1/js-bundles" -d "$(jq -nc '{name:"split-v8", source:"export default { async fetch(req) { return new Response(\"split-v8 \" + new URL(req.url).pathname); } };"}')")"
+  ref="$(jq -r '.module_ref // empty' <<<"$out" 2>/dev/null)"
+  [[ -n "$ref" ]] || { fail "hosts: JS bundle upload: $(head -c 300 <<<"$out")"; return; }
+  out="$(api -X POST "$SB_API_URL/v1/sandboxes" -d "$(jq -nc --arg r "$ref" '{runtime:"isolate", image:$r, module_ref:$r}')")"
+  v8_id="$(jq -r '.id // empty' <<<"$out" 2>/dev/null)"
+  [[ -n "$v8_id" ]] || { fail "hosts: V8 create: $(head -c 300 <<<"$out")"; return; }
+  # A WASM exec's first word is the module's argv[0]. A V8 exec calls the
+  # handler with the command as the URL path (the CLI has no exec for V8
+  # sandboxes, so the API's).
+  answers() {
+    out="$(cli exec "$wasm_id" -- split-stdio args split-wasm 2>&1)"
+    check "hosts: the WASM sandbox answers $1 ($out)" test "$out" = split-wasm
+    out="$(api -X POST "$SB_API_URL/v1/sandboxes/$v8_id/toolbox/process/execute" -d '{"command":"/hello"}' | jq -r '.stdout // .' 2>&1)"
+    check "hosts: the V8 sandbox answers $1 ($out)" test "$out" = "split-v8 /hello"
+  }
+  answers "after its create"
+  # The helper runs both hosts in the runtime container: WASM hosts as the
+  # worker user (61000), workerd jailed as the jail user (1000). The agent,
+  # in a process namespace of its own, sees neither.
+  local wasm_pids v8_pids uids seen
+  wasm_pids="$(host_pids '--wasm-' | tr '\n' ' ')"
+  v8_pids="$(host_pids 'workerd serve' | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  uids="$(host_uids $wasm_pids)"
+  check "hosts: WASM hosts run in the runtime container as uid 61000 (pids ${wasm_pids:-none}; uids ${uids:-none})" test "$uids" = "61000 "
+  # shellcheck disable=SC2086
+  uids="$(host_uids $v8_pids)"
+  check "hosts: workerd runs in the runtime container as the jail's uid 1000 (pids ${v8_pids:-none}; uids ${uids:-none})" test "$uids" = "1000 "
+  seen="$(agent sh -c 'for d in /proc/[0-9]*; do [ "${d#/proc/}" = "$$" ] && continue; case "$(tr "\0" " " < "$d/cmdline" 2>/dev/null)" in *--wasm-*|*"workerd serve"*) echo x;; esac; done' | wc -l | tr -d ' ')"
+  check "hosts: the agent sees none of them ($seen)" test "$seen" = 0
+  # An agent restart: the next sandboxd takes both hosts over through the
+  # helper, with no process namespace shared.
+  local before cid since wasm_after v8_after logs
+  before="$(k get pod "$pod" -o jsonpath='{.status.containerStatuses[?(@.name=="agent")].restartCount}')"
+  cid="$(k get pod "$pod" -o jsonpath='{.status.containerStatuses[?(@.name=="agent")].containerID}')"
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  docker exec "$node" crictl --timeout 60s stop --timeout 30 "${cid#containerd://}" >/dev/null
+  check "hosts: the agent came back" wait_restarted agent "$before"
+  forward
+  answers "after the agent restart"
+  wasm_after="$(survivors "$wasm_pids" "$(host_pids '--wasm-' | tr '\n' ' ')")"
+  v8_after="$(survivors "$v8_pids" "$(host_pids 'workerd serve' | tr '\n' ' ')")"
+  check "hosts: a WASM host from before the restart still runs (${wasm_after:-none} of ${wasm_pids:-none})" test -n "$wasm_after"
+  check "hosts: a workerd from before the restart still runs (${v8_after:-none} of ${v8_pids:-none})" test -n "$v8_after"
+  logs="$(k logs "$pod" -c agent --since-time="$since" 2>/dev/null)"
+  check "hosts: the new agent took the WASM sandbox over" bash -c 'grep "wasm adopt: running sandbox taken over" <<<"$1" | grep -q "$2"' _ "$logs" "$wasm_id"
+  check "hosts: the new agent took the V8 sandbox over, reloading none" bash -c 'grep "isolate adopt: sandboxes from the previous sandboxd" <<<"$1" | grep -Eq "adopted[\":= ]+[1-9]" && ! grep "isolate adopt: sandboxes from the previous sandboxd" <<<"$1" | grep -Eq "reloading[\":= ]+[1-9]"' _ "$logs"
+  local id code
+  for id in "$wasm_id" "$v8_id"; do
+    code="$(api -o /dev/null -w '%{http_code}' -X DELETE "$SB_API_URL/v1/sandboxes/$id")"
+    check "hosts: delete $id ($code)" bash -c '[[ "$1" == 200 || "$1" == 204 ]]' _ "$code"
+    code="$(api -o /dev/null -w '%{http_code}' "$SB_API_URL/v1/sandboxes/$id")"
+    check "hosts: $id is gone ($code)" test "$code" = 404
+  done
+}
+
 step_restarts() {
   [[ ${#created[@]} -gt 0 ]] || step_sandboxes
   local before cid s1 s2 hp1 hp2 id
@@ -256,16 +355,21 @@ step_verify() {
 }
 
 step_f8() {
-  local start
+  local start jails
   [[ -n "$pf" ]] && kill "$pf" 2>/dev/null
   pf=""
+  # With V8 isolates on, the warm V8 hosts' jails are mounted on the
+  # machine now (their folder is two-way in the runtime container): the
+  # check below then means something.
+  jails="$(docker exec "$node" grep -c isolate-jail /proc/self/mountinfo)"
+  [[ "${jails:-0}" -gt 0 ]] && echo "  V8 jail mounts on the machine before the delete: $jails"
   start=$(date +%s)
   check "f8: the worker pod went away with sandboxes running" k delete pod "$pod" --wait=true --timeout=120s
   echo "  in $(( $(date +%s) - start )) s"
   # The kubelet's own pod namespaces are /run/netns/cni-*; any other there,
   # or anything of the helper's, would be one of ours left behind.
   check "f8: no sandbox namespace or mount left on the machine" bash -c \
-    '! docker exec "$1" grep -e aerolvm-rootd -e /run/netns/ /proc/self/mountinfo | grep -qv /run/netns/cni-' _ "$node"
+    '! docker exec "$1" grep -e aerolvm-rootd -e /run/netns/ -e isolate-jail /proc/self/mountinfo | grep -qv /run/netns/cni-' _ "$node"
 }
 
 for s in "${steps[@]}"; do

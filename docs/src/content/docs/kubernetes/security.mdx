@@ -21,6 +21,7 @@ The full record is the chart's **evidence pack**, [`EVIDENCE.md`](https://github
 | Worker: **`runtime`, `agent`** | root | **privileged** | None |
 | Worker: `agent` with `privilegeMode: split` | uid 65531 | None: no capabilities, read-only root, `RuntimeDefault` seccomp | None |
 | Worker: `split-folders` (first, split only) | root | `CAP_CHOWN` only, read-only root, `RuntimeDefault` seccomp | None |
+| Worker: `workerd` (first, split with V8 isolates) | root | None: no capabilities, read-only root, `RuntimeDefault` seccomp | None |
 
 Servers, gateways and the operator run under the `restricted` Pod Security level. The worker pod's `runtime` and `agent` containers are the one exception. With [privilege mode split](#privilege-mode), only `runtime` is.
 
@@ -48,7 +49,8 @@ If you run Kyverno or Gatekeeper pod-security policies, exempt the worker pods (
 | `runtime`, `agent` | `privileged` |
 | `egress` | Running as root and the added capabilities `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`. It starts as root only to drop to uid 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`. |
 | `setup` (init, cluster mode) | Running as root. It has every capability dropped and a read-only root. |
-| `split-folders` (init, `privilegeMode: split`) | Running as root and the added capability `CHOWN`. It sets the owners of five of the pod's own folders, then exits. |
+| `split-folders` (init, `privilegeMode: split`) | Running as root and the added capability `CHOWN`. It sets the owners of five of the pod's own folders (six with V8 isolates), then exits. |
+| `workerd` (init, `privilegeMode: split` with V8 isolates) | Running as root. It has every capability dropped and a read-only root. It copies `workerd` into a folder of the pod's own, then exits. |
 
 ### The operator's rights
 
@@ -75,7 +77,7 @@ With `privilegeMode: split`, the `agent` has no rights at all. A small root help
 | `agent` runs as | root, privileged | uid 65531, no capabilities, read-only root, `RuntimeDefault` seccomp |
 | Network namespaces, firewall rules, cgroups, external mounts | made by `agent` | made by the root helper |
 | containerd | `agent` holds its socket | `agent` reaches it only through the helper, which checks each write |
-| Two-way mount propagation, shared process namespace | yes (and more with external storage) | none |
+| Two-way mount propagation, shared process namespace | yes (and more with external storage, WASM, V8 or Firecracker) | no shared process namespace; no two-way mount, except one for V8 isolates, from `runtime` only ([below](#wasm-and-v8-isolates-in-split)) |
 | Folders from the machine | none | `/sys/fs/cgroup`, read only, in `agent` alone, to read sandbox memory and CPU |
 | External storage | off by default | on by default |
 
@@ -91,16 +93,28 @@ helm install aerolvm oci://ghcr.io/aerol-ai/charts/aerolvm --set privilegeMode=s
 
 A worker gets its mode when its pod is made. To move a running install, see [Switch the privilege mode](/kubernetes/operations/#switch-the-privilege-mode).
 
-Split does not run these yet. The chart refuses each one by name, so `helm install` fails instead of a worker that never starts:
-
-- Firecracker (`worker.firecracker.enabled`)
-- WASM and V8-isolate sandboxes (`worker.wasm.enabled`, `worker.isolate.enabled`)
+Split does not run Firecracker (`worker.firecracker.enabled`) yet. The chart refuses it by name, so `helm install` fails instead of a worker that never starts.
 
 Split does run the container warm pool, the kubectl API's warm pools, and gVisor moves with memory. `worker.gvisor.checkpointMoves` is off by default in split; set it to `true` to turn moves on. A gVisor sandbox moves only to a worker of the same privilege mode. While you switch modes, a move to a worker of the other mode is refused before anything is saved, and the sandbox keeps running where it is.
 
-`privilegeMode: auto` picks `split` for a new install, unless one of these is on. An upgrade with `auto` keeps the mode the workers have now. `helm template` cannot see the cluster, so set the mode itself when a GitOps tool renders the chart.
+`privilegeMode: auto` picks `split` for a new install, unless Firecracker is on. An upgrade with `auto` keeps the mode the workers have now. `helm template` cannot see the cluster, so set the mode itself when a GitOps tool renders the chart.
 
 `aerolvm k8s verify` reports each worker pool's mode ([below](#check-a-live-install)).
+
+### WASM and V8 isolates in split
+
+Split runs [WASM](/wasm-sandbox/) and [V8 isolate](/isolate-sandbox/) sandboxes. Turn them on as in single mode, with `worker.wasm.enabled` and `worker.isolate.enabled`. The root helper starts their processes in the `runtime` container, as it does on a VM:
+
+- **WASM.** Each worker runs as its own user (uid 61000), with no groups and a system call filter. The `agent` talks to it over a socket in a folder that only root and the `agent` can enter. The `agent` joins the workers' group (61000), because it shares each sandbox's files with its worker that way.
+- **V8 isolates.** The helper builds each group's jail and runs `workerd` in it, never unjailed. A first container, `workerd`, copies `workerd` from the `aerolvm` image into a folder of root's that only `runtime` reads. The `agent` never sees that folder.
+
+These processes live in the `runtime` container, so they keep running when the `agent` restarts, and the next `agent` takes them over. No process namespace is shared.
+
+One mount is two-way: the folder of the V8 jails, from the `runtime` container only. Each jail has a small memory folder (`tmpfs`) the helper mounts, where the `agent` writes `workerd`'s settings. That mount must reach the `agent`, which mounts the folder read only and sends no mount back. The jails' mounts then also show on the machine, and the `runtime` container removes them when the pod ends.
+
+The deny floor (the addresses no sandbox may reach, such as the Kubernetes API server) reaches the `runtime` container too when WASM is on: the helper keeps the WASM workers' network fence with it.
+
+A new `workerd` reaches a worker only when its pod is made again, as the `runtime` image's tools do. An upgrade of the `agent` in place keeps the copy the pod started with.
 
 ## How a pod joins the cluster
 

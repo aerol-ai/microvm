@@ -916,6 +916,8 @@ jobs:
           scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
           scripts/chart-pod-templates.sh --set worker.externalStorage.enabled=true > "$RUNNER_TEMP/pod-templates-external-storage.yaml"
           scripts/chart-pod-templates.sh --set privilegeMode=split > "$RUNNER_TEMP/pod-templates-split.yaml"
+          scripts/chart-pod-templates.sh --set privilegeMode=split --set worker.wasm.enabled=true \
+            --set worker.isolate.enabled=true > "$RUNNER_TEMP/pod-templates-split-hosts.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set identity.tokenMaxTTL=2160h \
             --set-string identity.file.content='version: 1' > "$RUNNER_TEMP/pod-templates-identity.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set enterprise.enabled=true \
@@ -952,6 +954,7 @@ jobs:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
           AEROLVM_POD_TEMPLATES_EXTERNAL_STORAGE: ${{ runner.temp }}/pod-templates-external-storage.yaml
           AEROLVM_POD_TEMPLATES_SPLIT: ${{ runner.temp }}/pod-templates-split.yaml
+          AEROLVM_POD_TEMPLATES_SPLIT_HOSTS: ${{ runner.temp }}/pod-templates-split-hosts.yaml
           AEROLVM_POD_TEMPLATES_IDENTITY: ${{ runner.temp }}/pod-templates-identity.yaml
           AEROLVM_POD_TEMPLATES_ENTERPRISE: ${{ runner.temp }}/pod-templates-enterprise.yaml
           AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
@@ -1114,9 +1117,10 @@ jobs:
 
       # Privilege mode split (plans/security-gaps-m1-m4.md M1 PR 11): the
       # same install with the agent unprivileged and a root helper signed
-      # by a throwaway key, then the smoke test and every split check.
+      # by a throwaway key, then the smoke test and every split check. WASM
+      # and V8 isolates are on, so split.sh's hosts step runs too.
       - name: Install split mode with the edge on kind
-        run: AEROL_K8S_EDGE=1 AEROL_K8S_PRIVILEGE_MODE=split make k8s-dev
+        run: AEROL_K8S_EDGE=1 AEROL_K8S_PRIVILEGE_MODE=split AEROL_K8S_WASM_V8=1 make k8s-dev
 
       - name: Smoke test in split mode
         run: scripts/k8s-smoke.sh
