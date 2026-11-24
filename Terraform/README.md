@@ -329,12 +329,39 @@ does its root work (plans/security-gaps-m1-m4.md M1 PR 10). The bootstrap
 passes `install.sh --with-containerd-engine --privilege-mode split`, which
 installs the signed helper and both units (see
 `docs/src/content/docs/getting-started/installer-options.mdx`, "Run the server
-without root"). It needs `container_engine: containerd` and
-`one_line_join = true`, and it does not run Firecracker, V8 isolates or WASM
-yet: the plan fails when `wasm.enabled` is true or a node sets
-`with_firecracker` or `with_isolate`. `single` (the default) renders the
-bootstrap exactly as before. Changing it changes each node's user data, so
-Terraform replaces the nodes.
+without root"). `single` (the default) renders the bootstrap exactly as
+before. Changing it changes each node's user data, so Terraform replaces the
+nodes.
+
+Split runs every runtime through the helper: Firecracker (with its warm VM
+pool), V8 isolates (`with_isolate`), WASM (`wasm.enabled`) and the containerd
+warm pool (`containerd.pool.enabled`). What changes for them:
+
+- **Firecracker.** A node with `with_firecracker` also gets `install.sh
+  --with-firecracker`. That lets sandboxd write in `/srv/jailer`, puts the
+  guest kernel in a folder only root writes, and makes the `sandboxd-jailer`
+  user. The bootstrap still downloads this cluster's own Firecracker files
+  (section 2d). The default `firecracker.kernel_path` becomes
+  `/usr/local/lib/aerolvm-firecracker/vmlinux`, because the helper refuses a
+  kernel in a folder sandboxd writes. If `firecracker.jailer_uid` and
+  `jailer_gid` are unset, the bootstrap writes no jailer ids, so the VMs run
+  as `sandboxd-jailer`. In single they stay uid and gid 1000, as before.
+- **The helper restarts with sandboxd** at the end of the bootstrap. It reads
+  `cluster.env` too, and the WASM, Firecracker and volume settings are added
+  there after it first starts.
+
+The plan fails, and lists each problem, when split is set with:
+
+- `container_engine` other than `containerd`, or `one_line_join = false`;
+- `containerd.native_netns_pool_enabled: false`;
+- on a Firecracker node: `firecracker.use_jailer = false`, a
+  `jailer_chroot_base` other than `/srv/jailer`, or a `kernel_path` in
+  `/var/lib/sandboxd` or `/run/sandboxd`;
+- a `firecracker.run_dir`, `firecracker.templates_dir`, `wasm.modules_dir` or
+  `wasm.cache_dir` outside `/var/lib/sandboxd` and `/run/sandboxd`, the only
+  folders sandboxd may write in split.
+
+`Terraform/privilege_mode.tf` holds these rules.
 
 ### Download mirror
 

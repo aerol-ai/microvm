@@ -618,6 +618,26 @@ Each is small and stands alone. Together they shrink the root surface now.
     - **Two sockets needed more than the group:** the egress gateway's
       control socket (its peer uid, `SB_EGRESS_PEER_UIDS`) and rootless
       BuildKit's (an ACL for the agent, never the build user's group).
+    **What building it taught us (VM split runtimes, 2026-11-24).**
+    - **Terraform and Ansible now take split with every runtime.** Their
+      refusals of Firecracker, V8 isolates, WASM and the containerd warm
+      pool went once sandboxd and install.sh ran them (#1423 to #1432).
+      What is left is one list, the same in both: the containerd engine and
+      its netns pool, the jailer, `/srv/jailer` as the chroot base, a kernel
+      outside sandboxd's folders, and runtime folders inside them.
+      Terraform names each problem in one plan error
+      (`Terraform/privilege_mode.tf`); Ansible checks in
+      `tasks/privilege-mode-checks.yml`.
+    - **The helper reads `cluster.env`, so it must restart with sandboxd.**
+      The bootstrap and Ansible add settings there after the helper started
+      (WASM, Firecracker, platform volumes); restarting sandboxd alone left
+      the helper serving the old ones. Both now restart the two together.
+    - **Split Firecracker on Terraform goes through install.sh too**
+      (`--with-firecracker`): only install.sh can let the split unit write
+      `/srv/jailer`. The split kernel default moves to root's folder, and
+      unset jailer ids now mean the installer's `sandboxd-jailer`, not uid
+      1000 (`ubuntu`, which has sudo). Single renders byte for byte as
+      before.
 10c. Split mode's last containerd gaps (PR 13): the containerd warm pool
     and gVisor checkpoint moves.
     **What building it taught us (PR 13, 2026-11-23).**
