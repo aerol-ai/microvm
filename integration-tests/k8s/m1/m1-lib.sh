@@ -68,6 +68,21 @@ tfout() {
 refused=0
 gated=0
 refuse() { echo "m1-eks.sh: refusing to run: $*" >&2; refused=1; exit 2; }
+# refresh_credentials: one STS call in the foreground, at most
+# CRED_REFRESH_SECONDS (120) long, just before the teardown starts in a
+# process group of its own. With an MFA assume-role profile whose cached
+# credentials have expired, the AWS CLI prompts on the terminal: here the
+# user can answer, and the teardown's own calls (aws eks get-token under
+# kubectl and Helm, cluster.sh down) then find fresh credentials in the
+# CLI's cache. Best effort: the teardown runs either way. perl's alarm is
+# the time limit because a limit that runs the command in a group of its
+# own (GNU timeout) would take the terminal from it.
+refresh_credentials() {
+  [[ "$dry" == 1 ]] && return 0
+  perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "${CRED_REFRESH_SECONDS:-120}" \
+    aws sts get-caller-identity --query Account --output text >/dev/null ||
+    say "could not refresh the AWS credentials; the teardown tries anyway"
+}
 # caller_account: this machine's AWS account, or "" when STS does not
 # answer. Asked up to three times: one STS blip right after up must not
 # read as other credentials.

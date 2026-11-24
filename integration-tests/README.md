@@ -1015,6 +1015,10 @@ Cost guards:
   run this process made with `cluster.sh up` or passed the gate for: never
   after a refusal, and never a state an earlier run left. `up` refuses a
   name whose state still holds resources or whose EKS cluster exists.
+  Before the teardown starts, the AWS credentials are refreshed at the
+  terminal (an MFA prompt comes there); a prompt inside the teardown
+  fails at once instead of stopping it. Its output also goes to
+  `.state/<name>/teardown.log`.
 - **One account, one region.** `cluster.sh up` records the AWS account in
   the run's inputs; Terraform refuses any other (`allowed_account_ids`), and
   `cluster.sh down` and `eks-bank.sh down` check it before anything else.

@@ -73,8 +73,8 @@ func TestEKSBankNoAssignmentFromAnEarlyReader(t *testing.T) {
 	// ignores set -e inside it (ecr-storm called ecr-push as
 	// `[[ -f … ]] || step_ecr_push`; a run_check there would carry on past
 	// a failed command). The one exception is on_exit's teardown job,
-	// `{ step_down || exit 1; } … &`, which is best effort on purpose and
-	// says so.
+	// `{ step_down || exit 1; } < /dev/null … &`, which is best effort on
+	// purpose and says so.
 	call := `(step_[a-z_]+|run_check|run_drills)\b`
 	underList := regexp.MustCompile(`(\|\||&&|\bif\s+!?|\bwhile\s+!?|\buntil\s+|!)\s*` + call + `|` + call + `[^#]*?(\|\||&&)`)
 	for _, f := range []string{"eks-bank.sh", "drills-eks.sh", "drills-lib.sh", "drills-local.sh"} {
@@ -87,7 +87,7 @@ func TestEKSBankNoAssignmentFromAnEarlyReader(t *testing.T) {
 			if strings.HasPrefix(code, "#") || regexp.MustCompile(`^(step_[a-z_]+|run_check|run_drills)\(\)`).MatchString(code) {
 				continue
 			}
-			if underList.MatchString(code) && !strings.HasPrefix(code, `{ step_down || exit 1; } < /dev/null &`) {
+			if underList.MatchString(code) && !strings.HasPrefix(code, `{ step_down || exit 1; } < /dev/null `) {
 				t.Errorf("%s:%d: a step or check run under a list or condition: %s", f, i+1, code)
 			}
 		}
