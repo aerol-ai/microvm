@@ -150,22 +150,21 @@ func checkRootBinaryFile(path string) (string, error) {
 		return "", fmt.Errorf("%s: want a clean absolute path", path)
 	}
 	owner := uint32(os.Geteuid())
-	st, link, err := statRootName(path, owner)
+	st, link, err := statRoot(path, owner)
 	if err != nil {
 		return "", err
 	}
 	if st.Mode&unix.S_IFMT != unix.S_IFLNK {
 		return path, checkRootFile(&st, path, owner)
 	}
-	if st.Uid != 0 && st.Uid != owner {
-		return "", fmt.Errorf("%s is a link of uid %d", path, st.Uid)
+	if err := checkRootLink(&st, path, owner); err != nil {
+		return "", err
 	}
-	file := link
-	if !filepath.IsAbs(file) {
-		file = filepath.Join(filepath.Dir(path), file)
+	file, err := linkTarget(path, link)
+	if err != nil {
+		return "", err
 	}
-	file = filepath.Clean(file)
-	fst, _, err := statRootName(file, owner)
+	fst, _, err := statRoot(file, owner)
 	if err != nil {
 		return "", fmt.Errorf("%s is a link to %s: %w; %s", path, file, err, nameItAdvice)
 	}
@@ -176,6 +175,43 @@ func checkRootBinaryFile(path string) (string, error) {
 		return "", fmt.Errorf("%s is a link to %s: %w", path, file, err)
 	}
 	return file, nil
+}
+
+// statRoot is statRootName; tests stand one in, to give a link an owner
+// only root could give it.
+var statRoot = statRootName
+
+// checkRootLink: a link of root's (or the test's own user), which no one
+// else could have made or can change in a folder only root writes.
+func checkRootLink(st *unix.Stat_t, at string, owner uint32) error {
+	switch {
+	case st.Mode&unix.S_IFMT != unix.S_IFLNK:
+		return fmt.Errorf("%s is not a link (mode %o)", at, st.Mode)
+	case st.Uid != 0 && st.Uid != owner:
+		return fmt.Errorf("%s is a link of uid %d", at, st.Uid)
+	}
+	return nil
+}
+
+// linkTarget is the file the link at path names by its text, target,
+// worked out as the kernel works it out. The target must be a clean path:
+// clean, a ".." can only come first in a relative target, where it climbs
+// the link's own folder path, which the walk to the link proved has no
+// link, so the text and the kernel agree. A ".." after another name would
+// go up from wherever that name leads, which may be a link the text does
+// not show (bin/tool -> ../lnk/../evil/tool, with lnk -> q/r, runs
+// q/evil/tool), so it is refused, as is "." and "//". Every name after the
+// leading ".." parts is then walked from / with no link followed
+// (statRootName).
+func linkTarget(path, target string) (string, error) {
+	if target == "" || filepath.Clean(target) != target {
+		return "", fmt.Errorf("%s is a link to %q, which is not a clean path (a \"..\" may only come first in a relative "+
+			"link); %s", path, target, nameItAdvice)
+	}
+	if filepath.IsAbs(target) {
+		return target, nil
+	}
+	return filepath.Join(filepath.Dir(path), target), nil
 }
 
 // statRootName opens path's folder from / with no link followed, each

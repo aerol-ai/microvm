@@ -11,7 +11,9 @@
 # Each image gets the packages mkfs.ext4 and ip come from (e2fsprogs,
 # iproute2), and a root-owned placeholder at each path where firecracker,
 # the jailer, runsc and workerd go, as an install puts them; the test then
-# runs as root there and fails on any path the helper would refuse. Needs
+# runs as root there and fails on any path the helper would refuse. The
+# check's own tests run there too, as root, so the subtests that give a
+# file or a link to another user run. Needs
 # Docker and Go; pulls only the images. The test binary is built for each
 # image's own architecture.
 set -euo pipefail
@@ -23,6 +25,9 @@ out="$(mktemp -d)"
 # The programs no package installs: an install puts them at these paths.
 placeholders="$(awk '!/^#/ && NF == 3 && $2 ~ /^(SB_FIRECRACKER_BINARY|SB_JAILER_BINARY|SB_ROOTD_RUNSC|SB_ISOLATE_WORKERD_PATH)$/ {print $3}' \
   internal/rootd/testdata/split_programs.txt | sort -u | tr '\n' ' ')"
+# The layout test, and the check's own tests as root, where their
+# subtests that give a file or a link away run too.
+tests='^(TestRootProgramsOnThisHostsLayout|TestCheckRootBinaryFile|TestCheckRootBinaryFileRefusesSomeoneElsesLink|TestCheckRootLink|TestLinkTarget)$'
 failed=0
 for img in "${images[@]}"; do
   arch="$(docker image inspect --format '{{.Architecture}}' "$img" 2>/dev/null)" || {
@@ -32,7 +37,7 @@ for img in "${images[@]}"; do
   bin="$out/rootd.test-$arch"
   [[ -x "$bin" ]] || CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go test -c -o "$bin" ./internal/rootd
   echo "== $img ($arch)"
-  if ! docker run --rm --platform "linux/$arch" -e "PLACEHOLDERS=$placeholders" -e AEROL_ROOT_PROGRAM_LAYOUT=require \
+  if ! docker run --rm --platform "linux/$arch" -e "PLACEHOLDERS=$placeholders" -e AEROL_ROOT_PROGRAM_LAYOUT=require -e "TESTS=$tests" \
     -v "$bin:/t/rootd.test:ro" -v "$root/internal/rootd/testdata:/w/testdata:ro" -w /w "$img" sh -ec '
       if command -v apt-get >/dev/null; then
         apt-get update -qq >/dev/null
@@ -49,7 +54,7 @@ for img in "${images[@]}"; do
       . /etc/os-release
       echo "   $PRETTY_NAME: mkfs.ext4 $(readlink /usr/sbin/mkfs.ext4 || echo file), ip $(command -v ip) -> $(readlink -f "$(command -v ip)")"
       rc=0
-      /t/rootd.test -test.run "^TestRootProgramsOnThisHostsLayout$" -test.v >/tmp/rootd-test.out 2>&1 || rc=$?
+      /t/rootd.test -test.run "$TESTS" -test.v >/tmp/rootd-test.out 2>&1 || rc=$?
       grep -E "^(---|    ---|ok|PASS|FAIL)|_test.go:" /tmp/rootd-test.out || true
       exit "$rc"
     '; then

@@ -145,6 +145,39 @@ func TestCheckRootBinaryFile(t *testing.T) {
 		{"a link to nothing", func(t *testing.T) (string, string) {
 			return symlink(t, "mke2fs", filepath.Join(binTree(t), "mkfs.ext4")), ""
 		}, "no such file"},
+		// The kernel goes through lnk first, then up from where it leads:
+		// it runs base/q/evil/tool, in a folder anyone writes, while the
+		// text cleans to base/evil/tool, a file of root's (the re-review
+		// of 1ac18ae41).
+		{"a \"..\" after a link in the target", func(t *testing.T) (string, string) {
+			base := binTree(t)
+			mkdirMode(t, filepath.Join(base, "bin"), 0o755)
+			mkdirMode(t, filepath.Join(base, "evil"), 0o755)
+			writeBin(t, filepath.Join(base, "evil", "tool"), 0o755)
+			mkdirMode(t, filepath.Join(base, "q"), 0o755)
+			mkdirMode(t, filepath.Join(base, "q", "r"), 0o755)
+			mkdirMode(t, filepath.Join(base, "q", "evil"), 0o777)
+			writeBin(t, filepath.Join(base, "q", "evil", "tool"), 0o755)
+			symlink(t, "q/r", filepath.Join(base, "lnk"))
+			return symlink(t, "../lnk/../evil/tool", filepath.Join(base, "bin", "tool")), ""
+		}, "not a clean path"},
+		{"a \"..\" inside an absolute target", func(t *testing.T) (string, string) {
+			dir := binTree(t)
+			writeBin(t, filepath.Join(dir, "mke2fs"), 0o755)
+			return symlink(t, filepath.Join(dir, "x")+"/../mke2fs", filepath.Join(dir, "mkfs.ext4")), ""
+		}, "not a clean path"},
+		{"a \".\" in the target", func(t *testing.T) (string, string) {
+			dir := binTree(t)
+			writeBin(t, filepath.Join(dir, "mke2fs"), 0o755)
+			return symlink(t, "./mke2fs", filepath.Join(dir, "mkfs.ext4")), ""
+		}, "not a clean path"},
+		{"a link through a link with no \"..\"", func(t *testing.T) (string, string) {
+			base := binTree(t)
+			mkdirMode(t, filepath.Join(base, "q"), 0o755)
+			writeBin(t, filepath.Join(base, "q", "tool"), 0o755)
+			symlink(t, "q", filepath.Join(base, "lnk"))
+			return symlink(t, "lnk/tool", filepath.Join(base, "tool")), ""
+		}, "without following a link"},
 		{"a link to a folder", func(t *testing.T) (string, string) {
 			dir := binTree(t)
 			mkdirMode(t, filepath.Join(dir, "d"), 0o755)
@@ -205,6 +238,94 @@ func TestCheckRootBinaryFile(t *testing.T) {
 			t.Fatalf("%v, want a refusal naming the link's owner", err)
 		}
 	})
+}
+
+// TestCheckRootLink: a program's link is root's (or the test's own
+// user's, root's stand-in), from a made-up stat, so it runs without root.
+func TestCheckRootLink(t *testing.T) {
+	owner := uint32(os.Geteuid())
+	for _, tc := range []struct {
+		name string
+		st   unix.Stat_t
+		want string // "" passes
+	}{
+		{"root's link", unix.Stat_t{Mode: unix.S_IFLNK | 0o777, Uid: 0}, ""},
+		{"the stand-in's link", unix.Stat_t{Mode: unix.S_IFLNK | 0o777, Uid: owner}, ""},
+		{"someone else's link", unix.Stat_t{Mode: unix.S_IFLNK | 0o777, Uid: 4242}, "a link of uid 4242"},
+		{"a file", unix.Stat_t{Mode: unix.S_IFREG | 0o755}, "not a link"},
+	} {
+		if owner == 4242 {
+			t.Skip("this test's user is the made-up other user")
+		}
+		err := checkRootLink(&tc.st, "/usr/sbin/mkfs.ext4", owner)
+		if (tc.want == "") != (err == nil) || (err != nil && !strings.Contains(err.Error(), tc.want)) {
+			t.Errorf("%s: %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}
+
+// TestCheckRootBinaryFileRefusesSomeoneElsesLink: checkRootBinaryFile
+// applies checkRootLink to a program's link, shown without root by a
+// stand-in stat that gives the link another owner; the file it names is
+// root's, so only the link's owner refuses it.
+func TestCheckRootBinaryFileRefusesSomeoneElsesLink(t *testing.T) {
+	owner := uint32(os.Geteuid())
+	if owner == 4242 {
+		t.Skip("this test's user is the made-up other user")
+	}
+	old := statRoot
+	t.Cleanup(func() { statRoot = old })
+	for _, tc := range []struct {
+		uid  uint32
+		want string // "" passes
+	}{{0, ""}, {owner, ""}, {4242, "is a link of uid 4242"}} {
+		statRoot = func(path string, _ uint32) (unix.Stat_t, string, error) {
+			if path == "/usr/sbin/mkfs.ext4" {
+				return unix.Stat_t{Mode: unix.S_IFLNK | 0o777, Uid: tc.uid}, "mke2fs", nil
+			}
+			return unix.Stat_t{Mode: unix.S_IFREG | 0o755, Uid: 0}, "", nil
+		}
+		file, err := checkRootBinaryFile("/usr/sbin/mkfs.ext4")
+		if tc.want == "" {
+			if err != nil || file != "/usr/sbin/mke2fs" {
+				t.Errorf("a link of uid %d: %q, %v; want /usr/sbin/mke2fs", tc.uid, file, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("a link of uid %d: %q, %v; want %q", tc.uid, file, err, tc.want)
+		}
+	}
+}
+
+// TestLinkTarget: the file a link names, as the kernel finds it; only a
+// clean target, so ".." comes first in a relative one or not at all.
+func TestLinkTarget(t *testing.T) {
+	for _, tc := range []struct {
+		path, target, want string // want "" is refused
+	}{
+		{"/usr/sbin/mkfs.ext4", "mke2fs", "/usr/sbin/mke2fs"},
+		{"/usr/sbin/ip", "../bin/ip", "/usr/bin/ip"},
+		{"/usr/sbin/ip", "/bin/ip", "/bin/ip"},
+		{"/usr/sbin/x", "../../../../x", "/x"},
+		{"/b/bin/tool", "../lnk/../evil/tool", ""},
+		{"/usr/sbin/x", "/usr/lib/../sbin/y", ""},
+		{"/usr/sbin/x", "./y", ""},
+		{"/usr/sbin/x", "a//y", ""},
+		{"/usr/sbin/x", "y/", ""},
+		{"/usr/sbin/x", "", ""},
+	} {
+		got, err := linkTarget(tc.path, tc.target)
+		if tc.want == "" {
+			if err == nil || !strings.Contains(err.Error(), "not a clean path") {
+				t.Errorf("%s -> %q: %q, %v; want a refusal", tc.path, tc.target, got, err)
+			}
+			continue
+		}
+		if err != nil || got != tc.want {
+			t.Errorf("%s -> %q: %q, %v; want %s", tc.path, tc.target, got, err, tc.want)
+		}
+	}
 }
 
 func symlink(t *testing.T, target, link string) string {
