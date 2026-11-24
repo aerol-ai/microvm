@@ -48,7 +48,7 @@ If you run Kyverno or Gatekeeper pod-security policies, exempt the worker pods (
 | `runtime`, `agent` | `privileged` |
 | `egress` | Running as root and the added capabilities `NET_ADMIN`, `SETUID`, `SETGID` and `SETPCAP`. It starts as root only to drop to uid 65532 with `NET_ADMIN` and `NET_BIND_SERVICE`. |
 | `setup` (init, cluster mode) | Running as root. It has every capability dropped and a read-only root. |
-| `split-folders` (init, `privilegeMode: split`) | Running as root and the added capability `CHOWN`. It sets the owners of three of the pod's own folders, then exits. |
+| `split-folders` (init, `privilegeMode: split`) | Running as root and the added capability `CHOWN`. It sets the owners of four of the pod's own folders, then exits. |
 
 ### The operator's rights
 
@@ -81,7 +81,7 @@ With `privilegeMode: split`, the `agent` has no rights at all. A small root help
 
 The helper ships in the `aerolvm` image with a signature. The `agent` copies it to a folder the `runtime` container reads. The `runtime` container runs it only when a release key built into the `aerolvm-runtime` image signed it, and never an older one than it runs now.
 
-No root process writes in a folder the `agent` can write. Every folder the `agent` writes is mounted read only in the `runtime` container, or not at all. The one shared folder belongs to root, and the `agent` writes only in a folder of its own inside it. A short first container, `split-folders`, sets those owners before anything else starts.
+No root process writes in a folder the `agent` can write. The `runtime` and `egress` containers, which start as root, mount the folders the `agent` writes read only, or not at all. The one exception is a shared folder that belongs to root: the `agent` writes only in a folder of its own inside it. The egress gateway's control socket sits in a folder of the `egress` container's own, which the `agent` can read but not write. A short first container, `split-folders`, sets those owners before anything else starts.
 
 Turn it on at install:
 

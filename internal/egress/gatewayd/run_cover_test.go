@@ -2,8 +2,10 @@ package gatewayd
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -50,6 +52,83 @@ func TestSocketListenerMode(t *testing.T) {
 			t.Errorf("peers %v: mode %o, want %o", tc.peers, got, tc.want)
 		}
 	}
+}
+
+// A socket open to every user (one the gateway makes for another uid, as
+// in privilege mode split) is made only in a real folder that no other
+// user can write: the gateway removes, binds and sets the mode of the
+// socket by its name. A socket for root alone is still made in any folder,
+// as in single mode's shared /run/aerolvm.
+func TestSocketListenerOpenSocketFolder(t *testing.T) {
+	if uint32(os.Getuid()) == 65531 {
+		t.Skip("the test runs as uid 65531")
+	}
+	// Not t.TempDir: with this test's name the socket paths pass
+	// sun_path's 104 bytes on Darwin.
+	dir, err := os.MkdirTemp("", "gwf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+	}{{"others", 0o777}, {"group", 0o775}, {"sticky", 0o777 | os.ModeSticky}} {
+		folder := filepath.Join(dir, tc.name)
+		if err := os.Mkdir(folder, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(folder, tc.mode); err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(folder, "gw.sock")
+		if ln, err := socketListener(path, 65531); err == nil {
+			_ = ln.Close()
+			t.Errorf("%s can write the folder, and an open socket was made", tc.name)
+		}
+		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s: refused, but the path holds something: %v", tc.name, err)
+		}
+		ln, err := socketListener(path, 0)
+		if err != nil {
+			t.Errorf("%s: a socket for root alone: %v", tc.name, err)
+			continue
+		}
+		_ = ln.Close()
+	}
+	own := filepath.Join(dir, "own")
+	if err := os.Mkdir(own, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(own, link); err != nil {
+		t.Fatal(err)
+	}
+	if ln, err := socketListener(filepath.Join(link, "gw.sock"), 65531); err == nil {
+		_ = ln.Close()
+		t.Error("a link in place of the folder, and an open socket was made")
+	}
+	if err := ownFolder(filepath.Join(dir, "missing")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a missing folder: %v", err)
+	}
+	if os.Getuid() == 0 {
+		theirs := filepath.Join(dir, "theirs")
+		if err := os.Mkdir(theirs, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(theirs, 65534, 65534); err != nil {
+			t.Fatal(err)
+		}
+		if ln, err := socketListener(filepath.Join(theirs, "gw.sock"), 65531); err == nil {
+			_ = ln.Close()
+			t.Error("another user's folder, and an open socket was made")
+		}
+	}
+	ln, err := socketListener(filepath.Join(own, "gw.sock"), 65531)
+	if err != nil {
+		t.Fatalf("its own folder: %v", err)
+	}
+	_ = ln.Close()
 }
 
 func TestSocketListenerFailures(t *testing.T) {

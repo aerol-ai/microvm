@@ -300,15 +300,30 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 }
 
 // In a split worker no root process writes in a folder the agent can write
-// (plan §3.3, "root-read paths live in root's folders"). Each volume the
-// agent mounts read-write is read-only or absent in the runtime container,
-// which runs as root, with one exception: the shared folder, whose top is
-// root's (split-folders makes it 0750 root:65531 before any container
-// runs) and in which the agent writes only its own folder. Root's one-time
-// setup runs in the split-folders init container, before the agent
-// exists. The one machine folder is the agent's read-only cgroup tree.
+// (plan §3.3, "root-read paths live in root's folders"). Every container
+// that starts as root (the runtime container, the egress container before
+// it drops to 65532, split-folders, and any other) mounts each volume the
+// agent writes read only, or not at all. Two pairs are allowed, each for
+// its reason below. The set of root containers is pinned, so a new one, or
+// an edge made root, fails here until someone looks at its folders. The
+// one machine folder is the agent's read-only cgroup tree.
 func TestChartSplitRootWritesNoAgentFolder(t *testing.T) {
 	helm := chartHelm(t)
+	// Root container and volume pairs that may share a volume the agent
+	// writes.
+	allowed := map[string]bool{
+		// The shared folder's top is root's (split-folders makes it 0750
+		// root:65531), and the agent writes only in its own folder there,
+		// where root never writes.
+		"runtime/rootd-shared": true,
+		// split-folders runs before every other container. In these two it
+		// sets the volume's own top folder, its mount point, which no
+		// container can swap for another file; and it makes the agent's
+		// folder in the shared folder only after that folder's top is
+		// root's.
+		"split-folders/state":        true,
+		"split-folders/rootd-shared": true,
+	}
 	edge := []string{"--set", "edge.enabled=true", "--set", "edge.domain=aerolvm.test", "--set", "edge.certManager.issuerRef.name=ci"}
 	for name, flags := range map[string][]string{"single": edge, "cluster": append(slices.Clone(chartClusterFlags), edge...)} {
 		t.Run(name, func(t *testing.T) {
@@ -317,39 +332,83 @@ func TestChartSplitRootWritesNoAgentFolder(t *testing.T) {
 				t.Fatal(err)
 			}
 			spec := workerSpec(t, out)
-			mounts := func(list string, name string) map[string]bool {
-				rw := map[string]bool{}
+			type mount struct {
+				path string
+				rw   bool
+			}
+			type container struct {
+				mounts map[string]mount
+				env    map[string]string
+				root   bool
+			}
+			all := map[string]container{}
+			for _, list := range []string{"initContainers", "containers"} {
 				cs, _ := spec[list].([]any)
 				for _, c := range cs {
 					m, _ := c.(map[string]any)
-					if m["name"] != name {
-						continue
-					}
+					sc, _ := m["securityContext"].(map[string]any)
+					// No user of its own means the image's user, root in
+					// every image here.
+					user := fmt.Sprint(sc["runAsUser"])
+					privileged, _ := sc["privileged"].(bool)
+					ctr := container{mounts: map[string]mount{}, env: map[string]string{}, root: privileged || user == "0" || user == "<nil>"}
 					vms, _ := m["volumeMounts"].([]any)
 					for _, v := range vms {
 						vm, _ := v.(map[string]any)
 						ro, _ := vm["readOnly"].(bool)
-						rw[fmt.Sprint(vm["name"])] = !ro
+						ctr.mounts[fmt.Sprint(vm["name"])] = mount{path: fmt.Sprint(vm["mountPath"]), rw: !ro}
+					}
+					env, _ := m["env"].([]any)
+					for _, e := range env {
+						kv, _ := e.(map[string]any)
+						ctr.env[fmt.Sprint(kv["name"])] = fmt.Sprint(kv["value"])
+					}
+					all[fmt.Sprint(m["name"])] = ctr
+				}
+			}
+			agent := all["agent"]
+			var roots []string
+			for name, c := range all {
+				if !c.root {
+					continue
+				}
+				roots = append(roots, name)
+				for vol, m := range c.mounts {
+					if m.rw && agent.mounts[vol].rw && !allowed[name+"/"+vol] {
+						t.Errorf("%s starts as root and writes volume %s, which the agent writes", name, vol)
 					}
 				}
-				return rw
 			}
-			agent, runtime := mounts("containers", "agent"), mounts("containers", "runtime")
-			for vol, agentWrites := range agent {
-				if agentWrites && runtime[vol] && vol != "rootd-shared" {
-					t.Errorf("the agent and the runtime container both write volume %s", vol)
-				}
+			slices.Sort(roots)
+			if want := []string{"egress", "runtime", "split-folders"}; !slices.Equal(roots, want) {
+				t.Errorf("containers that start as root: %v, want %v", roots, want)
 			}
-			if _, ok := runtime["state"]; ok {
+			if _, ok := all["runtime"].mounts["state"]; ok {
 				t.Error("the runtime container mounts sandboxd's state volume")
 			}
-			if init := mounts("initContainers", "split-folders"); !init["rootd-shared"] || !init["state"] || !init["cni-state"] {
+			if init := all["split-folders"].mounts; !init["rootd-shared"].rw || !init["state"].rw || !init["cni-state"].rw || !init["run-egress"].rw {
 				t.Errorf("split-folders mounts %v", init)
+			}
+			// The egress gateway's control socket: the agent dials it in a
+			// folder the egress container writes and the agent reads only.
+			sock := agent.env["SB_EGRESS_GATEWAY_SOCKET"]
+			if sock == "" || all["egress"].env["SB_EGRESS_GATEWAY_SOCKET"] != sock {
+				t.Errorf("gateway socket: agent %q, egress %q", sock, all["egress"].env["SB_EGRESS_GATEWAY_SOCKET"])
+			}
+			placed := false
+			for vol, m := range all["egress"].mounts {
+				if m.rw && filepath.Dir(sock) == m.path {
+					a, ok := agent.mounts[vol]
+					placed = ok && !a.rw && a.path == m.path
+				}
+			}
+			if !placed {
+				t.Errorf("the gateway socket %s is not in a folder the egress container writes and the agent reads only", sock)
 			}
 			vols, _ := spec["volumes"].([]any)
 			for _, v := range vols {
 				vm, _ := v.(map[string]any)
-				if hp := dig(vm, "hostPath"); hp != nil && (vm["name"] != "host-cgroup" || agent["host-cgroup"] || hp["path"] != "/sys/fs/cgroup") {
+				if hp := dig(vm, "hostPath"); hp != nil && (vm["name"] != "host-cgroup" || agent.mounts["host-cgroup"].rw || hp["path"] != "/sys/fs/cgroup") {
 					t.Errorf("machine folder %v", vm)
 				}
 			}
@@ -366,7 +425,7 @@ func TestChartSingleHasNoSplit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime"} {
+			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime", "run-egress", "SB_EGRESS_GATEWAY_SOCKET"} {
 				if strings.Contains(out, bad) {
 					t.Errorf("single renders %q", bad)
 				}
