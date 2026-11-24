@@ -33,7 +33,7 @@ func undoHarnessWith(t *testing.T, extra, check string) string {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString(`set -euo pipefail
-SELF="$0"
+SELF="$0"; HERE=/eksbank-test
 sd="$OUT"; dry=0; name=bank-1; ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm; cname=aerolvm; HELM=true
 base_workers=6; peak_workers=60; scale_minutes=60; back_minutes=20; gateways_peak=11
 run_all="$RUN_ALL"; refused=0; downed=0; made_here=1; gated=1
@@ -86,8 +86,11 @@ drills() {
   [[ "$1" == unfill ]] || { command sleep "${DRILL_SLEEP:-0}" & echo $! >> "$OUT/drill-sleeps"; wait; }
 }
 `)
-	// detach: on_exit's teardown runs this file again through it.
-	b.WriteString(shellFuncIf(t, "eks-bank.sh", "detach"))
+	// detach, teardown_detached, keep_copy: on_exit's teardown runs a copy
+	// of this file again through them.
+	for _, fn := range []string{"detach", "teardown_detached", "keep_copy"} {
+		b.WriteString(shellFuncIf(t, "eks-bank.sh", fn))
+	}
 	for _, fn := range []string{"kill_tree", "run_check", "check_exit", "stop_check", "on_exit",
 		"stop_scale_drills", "scale_back", "read_workers", "step_scale", "step_gateways11"} {
 		b.WriteString(shellFunc(t, "eks-bank.sh", fn))
@@ -99,6 +102,10 @@ drills() {
 	}
 	b.WriteString(extra)
 	b.WriteString(`
+# keep_copy (when the script has it): the teardown runs a copy of this
+# file in $sd; ME is the folder this file is in.
+ME="$(cd "$(dirname "$0")" && pwd)"
+if declare -F keep_copy >/dev/null; then keep_copy; fi
 # on_exit's teardown runs this file again with step down (eks-bank.sh's
 # main loop: step_down alone).
 if [[ "${2:-}" == down ]]; then step_down; exit; fi
@@ -144,10 +151,7 @@ func startUndoWith(t *testing.T, extra, check, workers string, env ...string) un
 	}
 	t.Cleanup(func() { out.Close() })
 	// From a file: on_exit's teardown runs it again ($0, step down).
-	harness := filepath.Join(dir, "harness.sh")
-	if err := os.WriteFile(harness, []byte(undoHarnessWith(t, extra, check)), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	harness := writeHarness(t, dir, "harness.sh", undoHarnessWith(t, extra, check))
 	cmd := exec.Command("bash", harness)
 	cmd.Env = append(append(cleanEnviron(), "OUT="+dir), env...)
 	cmd.Stdout, cmd.Stderr = out, out

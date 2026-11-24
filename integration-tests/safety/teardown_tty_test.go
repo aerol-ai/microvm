@@ -63,17 +63,36 @@ def wait_for(s, t):
         drain(0.1)
         if s in log(): return True
     return False
-res = {"ready": wait_for(cfg["ready"], 30), "answered": False, "ended": False, "code": None, "stuck": []}
+res = {"ready": wait_for(cfg["ready"], 30), "answered": False, "ended": False, "code": None, "stuck": [], "killed": []}
+if cfg.get("replace"):
+    # A new file in the script's place (as a branch switch writes one).
+    with open(cfg["replace"] + ".new", "w") as f: f.write(cfg["replace_with"])
+    os.replace(cfg["replace"] + ".new", cfg["replace"])
 drain(0.3)
 os.write(fd, b"\x03")
 if cfg.get("prompt") and wait_for(cfg["prompt"], 8):
     os.write(fd, (cfg["answer"] + "\n").encode()); res["answered"] = True
+closed = False
+if cfg.get("close_at") and wait_for(cfg["close_at"], 20):
+    os.close(fd); closed = True
+if cfg.get("kill_at") and wait_for(cfg["kill_at"], 20):
+    ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True).stdout.decode("utf-8", "replace")
+    for line in ps.splitlines():
+        if cfg["kill_pattern"] in line and "ps -axo" not in line:
+            try: os.kill(int(line.split()[0]), signal.SIGKILL); res["killed"].append(line.split()[0])
+            except Exception: pass
 end = time.time() + cfg["timeout"]
 while time.time() < end:
-    drain(0.2)
+    if closed: time.sleep(0.2)
+    else: drain(0.2)
     p, st = os.waitpid(pid, os.WNOHANG)
     if p:
         res["ended"], res["code"] = True, os.waitstatus_to_exitcode(st); break
+# A teardown that goes on after the run (it should not): give it time to
+# show in the log.
+if cfg.get("settle"):
+    t_end = time.time() + cfg["settle"]
+    while time.time() < t_end and "down-done" not in log(): time.sleep(0.2)
 if not res["ended"]:
     ps = subprocess.run(["ps", "-axo", "pid=,stat=,command="], capture_output=True).stdout.decode("utf-8", "replace")
     for line in ps.splitlines():
@@ -96,15 +115,51 @@ print(json.dumps(res))
 // wrapper still holds the terminal (when the terminal's session leader
 // ends, its foreground group gets SIGHUP, which would end a left-over
 // prompt and hide it).
+//
+// replaceWith, when set, is written in the harness file's place (a new
+// file, as a branch switch writes one) once the run is ready. closeAt
+// closes the terminal when its line shows in the log; killAt SIGKILLs every
+// process whose command line holds $OUT/teardown.log (the viewer, or the
+// tee before it) when its line shows.
 type ttyOpts struct {
 	args, env             []string
 	ready, awsMode, after string
+	replaceWith           string
+	closeAt, killAt       string
+}
+
+// writeHarness writes script to dir/checkout/<name> (the checkout: not
+// $OUT, which stands for .state/<name>/, where keep_copy puts its copy),
+// with an m1-lib.sh beside it for m1-eks.sh's keep_copy. It returns the
+// path.
+func writeHarness(t *testing.T, dir, name, script string) string {
+	t.Helper()
+	co := filepath.Join(dir, "checkout")
+	if err := os.MkdirAll(co, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(co, "m1-lib.sh"), []byte("# the harness's functions are in the harness\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(co, name)
+	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// exit is the run's exit code as text ("none" when it never ended).
+func (r ttyResult) exit() string {
+	if r.Code == nil {
+		return "none"
+	}
+	return strconv.Itoa(*r.Code)
 }
 
 type ttyResult struct {
 	Ready, Answered, Ended bool
 	Code                   *int
-	Stuck                  []string
+	Stuck, Killed          []string
 	Screen                 string
 }
 
@@ -117,10 +172,7 @@ func runUnderTTY(t *testing.T, dir, script string, o ttyOpts) (ttyResult, string
 	t.Helper()
 	needTools(t, "python3", "ps")
 	marker := fmt.Sprintf("ttyrun-%d-%d", os.Getpid(), time.Now().UnixNano())
-	path := filepath.Join(dir, marker+".sh")
-	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	path := writeHarness(t, dir, marker+".sh", script)
 	bin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
@@ -169,10 +221,18 @@ exit 0
 	if o.awsMode == "" {
 		prompt = "aws-prompt"
 	}
-	cfg, _ := json.Marshal(map[string]any{
+	c := map[string]any{
 		"argv": argv, "env": envMap, "log": filepath.Join(dir, "log"),
 		"ready": o.ready, "prompt": prompt, "answer": "246810", "marker": marker, "timeout": 25,
-	})
+		"close_at": o.closeAt, "kill_at": o.killAt, "kill_pattern": filepath.Join(dir, "teardown.log"),
+	}
+	if o.closeAt != "" || o.killAt != "" {
+		c["settle"] = 8
+	}
+	if o.replaceWith != "" {
+		c["replace"], c["replace_with"] = path, o.replaceWith
+	}
+	cfg, _ := json.Marshal(c)
 	cfgPath := filepath.Join(dir, "driver.json")
 	if err := os.WriteFile(cfgPath, cfg, 0o644); err != nil {
 		t.Fatal(err)
@@ -272,7 +332,17 @@ hm() {
   if read -r _ < /dev/tty; then log "hm read the terminal"; else log "hm: no terminal"; fi
 }
 sleepy() { log sleepy-start; command sleep 20; }
-` + shellFunc(t, "eks-bank.sh", "step_down") + shellFuncIf(t, "eks-bank.sh", "refresh_credentials") + shellFuncIf(t, "eks-bank.sh", "detach")
+` + shellFunc(t, "eks-bank.sh", "step_down") + shellFuncIf(t, "eks-bank.sh", "refresh_credentials") + shellFuncIf(t, "eks-bank.sh", "detach") + `
+if [[ -n "${TD_TICKS:-}" ]]; then
+  step_down() {
+    log down-start
+    local i
+    for i in $(seq 1 "$TD_TICKS"); do echo "teardown tick $i"; log "tick $i"; command sleep 1; done
+    echo "teardown output last line"
+    log down-done
+  }
+fi
+`
 				return undoHarnessWith(t, extra, "sleepy sleepy"), nil, []string{"RUN_ALL=1"}
 			}},
 	}
@@ -380,6 +450,71 @@ func TestRefreshPutsTheTerminalBack(t *testing.T) {
 			}
 			if !strings.Contains(log, tr.down) {
 				t.Errorf("no %q:\n%s", tr.down, log)
+			}
+		})
+	}
+}
+
+// The teardown outlives whatever shows it (review of #1445). Its output
+// went through a tee in this shell's process group: when the terminal
+// closed, eks-bank.sh (which did not ignore HUP in on_exit) died with its
+// tee, and the teardown died of SIGPIPE at its next line; a killed tee
+// did the same to either script, and a tee that failed on a closed
+// terminal made "down did not finish" show for a teardown that had
+// finished. Now the teardown writes straight to teardown.log, a viewer
+// shows it, and "down did not finish" is the teardown's own status.
+func TestTeardownOutlivesItsViewer(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		o    ttyOpts
+	}{
+		{"the terminal closes", ttyOpts{closeAt: "tick 2"}},
+		{"the viewer is killed", ttyOpts{killAt: "tick 2"}},
+	} {
+		for _, tr := range teardownRuns() {
+			t.Run(tc.name+"/"+tr.name, func(t *testing.T) {
+				dir := t.TempDir()
+				script, args, env := tr.harness(t, dir)
+				o := tc.o
+				o.args, o.ready, o.env = args, tr.ready, append(env, "TD_TICKS=5")
+				r, _ := runUnderTTY(t, dir, script, o)
+				log := readLog(t, filepath.Join(dir, "log"))
+				if !strings.Contains(log, "down-done") {
+					t.Fatalf("the teardown died half way (ended %v, exit %s, killed %v):\n%s", r.Ended, r.exit(), r.Killed, log)
+				}
+				if tl := readLog(t, filepath.Join(dir, "teardown.log")); !strings.Contains(tl, "teardown output last line") {
+					t.Errorf("teardown.log lacks the last line:\n%s", tl)
+				}
+				if strings.Contains(log, "did not finish") {
+					t.Errorf("\"down did not finish\" for a teardown that finished:\n%s", log)
+				}
+				if !r.Ended || r.Code == nil || *r.Code != 130 {
+					t.Errorf("ended %v, exit %s; want exit 130:\n%s", r.Ended, r.exit(), log)
+				}
+				if tc.o.killAt != "" && len(r.Killed) == 0 {
+					t.Errorf("nothing held teardown.log open to kill (no viewer?)")
+				}
+			})
+		}
+	}
+}
+
+// The teardown runs the copy of the script made at the start, not the
+// file in the checkout, which a branch switch may have replaced since
+// (review of #1445: it ran the script again from disk).
+func TestTeardownRunsTheCopyNotTheCheckout(t *testing.T) {
+	for _, tr := range teardownRuns() {
+		t.Run(tr.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script, args, env := tr.harness(t, dir)
+			r, _ := runUnderTTY(t, dir, script, ttyOpts{args: args, env: env, ready: tr.ready,
+				replaceWith: "echo \"the replaced script ran\" >> \"$OUT/log\"\n"})
+			log := readLog(t, filepath.Join(dir, "log"))
+			if strings.Contains(log, "the replaced script ran") {
+				t.Errorf("the teardown ran the replaced file:\n%s", log)
+			}
+			if !strings.Contains(log, tr.down) {
+				t.Errorf("no %q (exit %s):\n%s", tr.down, r.exit(), log)
 			}
 		})
 	}

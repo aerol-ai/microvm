@@ -94,7 +94,10 @@ The cost guards:
   `CRED_REFRESH_SECONDS`, 120 s), so an MFA prompt comes where you can
   answer it. A prompt that still comes inside the teardown fails at once
   instead of stopping it. Its output goes to the terminal and to
-  `.state/<name>/teardown.log`.
+  `.state/<name>/teardown.log`. It runs the copy of `m1-eks.sh` and
+  `m1-lib.sh` made in `.state/<name>/` when the run started, so a branch
+  switched in the checkout during the run does not change it; a closed
+  terminal does not stop it either.
 - **Teardown by name.** `down` removes the chart and its volumes, then runs
   `cluster.sh down <name>`, which works from the run's own Terraform state.
 - **A timer in AWS.** `cluster.sh up --teardown` has AWS end the machines at

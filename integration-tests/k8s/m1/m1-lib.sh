@@ -96,20 +96,61 @@ refresh_credentials() {
       select(undef, undef, undef, 0.1);
     }
     # Out of time: the whole tree, found while aws still lives (its
-    # children would go to init once it is gone), then all of it at once.
-    my %tree;
-    my @todo = ($pid);
-    my @ps = `ps -axo pid=,ppid=`;
-    while (defined(my $p = shift @todo)) {
-      for (@ps) { my ($c, $pp) = split; push @todo, $c if $pp == $p && !$tree{$c}++ }
+    # children would go to init once it is gone). Frozen first (STOP), then
+    # walked again until a walk finds no new process: one forked between a
+    # walk and the kill cannot get away. Then all of it at once.
+    my %tree = ($pid => 1);
+    for (my $grew = 1; $grew;) {
+      kill "STOP", keys %tree;
+      $grew = 0;
+      for (`ps -axo pid=,ppid=`) {
+        my ($c, $pp) = split;
+        if ($tree{$pp} && !$tree{$c}) { $tree{$c} = 1; $grew = 1 }
+      }
     }
-    kill "KILL", $pid, keys %tree;
+    kill "KILL", keys %tree;
     waitpid($pid, 0);
     exit 124' "${CRED_REFRESH_SECONDS:-120}" aws sts get-caller-identity --query Account --output text >/dev/null || rc=$?
   # A prompt that was killed leaves the terminal as it set it (echo off).
   [[ -z "$saved" ]] || stty "$saved" 2>/dev/null || true
   [[ "$rc" == 0 ]] || say "could not refresh the AWS credentials (exit $rc); the teardown tries anyway" || true
   return 0
+}
+# teardown_detached <cmd...>: cmd run by detach (no terminal), writing
+# straight to $sd/teardown.log, with no pipe in between: nothing that dies
+# on this side (the terminal closing, a killed viewer) can send it SIGPIPE
+# half way. A tee on this side did: when the terminal closed, it died and
+# the teardown with it (review of #1445). A viewer shows the log's new
+# lines on this terminal while cmd runs, and stops after cmd ends (KILL if
+# it is stuck: it inherits INT and TERM ignored). Returns cmd's own exit
+# status, so "down did not finish" means the teardown failed, not the
+# viewer.
+teardown_detached() {
+  local log="$sd/teardown.log" mark="$sd/.teardown-done.$$" from viewer rc=0 _
+  touch "$log"
+  from="$(wc -c < "$log" | tr -d ' ')"
+  rm -f "$mark"
+  perl -e '
+    my ($f, $from, $mark) = @ARGV;
+    open(my $fh, "<", $f) or exit 0;
+    seek($fh, $from, 0);
+    $| = 1;
+    my $buf;
+    while (1) {
+      my $done = -e $mark;
+      while (read($fh, $buf, 65536)) { print $buf }
+      last if $done;
+      select(undef, undef, undef, 0.2);
+      seek($fh, 0, 1);
+    }' "$log" "$from" "$mark" &
+  viewer=$!
+  detach "$@" < /dev/null >> "$log" 2>&1 || rc=$?
+  : > "$mark"
+  for _ in $(seq 1 30); do kill -0 "$viewer" 2>/dev/null || break; sleep 0.1; done
+  kill -KILL "$viewer" 2>/dev/null || true
+  wait "$viewer" 2>/dev/null || true
+  rm -f "$mark"
+  return "$rc"
 }
 # detach <cmd...>: cmd in a session of its own, with no controlling
 # terminal, waited for; its exit status (128 + n when signal n ended it).

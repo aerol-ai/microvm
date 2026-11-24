@@ -106,6 +106,24 @@ behave() {
 		b.WriteString(shellFuncIf(t, "m1/m1-lib.sh", fn))
 	}
 	b.WriteString("if [[ \"${DOWN:-}\" == real ]]; then\n" + shellFunc(t, "m1/m1-eks.sh", "step_down") + "fi\n")
+	b.WriteString(`# TD_TICKS: a teardown that takes TD_TICKS seconds, a line a second, then
+# a last line (for a terminal or a viewer that goes away half way).
+if [[ -n "${TD_TICKS:-}" ]]; then
+  step_down() {
+    log down-start
+    local i
+    for i in $(seq 1 "$TD_TICKS"); do echo "teardown tick $i"; log "tick $i"; command sleep 1; done
+    echo "teardown output last line"
+    log down-done
+  }
+fi
+`)
+	b.WriteString(shellFuncIf(t, "m1/m1-lib.sh", "teardown_detached") + shellFuncIf(t, "m1/m1-eks.sh", "keep_copy"))
+	b.WriteString(`# keep_copy (when the script has it): the teardown runs a copy of this
+# file in $sd; ME is the folder this file is in.
+ME="$(cd "$(dirname "$0")" && pwd)"
+if declare -F keep_copy >/dev/null; then keep_copy; fi
+`)
 	b.WriteString(string(src[i:]))
 	return b.String()
 }
@@ -131,10 +149,7 @@ func startM1(t *testing.T, steps []string, env ...string) m1Run {
 	}
 	t.Cleanup(func() { out.Close() })
 	// From a file: on_exit's teardown runs it again ($0, step teardown).
-	harness := filepath.Join(dir, "m1-eks.sh")
-	if err := os.WriteFile(harness, []byte(m1Harness(t)), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	harness := writeHarness(t, dir, "m1-eks.sh", m1Harness(t))
 	cmd := exec.Command("bash", append([]string{harness}, steps...)...)
 	var clean []string
 	for _, e := range cleanEnviron() {

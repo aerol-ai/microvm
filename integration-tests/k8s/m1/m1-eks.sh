@@ -80,11 +80,13 @@
 set -euo pipefail
 # bash 4 or newer: macOS's /bin/bash is 3.2 (`brew install bash`).
 [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { echo "m1-eks.sh: needs bash 4 or newer; this is bash $BASH_VERSION" >&2; exit 2; }
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ME: the folder this file is in: the checkout's m1/, or .state/<name>/
+# for the copy on_exit runs (keep_copy). HERE: the drill's folder, which
+# that copy is told (M1_KIT_DIR).
+ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="${M1_KIT_DIR:-$ME}"
 K8S="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$K8S/../.." && pwd)"
-# This script, which on_exit runs again (step teardown) to tear down.
-SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
 usage() { sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 name="${1:-}"; [[ -n "$name" ]] || usage
 shift
@@ -96,12 +98,24 @@ esac
 [[ "$name" =~ ^[a-z][a-z0-9-]{2,30}$ ]] || { echo "m1-eks.sh: \"$name\" is not a cluster.sh run name" >&2; exit 2; }
 sd="$K8S/.state/$name"
 mkdir -p "$sd/evidence"
+# keep_copy: this script and m1-lib.sh copied into $sd, and SELF set to
+# the copy, which on_exit's teardown runs. The teardown reads the script
+# from disk, and a run takes hours: a branch switched in the checkout
+# meanwhile must not change what tears the run down. The copy itself (ME
+# is $sd) copies nothing.
+keep_copy() {
+  SELF="$sd/$(basename "${BASH_SOURCE[0]}")"
+  [[ "$ME" != "$sd" ]] || return 0
+  cp "${BASH_SOURCE[0]}" "$SELF"
+  cp "$ME/m1-lib.sh" "$sd/m1-lib.sh"
+}
+keep_copy
 sha="$(git -C "$REPO" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
 # The versions: T1 is installed, T2 is S2's upgrade, T3 only signs the
 # refused variants (newer than T2, so only the signature is wrong).
 T1=v0.0.0-m1drill.1 T2=v0.0.0-m1drill.2 T3=v0.0.0-m1drill.3
 # shellcheck source=m1-lib.sh
-source "$HERE/m1-lib.sh"
+source "$ME/m1-lib.sh"
 # made_here: this process called cluster.sh up (step_up sets it).
 made_here=0
 CERT_MANAGER_VERSION=v1.21.3
@@ -964,9 +978,10 @@ on_exit() {
     # TTOU was not enough: macOS's bash 3.2, running a script, gives its
     # children the default back, and ssh-style prompts install their own
     # handler and spin (review of #1443). With no terminal, /dev/tty fails
-    # at once. Its output reaches the terminal and $sd/teardown.log through
-    # tee, here in this (the terminal's) process group.
-    if ! detach env M1_TEARDOWN_ON_EXIT=0 "$BASH" "$SELF" "$name" teardown < /dev/null 2>&1 | tee -a "$sd/teardown.log"; then
+    # at once. Its output reaches $sd/teardown.log and the terminal through
+    # teardown_detached: straight to the log, shown here by a viewer. It is
+    # the copy keep_copy made (SELF), told where the drill's folder is.
+    if ! teardown_detached env M1_TEARDOWN_ON_EXIT=0 M1_KIT_DIR="$HERE" "$BASH" "$SELF" "$name" teardown; then
       say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true
     fi
   fi
