@@ -245,11 +245,13 @@ func (r *NodeReconciler) removeNodeCert(ctx context.Context, ns, name string) er
 // sandboxd and must start even with the Secret gone, so there it is
 // optional.
 func useNodeCert(spec *corev1.PodSpec, node string, optional bool) {
+	i := containerIndex(spec.Containers, AgentContainer)
+	// The agent and setup, which runs as the agent's user, read it
+	// (readMode).
 	spec.Volumes = append(spec.Volumes, corev1.Volume{Name: TLSVolume, VolumeSource: corev1.VolumeSource{
-		Secret: &corev1.SecretVolumeSource{SecretName: NodeCert(node), DefaultMode: ptr[int32](0o400), Optional: ptr(optional),
+		Secret: &corev1.SecretVolumeSource{SecretName: NodeCert(node), DefaultMode: ptr(readMode(spec, spec.Containers[i].SecurityContext, 0o400)), Optional: ptr(optional),
 			Items: []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}, {Key: "tls.crt", Path: "node.crt"}, {Key: "tls.key", Path: "node.key"}}},
 	}})
-	i := containerIndex(spec.Containers, AgentContainer)
 	spec.Containers[i].VolumeMounts = append(spec.Containers[i].VolumeMounts,
 		corev1.VolumeMount{Name: TLSVolume, MountPath: TLSDir, ReadOnly: true})
 	setEnv(spec, AgentContainer, []corev1.EnvVar{{Name: "SB_CLUSTER_TLS_DIR", Value: TLSDir}})

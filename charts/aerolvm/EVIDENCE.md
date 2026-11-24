@@ -208,6 +208,14 @@ What is proven so far, and how:
   the `agent` saw the socket there and could not write the folder, the
   `egress` container could not write `/run/aerolvm`, hostname allow lists
   through the gateway held, and every other check above passed again.
+- **Cluster mode on kind** (2026-11-24, after the first EKS drill found a
+  split worker that could not read its join token): three servers, a
+  gateway and one split worker pool. The worker's `setup` (uid 65531)
+  read its token, the worker joined, runc and gVisor sandboxes ran on it,
+  and `aerolvm k8s verify` reported `general: split 1`. In a split worker
+  the token is mode 0444 (and an external-CA certificate 0404): the pod has
+  no fsGroup and its containers run as different users, so Kubernetes
+  makes these files root's, and only their readers mount them.
 - **Not yet proven:** one live EKS run (sandboxes kept across an agent
   swap; external storage across it; no namespace left after a pod delete;
   memory pressure kills one sandbox, never the machinery; create latency

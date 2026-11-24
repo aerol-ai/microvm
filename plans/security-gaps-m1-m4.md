@@ -818,6 +818,24 @@ Each is small and stands alone. Together they shrink the root surface now.
       cluster-mode mixed fleet (one kind node cannot hold three servers,
       three gateways and two workers beside the other local clusters); and
       a 6.12 kernel. Those are the EKS drill's.
+    - **The first EKS drill (m1d-1, 2026-11-24) found one more.** A
+      cluster-mode worker made from the split template never joined. Its
+      setup runs as the agent's user (65531), and its join token, a
+      projected ServiceAccount token the operator stamped 0440, was root's:
+      the pod's containers run as different users and the pod has no
+      fsGroup, so the kubelet gives the file no other owner or group. The
+      operator now adds the read bit for others to each volume a reader
+      that is not root needs (the join token 0444, an external-CA
+      certificate 0404, which had the same problem); only those readers
+      mount them. No pod fsGroup (it would regroup the folders
+      `split-folders` closes), and the join never runs as root. A chart
+      test checks every file volume the chart gives a container that is
+      not root. Kind had not shown it: it had run split in single mode
+      only. On kind, cluster mode with one split pool (three servers, a
+      gateway and one worker, in one zone) now joins, runs runc and gVisor
+      sandboxes, and `aerolvm k8s verify` reports `general: split 1`;
+      with the operator from before the fix the same worker fails as it
+      did on EKS.
 12. Docs, `EVIDENCE.md` and the capability matrix.
 
 ### 3.6 Tests
