@@ -1,0 +1,177 @@
+# build-job.yaml: the M1 drill's images, built inside the cluster
+# (m1-eks.sh build). Based on integration-tests/k8s/cell/build-job.yaml, plus
+# what privilege mode split needs: a signed root helper, and a runtime image
+# whose supervisor trusts the signing key.
+#
+# The signing keys are THROWAWAY keys made inside this pod. They never leave
+# it: they live in an emptyDir that goes when the pod ends. The release key
+# is never used, read or copied here. The supervisor is built with
+# `go build -overlay` putting this run's public key in place of
+# internal/rootswap/release-keys.pub, as scripts/k8s-dev.sh does on kind.
+#
+# Images (all linux/amd64, pushed to the run's ECR repositories):
+#   aerolvm:@@T1@@            sandboxd @@T1@@, helper @@T1@@ signed by key A
+#   aerolvm:@@T2@@            sandboxd @@T2@@, helper @@T2@@ signed by key A (S2's newer helper)
+#   aerolvm:@@T2@@-unsigned   sandboxd @@T2@@, helper @@T3@@ with no signature
+#   aerolvm:@@T2@@-otherkey   sandboxd @@T2@@, helper @@T3@@ signed by key B (not trusted)
+#   aerolvm:@@T2@@-older      sandboxd @@T2@@, helper @@T1@@ signed by key A (older)
+#   aerolvm-runtime:@@T1@@ and :@@T2@@  supervisor trusting key A only
+#   aerolvm-operator:@@T1@@ and :@@T2@@
+# Placeholders in @@...@@ are filled by m1-eks.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aerolvm-build
+  labels:
+    # BuildKit runs privileged; this namespace is the build's only.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: images-@@SHORT@@
+  namespace: aerolvm-build
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      # On a worker machine (4 CPUs, empty until the chart is installed):
+      # the system machines have 2 CPUs and hold the cell's own pods.
+      nodeSelector: { aerolvm.io/pool: phase0 }
+      tolerations: [{ key: aerolvm.io/worker, operator: Exists, effect: NoSchedule }]
+      volumes:
+        - { name: work, emptyDir: {} }
+        - { name: gocache, emptyDir: {} }
+        # The throwaway keys. Memory-backed, so they never touch the
+        # machine's disk.
+        - { name: keys, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+        - name: ecr
+          secret:
+            secretName: ecr-push
+            items: [{ key: .dockerconfigjson, path: config.json }]
+      initContainers:
+        - name: source
+          image: public.ecr.aws/docker/library/alpine:3.20
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /work/src
+              wget -q -O /work/src.tgz "$SOURCE_URL"
+              tar -xzf /work/src.tgz -C /work/src
+              echo "source: $(du -sh /work/src | cut -f1)"
+          env:
+            - { name: SOURCE_URL, value: "@@SOURCE_URL@@" }
+          volumeMounts: [{ name: work, mountPath: /work }]
+        - name: compile
+          image: public.ecr.aws/docker/library/golang:1.26
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              cd /work/src
+              export GOFLAGS=-buildvcs=false GOCACHE=/gocache
+              v() { echo "-X github.com/aerol-ai/microvm/internal/version.Version=$1"; }
+              bin=/work/bin; mkdir -p "$bin"
+              # The signer, and two throwaway keys: A (trusted by this run's
+              # supervisor) and B (trusted by nothing). Only public halves
+              # are printed.
+              go build -trimpath -o "$bin/sign" ./cmd/aerolvm-rootd-sign
+              "$bin/sign" -genkey /keys/a.key > /keys/a.pub
+              "$bin/sign" -genkey /keys/b.key > /keys/b.pub
+              echo "throwaway key A (public): $(cat /keys/a.pub)"
+              echo "throwaway key B (public): $(cat /keys/b.pub)"
+              # The supervisor trusts key A alone, in place of the release keys.
+              printf '{"Replace":{"%s":"%s"}}\n' "$PWD/internal/rootswap/release-keys.pub" /keys/a.pub > /work/overlay.json
+              CGO_ENABLED=0 go build -trimpath -overlay /work/overlay.json -o "$bin/aerolvm-supervisor" ./cmd/aerolvm-supervisor
+              (cd operator && CGO_ENABLED=0 go build -trimpath -o "$bin/aerolvm-operator" ./cmd/aerolvm-operator)
+              # One helper per version: T1 and T2 (the real ones) and T3 (only
+              # for the refused variants, newer than T2 so that only its
+              # signature is wrong).
+              for t in @@T1@@ @@T2@@ @@T3@@; do
+                mkdir -p "/work/rootd/$t"
+                CGO_ENABLED=0 go build -trimpath -ldflags "$(v "$t")" -o "/work/rootd/$t/aerolvm-rootd" ./cmd/aerolvm-rootd
+              done
+              # sandboxd and toolboxd per agent version (toolboxd carries
+              # sandboxd's version: a warm slot is refused when the agent in
+              # it reports another).
+              for t in @@T1@@ @@T2@@; do
+                mkdir -p "/work/agent/$t"
+                CGO_ENABLED=1 go build -trimpath -ldflags "$(v "$t")" -o "/work/agent/$t/sandboxd" ./cmd/sandboxd
+                CGO_ENABLED=0 go build -trimpath -ldflags "$(v "$t")" -o "/work/agent/$t/toolboxd" ./cmd/toolboxd
+              done
+              # ctx <name> <agent version> <helper version> <key: a|b|none>:
+              # one build context, laid out as scripts/build-images.sh does.
+              ctx() {
+                local d="/work/ctx/$1/amd64"
+                mkdir -p "$d/rootd"
+                cp "/work/agent/$2/sandboxd" "/work/agent/$2/toolboxd" "$bin/aerolvm-supervisor" "$bin/aerolvm-operator" "$d/"
+                cp "/work/rootd/$3/aerolvm-rootd" "$d/rootd/aerolvm-rootd"
+                if [ "$4" != none ]; then
+                  "$bin/sign" -key "/keys/$4.key" -version "$3" -no-exec "$d/rootd/aerolvm-rootd"
+                fi
+                ls -la "$d" "$d/rootd"
+              }
+              ctx t1        @@T1@@ @@T1@@ a
+              ctx t2        @@T2@@ @@T2@@ a
+              ctx unsigned  @@T2@@ @@T3@@ none
+              ctx otherkey  @@T2@@ @@T3@@ b
+              ctx older     @@T2@@ @@T1@@ a
+              # Each signed helper checks against the key its supervisor trusts
+              # (key A), except the other-key one, which must not.
+              for c in t1 t2 older; do "$bin/sign" -verify /keys/a.pub "/work/ctx/$c/amd64/rootd/aerolvm-rootd"; done
+              if "$bin/sign" -verify /keys/a.pub /work/ctx/otherkey/amd64/rootd/aerolvm-rootd 2>/dev/null; then
+                echo "the other-key helper checks against key A: the variant is wrong" >&2; exit 1
+              fi
+              # The keys go now: nothing after this step can read them.
+              rm -f /keys/a.key /keys/b.key
+              echo "compile: done"
+          resources:
+            requests: { cpu: "3", memory: 6Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: gocache, mountPath: /gocache }
+            - { name: keys, mountPath: /keys }
+      containers:
+        - name: images
+          image: docker.io/moby/buildkit:v0.22.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              cd /work/src
+              base="--opt build-arg:REVISION=@@SHA@@"
+              while IFS='=' read -r k v; do
+                case "$k" in ''|\#*) continue ;; esac
+                base="$base --opt build-arg:$k=$v"
+              done < packaging/images/versions.env
+              # img <image> <dockerfile> <context> <tag> <version>
+              img() {
+                echo "images: @@REGISTRY@@/$1:$4"
+                # shellcheck disable=SC2086
+                buildctl-daemonless.sh build --frontend dockerfile.v0 \
+                  --local context="/work/ctx/$3" --local dockerfile=packaging/images \
+                  --opt filename="$2" --opt platform=linux/amd64 $base --opt "build-arg:VERSION=$5" \
+                  --output "type=image,name=@@REGISTRY@@/$1:$4,push=true"
+              }
+              img aerolvm          aerolvm.Dockerfile  t1       @@T1@@          @@T1@@
+              img aerolvm-runtime  runtime.Dockerfile  t1       @@T1@@          @@T1@@
+              img aerolvm-operator operator.Dockerfile t1       @@T1@@          @@T1@@
+              img aerolvm          aerolvm.Dockerfile  t2       @@T2@@          @@T2@@
+              img aerolvm-runtime  runtime.Dockerfile  t2       @@T2@@          @@T2@@
+              img aerolvm-operator operator.Dockerfile t2       @@T2@@          @@T2@@
+              img aerolvm          aerolvm.Dockerfile  unsigned @@T2@@-unsigned @@T2@@
+              img aerolvm          aerolvm.Dockerfile  otherkey @@T2@@-otherkey @@T2@@
+              img aerolvm          aerolvm.Dockerfile  older    @@T2@@-older    @@T2@@
+              echo "images: done"
+          env:
+            - { name: DOCKER_CONFIG, value: /ecr }
+          securityContext:
+            privileged: true
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+          volumeMounts:
+            - { name: work, mountPath: /work }
+            - { name: ecr, mountPath: /ecr, readOnly: true }
