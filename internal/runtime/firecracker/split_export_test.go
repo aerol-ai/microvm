@@ -242,6 +242,24 @@ func TestSplitSweepSnapshotExports(t *testing.T) {
 	}
 }
 
+// TestSplitBuildInJailFailures: a build whose disk cannot be moved to its
+// place, or whose jail ID is no VM's, fails, and the jail goes either way.
+func TestSplitBuildInJailFailures(t *testing.T) {
+	f := newFakeSplit(t)
+	d, _, _, _ := splitDriver(t, f)
+	build := func(out string) error { return os.WriteFile(out, []byte("ext4"), 0o600) }
+	missing := filepath.Join(d.cfg.TemplatesDir, "no-such-folder", "image.ext4")
+	if err := d.splitBuildInJail(context.Background(), "export-0123456789ab", "export VM image", missing, build); err == nil || !strings.Contains(err.Error(), "move to") {
+		t.Fatalf("a disk with nowhere to go: %v", err)
+	}
+	if got := f.seen(); !slices.Equal(got, []string{"prepare export-0123456789ab", "stop export-0123456789ab"}) {
+		t.Fatalf("helper calls %v", got)
+	}
+	if err := d.splitBuildInJail(context.Background(), "../export", "export VM image", filepath.Join(d.cfg.TemplatesDir, "x.ext4"), build); err == nil {
+		t.Fatal("a jail ID up the tree")
+	}
+}
+
 type errUnitTest string
 
 func (e errUnitTest) Error() string { return string(e) }
