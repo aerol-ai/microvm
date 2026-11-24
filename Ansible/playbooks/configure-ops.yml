@@ -21,22 +21,6 @@
   any_errors_fatal: true
   gather_facts: false
 
-  pre_tasks:
-    - name: Gather hardware facts for architecture preflight
-      ansible.builtin.setup:
-        gather_subset:
-          - "!all"
-          - hardware
-
-    - name: Assert homogeneous CPU architecture across play hosts
-      run_once: true
-      ansible.builtin.assert:
-        that:
-          - ansible_play_hosts | map('extract', hostvars, 'ansible_architecture') | unique | length == 1
-        fail_msg: >-
-          Mixed CPU architectures detected across inventory hosts.
-          AerolVM clusters must be single-arch (see plans/arm64-firecracker-hosts.md).
-
   # Shared SoT files Terraform also reads (Terraform/locals.tf: cluster_ops
   # and cluster_secrets). Paths are relative to this playbook file; both
   # tools point at the same on-disk files so day-0 and day-2 rollouts render
@@ -57,6 +41,16 @@
     # user, which reads them. It never writes SB_PRIVILEGE_MODE.
     sandboxd_privilege_mode: "{{ privilege_mode | default('single') }}"
     sandboxd_file_owner: "{{ 'sandboxd' if sandboxd_privilege_mode == 'split' else 'root' }}"
+    # The Firecracker guest kernel. In split the root helper links it into
+    # every VM's jail and refuses a kernel in a folder sandboxd writes, so
+    # split moves the single default where install.sh --privilege-mode split
+    # puts it, a folder only root writes. Terraform does the same
+    # (Terraform/privilege_mode.tf); any other path is kept.
+    sandboxd_firecracker_kernel_path: >-
+      {{ '/usr/local/lib/aerolvm-firecracker/vmlinux'
+         if (sandboxd_privilege_mode == 'split'
+             and (firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux')) == '/var/lib/sandboxd/firecracker/vmlinux')
+         else (firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux')) }}
     sandboxd_ops_env:
       SB_OTEL_METRICS_ENABLED: "{{ ((otel.metrics_enabled | bool) or (otel.metrics_endpoint | length > 0)) | string | lower }}"
       SB_OTEL_METRICS_ENDPOINT: "{{ otel.metrics_endpoint }}"
@@ -83,7 +77,7 @@
       SB_ENABLE_FIRECRACKER: "{{ firecracker.enabled | default(false) | bool | string | lower }}"
       SB_FIRECRACKER_BINARY: "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') }}"
       SB_JAILER_BINARY: "{{ firecracker.jailer_path | default('/usr/local/bin/jailer') }}"
-      SB_FIRECRACKER_KERNEL: "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}"
+      SB_FIRECRACKER_KERNEL: "{{ sandboxd_firecracker_kernel_path }}"
       SB_FIRECRACKER_RUN_DIR: "{{ firecracker.run_dir | default('/run/sandboxd/firecracker') }}"
       SB_FIRECRACKER_TEMPLATES_DIR: "{{ firecracker.templates_dir | default('/var/lib/sandboxd/firecracker/templates') }}"
       SB_FIRECRACKER_USE_JAILER: "{{ firecracker.use_jailer | default(true) | bool | string | lower }}"
@@ -185,7 +179,24 @@
       SB_AUDIT_WITNESS_S3_ENDPOINT: "{{ sandboxd_audit_witness_s3_endpoint }}"
       SB_AUDIT_WITNESS_S3_PATH_STYLE: "{{ sandboxd_audit_witness_s3_path_style | bool | string | lower }}"
 
+  # One pre_tasks list: YAML keeps only the last of two, and a second one
+  # once dropped the architecture check below without a word.
   pre_tasks:
+    - name: Gather hardware facts for architecture preflight
+      ansible.builtin.setup:
+        gather_subset:
+          - "!all"
+          - hardware
+
+    - name: Assert homogeneous CPU architecture across play hosts
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - ansible_play_hosts | map('extract', hostvars, 'ansible_architecture') | unique | length == 1
+        fail_msg: >-
+          Mixed CPU architectures detected across inventory hosts.
+          AerolVM clusters must be single-arch (see plans/arm64-firecracker-hosts.md).
+
     - name: Check base sandboxd env file
       ansible.builtin.stat:
         path: "{{ sandboxd_env_file }}"
@@ -206,27 +217,23 @@
       ansible.builtin.set_fact:
         sandboxd_ops_env_file: "{{ sandboxd_cluster_env_file if sandboxd_cluster_env.stat.exists else sandboxd_env_file }}"
 
-    - name: Refuse an unknown privilege_mode
-      ansible.builtin.assert:
-        that:
-          - sandboxd_privilege_mode in ['single', 'split']
-        fail_msg: "privilege_mode in config/cluster.yml must be single or split, got {{ sandboxd_privilege_mode }}."
+    # Whether install.sh set a split node up for Firecracker (its unit lets
+    # sandboxd write the jailer's folder); privilege-mode-checks.yml reads it.
+    - name: Read sandboxd's unit on a split node with Firecracker
+      when:
+        - sandboxd_privilege_mode == 'split'
+        - firecracker.enabled | default(false) | bool
+      ansible.builtin.command:
+        argv: [systemctl, cat, "{{ sandboxd_service_name }}"]
+      register: sandboxd_unit
+      changed_when: false
+      failed_when: false
+      check_mode: false
 
-    # The root helper does not start these yet (M1 PR 9): sandboxd refuses
-    # to boot with them in split mode. Checked here so the restart handler
-    # never takes a healthy node down into a refused boot.
-    - name: Refuse runtimes privilege mode split does not run yet
-      when: sandboxd_privilege_mode == 'split'
-      ansible.builtin.assert:
-        that:
-          - not (firecracker.enabled | default(false) | bool)
-          - not (wasm.enabled | default(false) | bool)
-          - not (containerd.pool.enabled | default(false) | bool)
-        fail_msg: >-
-          privilege_mode: split does not run Firecracker, WASM or the
-          containerd warm pool yet; set firecracker.enabled, wasm.enabled and
-          containerd.pool.enabled to false in config/cluster.yml, or keep
-          privilege_mode: single.
+    # Split runs Firecracker, WASM, V8 isolates and the containerd warm pool
+    # through the root helper. These are the settings it cannot run with.
+    - name: Check the privilege mode's settings
+      ansible.builtin.import_tasks: tasks/privilege-mode-checks.yml
 
     - name: Read the privilege mode this node runs in
       ansible.builtin.shell: >-
@@ -528,10 +535,22 @@
       loop:
         - "{{ firecracker.binary_path | default('/usr/local/bin/firecracker') | dirname }}"
         - "{{ firecracker.jailer_path | default('/usr/local/bin/jailer') | dirname }}"
-        - "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') | dirname }}"
+        - "{{ sandboxd_firecracker_kernel_path | dirname }}"
+        - "{{ firecracker.jailer_chroot_base | default('/srv/jailer') }}"
+
+    # sandboxd writes these two. In split they are its user's: root's would
+    # stop its VM files and templates until its next start gave them back.
+    - name: Ensure Firecracker's sandboxd folders exist
+      when: firecracker.enabled | default(false) | bool
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+        owner: "{{ sandboxd_file_owner }}"
+        group: "{{ sandboxd_file_owner }}"
+      loop:
         - "{{ firecracker.run_dir | default('/run/sandboxd/firecracker') }}"
         - "{{ firecracker.templates_dir | default('/var/lib/sandboxd/firecracker/templates') }}"
-        - "{{ firecracker.jailer_chroot_base | default('/srv/jailer') }}"
 
     - name: Stat installed Firecracker binary
       when: firecracker.enabled | default(false) | bool
@@ -648,7 +667,7 @@
       when: firecracker.enabled | default(false) | bool
       ansible.builtin.get_url:
         url: "{{ firecracker_kernel_url if (firecracker_kernel_url | length > 0) else firecracker_kernel_default_url }}"
-        dest: "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}"
+        dest: "{{ sandboxd_firecracker_kernel_path }}"
         mode: "0644"
         owner: root
         group: root
@@ -660,7 +679,7 @@
       when: firecracker.enabled | default(false) | bool
       ansible.builtin.get_url:
         url: "{{ firecracker_kernel_config_url if (firecracker_kernel_config_url | length > 0) else (firecracker_kernel_url ~ '.config' if (firecracker_kernel_url | length > 0) else firecracker_kernel_config_default_url) }}"
-        dest: "{{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}.config"
+        dest: "{{ sandboxd_firecracker_kernel_path }}.config"
         mode: "0644"
         owner: root
         group: root
@@ -668,7 +687,7 @@
 
     - name: Verify Firecracker guest kernel enables vmgenid
       when: firecracker.enabled | default(false) | bool
-      ansible.builtin.command: "grep -qx CONFIG_VMGENID=y {{ firecracker.kernel_path | default('/var/lib/sandboxd/firecracker/vmlinux') }}.config"
+      ansible.builtin.command: "grep -qx CONFIG_VMGENID=y {{ sandboxd_firecracker_kernel_path }}.config"
       changed_when: false
 
     # Upstream wrap key (Phase 4 F17). Two delivery modes:
@@ -929,11 +948,26 @@
   handlers:
     - name: Restart sandboxd
       listen: Apply sandboxd ops config
-      when: sandboxd_restart_after_ops_config | bool
+      when:
+        - sandboxd_restart_after_ops_config | bool
+        - sandboxd_privilege_mode != 'split'
       ansible.builtin.systemd:
         name: "{{ sandboxd_service_name }}"
         state: restarted
         daemon_reload: false
+
+    # Split: the root helper reads cluster.env too (aerolvm-rootd.service
+    # loads sandboxd.env and cluster.env), for the WASM, Firecracker and
+    # volume settings among others. One restart of both, so the two never run
+    # with different settings. Restarting the helper stops no sandbox.
+    - name: Restart the root helper and sandboxd
+      listen: Apply sandboxd ops config
+      when:
+        - sandboxd_restart_after_ops_config | bool
+        - sandboxd_privilege_mode == 'split'
+      ansible.builtin.command:
+        argv: [systemctl, restart, aerolvm-rootd, "{{ sandboxd_service_name }}"]
+      changed_when: true
 
     - name: Wait for sandboxd health
       listen: Apply sandboxd ops config

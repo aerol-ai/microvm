@@ -1,0 +1,91 @@
+---
+# Privilege mode checks (config/cluster.yml privilege_mode,
+# plans/security-gaps-m1-m4.md M1 PR 10), imported by configure-ops.yml
+# before it changes anything on a node.
+#
+# Split runs every runtime through the root helper: V8 isolates, Firecracker
+# with its warm VM pool and disk images, WASM with its warm pool and
+# checkpoints, the containerd warm pool and gVisor moves. What is left here
+# are the settings split cannot run with. sandboxd or the helper refuses each
+# at start, or a create fails, so checking first keeps the restart handler
+# from taking a healthy node down. Terraform refuses the same settings at plan
+# time (Terraform/privilege_mode.tf).
+#
+# Reads sandboxd_privilege_mode and sandboxd_firecracker_kernel_path (the
+# play's vars), cluster.yml's values, and sandboxd_unit: `systemctl cat` of
+# sandboxd's unit, read only for split with Firecracker on.
+# integration-tests/safety/ansible_privilege_mode_test.go runs this file with
+# cluster.yml values of its own.
+
+- name: Refuse an unknown privilege_mode
+  ansible.builtin.assert:
+    that:
+      - sandboxd_privilege_mode in ['single', 'split']
+    fail_msg: "privilege_mode in config/cluster.yml must be single or split, got {{ sandboxd_privilege_mode }}."
+
+- name: Refuse a split node without the containerd engine or its netns pool
+  when: sandboxd_privilege_mode == 'split'
+  ansible.builtin.assert:
+    that:
+      - (container_engine | default('containerd')) == 'containerd'
+      - containerd.native_netns_pool_enabled | default(true) | bool
+    fail_msg: >-
+      privilege_mode: split needs container_engine: containerd (Docker's socket
+      is as good as root, and nothing checks what is sent to it) and
+      containerd.native_netns_pool_enabled: true (the root helper makes every
+      sandbox's network namespace for that pool).
+
+- name: Refuse Firecracker settings privilege mode split cannot run
+  when:
+    - sandboxd_privilege_mode == 'split'
+    - firecracker.enabled | default(false) | bool
+  ansible.builtin.assert:
+    that:
+      - firecracker.use_jailer | default(true) | bool
+      - (firecracker.jailer_chroot_base | default('/srv/jailer')) == '/srv/jailer'
+      - not (sandboxd_firecracker_kernel_path.startswith('/var/lib/sandboxd/') or sandboxd_firecracker_kernel_path.startswith('/run/sandboxd/'))
+    fail_msg: >-
+      privilege_mode: split runs every Firecracker VM through the root helper,
+      so firecracker.use_jailer must be true, firecracker.jailer_chroot_base must
+      be /srv/jailer (install.sh --privilege-mode split lets sandboxd write
+      there and in no other jailer folder), and firecracker.kernel_path must not
+      be in /var/lib/sandboxd or /run/sandboxd (the helper refuses a kernel in a
+      folder sandboxd writes). Got use_jailer={{ firecracker.use_jailer | default(true) }},
+      jailer_chroot_base={{ firecracker.jailer_chroot_base | default('/srv/jailer') }},
+      kernel_path={{ sandboxd_firecracker_kernel_path }}.
+
+- name: Refuse runtime folders a split sandboxd cannot write
+  when: sandboxd_privilege_mode == 'split'
+  ansible.builtin.assert:
+    that:
+      - item == '/var/lib/sandboxd' or item.startswith('/var/lib/sandboxd/') or item == '/run/sandboxd' or item.startswith('/run/sandboxd/')
+    fail_msg: >-
+      {{ item }} must be in /var/lib/sandboxd or /run/sandboxd: sandboxd writes
+      it, and in privilege mode split it may write nowhere else. Check
+      firecracker.run_dir, firecracker.templates_dir, wasm.modules_dir and
+      wasm.cache_dir in config/cluster.yml.
+  loop: >-
+    {{ ((firecracker.enabled | default(false) | bool)
+        | ternary([firecracker.run_dir | default('/run/sandboxd/firecracker'),
+                   firecracker.templates_dir | default('/var/lib/sandboxd/firecracker/templates')], []))
+       + ((wasm.enabled | default(false) | bool)
+        | ternary([wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules'),
+                   wasm.cache_dir | default('')] | select | list, [])) }}
+
+# install.sh --privilege-mode split --with-firecracker is what lets sandboxd
+# write the jailer's folder (its unit's ReadWritePaths), makes the
+# sandboxd-jailer user and puts the kernel where only root writes. This play
+# installs Firecracker's files but cannot rewrite the unit, so a split node
+# set up without it is refused rather than left with VMs that cannot start.
+- name: Refuse Firecracker on a split node install.sh did not set up for it
+  when:
+    - sandboxd_privilege_mode == 'split'
+    - firecracker.enabled | default(false) | bool
+  ansible.builtin.assert:
+    that:
+      - sandboxd_unit.stdout | default('') is search('^ReadWritePaths=.*[ =]-?/srv/jailer( |$)', multiline=True)
+    fail_msg: >-
+      {{ inventory_hostname }} runs in privilege mode split, but install.sh did not
+      set it up for Firecracker: its sandboxd unit cannot write /srv/jailer. Run
+      install.sh --privilege-mode split --with-firecracker on the node, then run
+      this play again.
