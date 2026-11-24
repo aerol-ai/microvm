@@ -35,6 +35,10 @@ type Options struct {
 	ID func(*http.Request) string
 	// WriteError renders an error in the facade's envelope. Required.
 	WriteError ErrorWriter
+	// Destroy marks the route that deletes the sandbox. A sandbox left on a
+	// node an operator deleted has no owner to take the delete; a server
+	// deletes its placement instead (abandoned.go).
+	Destroy bool
 }
 
 // Wrap routes a per-sandbox request to the node that owns the sandbox,
@@ -215,6 +219,9 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		case errors.Is(err, cluster.ErrOrphaned):
 			// The owner died and was evicted; the placement points nowhere.
 			cache.Forget(id)
+			if opts.Destroy && destroyAbandoned(c, localID, w, r, serveLocal) {
+				return
+			}
 			write(w, http.StatusGone, "sandbox owner died; placement orphaned (manual recovery required)")
 			return
 		case err != nil:
@@ -226,6 +233,17 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 		if owner.IsSelf {
 			cache.Forget(id)
 			serveLocal(localID)
+			return
+		}
+		if cluster.NodeDeleted(c, owner.NodeID) {
+			// The placement still names a node an operator deleted: the
+			// leader is handing its sandboxes off. Nothing there can serve
+			// the call, so it is never forwarded (abandoned.go).
+			cache.Forget(id)
+			if opts.Destroy && destroyAbandoned(c, localID, w, r, serveLocal) {
+				return
+			}
+			writeOwnerDeleted(w, write)
 			return
 		}
 		if owner.APIURL == "" && owner.InternalURL == "" {
