@@ -14,8 +14,9 @@ It has two parts:
   machines (m7i.large), three worker machines (m7i.xlarge, Amazon Linux
   2023), cluster mode, two zones. The workers start in `single` and are
   switched to `split` one at a time.
-- **Part B** (`vm-n1.sh`): one EC2 machine (m7i.xlarge, Ubuntu 24.04). It
-  times WASM and V8 creates in `single` and in `split` on the same machine.
+- **Part B** (`vm-n1.sh`): one EC2 machine (m7i.xlarge, Ubuntu 24.04), in
+  a security group of its own that lets nothing in. It times WASM and V8
+  creates in `single` and in `split` on the same machine.
   The chart does not run WASM or V8 in a split worker pod yet, so EKS
   cannot answer this.
 
@@ -30,38 +31,45 @@ Every check writes one line, `PASS`, `FAIL`, `SKIP` or `INFO`, to
 |---|---|---|
 | `kernel` | every worker machine runs Linux 6.12 or later | PASS (6.18) |
 | `verify-single`, `verify-mixed1`, `verify-mixed2`, `verify-all-split`, `verify-final` | `aerolvm k8s verify` passes with all single, a mixed pool, all split, and at the end | PASS |
-| `switch1`, `switch2`, `switch3` | each worker machine is switched: the old worker is decommissioned, a new one comes back in split | PASS (switch2 and switch3 needed the B1 workaround below) |
+| `switch1`, `switch2`, `switch3` | each worker machine is switched: the old worker is decommissioned, a new one comes back in split | PASS (switch2 and switch3 needed the B1 workaround below; B1 is now fixed) |
 | `s1-recreate`, `s2-recreate`, `s3-recreate` | a runc sandbox with `failover: recreate` moves off the old worker and answers | s2 and s3 PASS; s1 failed on a test bug, which is fixed |
 | `shape-*` (7 checks) | the split agent: uid 65531, no capabilities, not privileged, no containerd, reaches the helper, no two-way mount, runs the signed helper | PASS |
 | `image-user-6.12` | three images run as the same user in split as in single | PASS |
-| `n1` | create time, split against single: the median difference is inside the budget (+3 ms cold, +1 ms warm) | PASS (numbers below) |
+| `n1` | create time, split against single: the p50 gap and the paired median difference are both inside the budget (+3 ms cold, +1 ms warm) | Cold inside. Warm over the p50 budget (numbers below). The run graded PASS on the paired median alone; the check now tests the p50 gap too |
 | `moves-split-split` | a gVisor sandbox moves from one split worker to another and keeps its memory | PASS |
 | `switch1-gvisor-move`, `single-single-gvisor-move` | the same, between two single workers | not proven: test bugs (a placement label that never matches; a test sandbox from the warm pool, which moves by recreate only). Both are fixed |
-| `cross-mode-refusal` | a gVisor move from single to split is refused before anything is saved, and the sandbox keeps running | PASS |
+| `cross-mode-refusal` | a gVisor move from single to split is refused before anything is saved, and the sandbox keeps running | PASS. The move call that showed the refusal was made by hand: the run's own call hit a test bug (H1), which is fixed |
 | `s2`, `s2-helper-swap` | a version rollout swaps every agent in place, every sandbox keeps running, and the newer signed helper takes over | PASS |
 | `ov-e2-reach`, `ov-e2-swap`, `ov-e2-helper-restart` | an rclone mount reaches the sandbox and keeps writing across the rollout and a helper restart | PASS |
 | `helper-restart` | a killed helper is started again; its cgroup holds only the new helper and has `cgroup.kill` | PASS |
-| `helper-otherkey`, `helper-older`, `helper-unsigned` | a helper signed by another key, an older one and an unsigned one are refused; the running helper stays | PASS. The run graded `helper-unsigned` FAIL because it read the wrong log; read by hand, it passed. The test is fixed |
+| `helper-otherkey`, `helper-older`, `helper-unsigned` | a helper signed by another key, an older one and an unsigned one are refused; the running helper stays | Other key and older: PASS. Unsigned: the agent's start refused the image before the supervisor saw it, and the running helper stayed. So the supervisor's own unsigned check did not run live (unit tests cover it). The run graded it FAIL because it read the supervisor's log; the test now reads the agent's |
 | `f10` | memory pressure stops whole sandboxes only, never the worker's own processes | PASS, done by hand. The run's own fill was too small (64 MB); the test is fixed |
 | `f8` | deleting a split worker pod with sandboxes running leaves nothing on the machine | PASS |
 
 N1 in m1d-2 (time the worker reports for each create, 95% range from a
 bootstrap):
 
-- Cold: split p50 143.3 ms, single 152.0 ms. Median difference -0.15 ms
-  (95% range -36.00 to +20.70). Budget +3 ms.
-- Warm: split p50 18.0 ms, single 16.7 ms. Median difference +0.80 ms
-  (95% range +0.40 to +1.60). Budget +1 ms. The median is inside the
-  budget; the top of the range is above it.
+The budget (plan §3.7) is on the p50: +3 ms cold, +1 ms warm.
 
-Part B, first run (m1d-1-vm): WASM warm +0.05 ms, WASM busy mix +0.15 ms,
-V8 warm -0.10 ms. Budget +1 ms. All three meet it.
+- Cold: split p50 143.3 ms, single 152.0 ms. The p50 gap is -8.7 ms,
+  inside the budget. The paired median difference is -0.15 ms (95% range
+  -36.00 to +20.70).
+- Warm: split p50 18.0 ms, single 16.7 ms. The p50 gap is 18.0 - 16.7 =
+  +1.3 ms, **over** the +1 ms budget. The paired median difference is
+  +0.80 ms (95% range +0.40 to +1.60). 50 of the 120 warm rounds were pool
+  misses and were left out. A change that makes the split warm claim faster
+  has since merged (#1437); a new run will show how much of the gap it
+  closes.
+
+Part B, first run (m1d-1-vm), budget +1 ms: the paired median differences
+are WASM warm +0.05 ms, WASM busy mix +0.15 ms and V8 warm -0.10 ms, and
+the p50 gaps +0.15, -0.50 and -0.10 ms. All three meet it.
 
 ## What it costs
 
 | Part | Usual cost | Seen |
 |---|---|---|
-| A, the EKS cluster (about 3 h) | about $2 to $3.50 | $2.11 in m1d-2 (2.20 cluster hours at $0.959 an hour) |
+| A, the EKS cluster (about 3 h) | about $2 to $3.50 | $2.11 in m1d-2 by the running meter (2.20 cluster hours at $0.959 an hour); $2.61 with the kit's fixed allowance for ECR, S3 and logs |
 | B, the VM (under 1.5 h) | well under $1 | about $0.07 in m1d-1-vm (0.35 h). That whole first day, with a cluster stopped early, cost $0.77 |
 
 The cost guards:
@@ -70,7 +78,16 @@ The cost guards:
   refuses when the worst case passes `M1_CEILING` ($8). After every step
   the run writes what it spent so far, and what the rest will cost, to
   `.state/<name>/cost.log`. When that passes `M1_COST_LIMIT` ($6.15), the
-  run stops and tears itself down.
+  run stops and tears itself down. `vm-n1.sh` does the same for the VM
+  before it makes anything: its worst case (it runs until it powers itself
+  off) must stay under `M1_VM_CEILING` ($2), and a machine type with no
+  price in `cost.py` is refused unless `M1_PRICE_VM` gives one.
+- **A teardown on any stop.** A run started with `all` tears itself down
+  whatever stops it: a step that fails, the spend limit, Ctrl-C or a kill.
+  The teardown runs in a process group of its own, so a second Ctrl-C does
+  not stop it half way. It tears down only a cluster this run made (or
+  passed the account check for): a refused estimate never takes down an
+  older cluster that used the same name.
 - **Teardown by name.** `down` removes the chart and its volumes, then runs
   `cluster.sh down <name>`, which works from the run's own Terraform state.
 - **A timer in AWS.** `cluster.sh up --teardown` has AWS end the machines at
@@ -83,13 +100,14 @@ The cost guards:
 - **One account, one cluster.** Every step after `up` talks only to the
   kubeconfig `cluster.sh` wrote for this run, only if it names this EKS
   cluster, and only with this account's credentials. A refused step changes
-  nothing and never tears anything down.
+  nothing. A check that fails part way lifts the cordons it placed.
 
 ## How to run it
 
 You need: AWS credentials for the test account, the artifact bucket
 (`make itest-artifacts-init`), `aws`, `kubectl`, Helm 3.8 or newer (`HELM=`),
-`terraform`, `jq`, `go`, `git` and `python3`. Run it from a checkout of the
+`terraform`, `jq`, `go`, `git`, `python3` and bash 4 or newer for
+`m1-eks.sh` (macOS: `brew install bash`). Run it from a checkout of the
 commit under test. The images, the chart and `aerolvm k8s verify` are built
 from that commit (`AEROL_BUILD_REF`, default `HEAD`), not from your working
 tree. Use a new name for every run.
@@ -125,12 +143,15 @@ order and what each step does are at the top of `m1-eks.sh`.
 ## How to stop it and tear it down
 
 - **Stop:** press Ctrl-C. A run started with `all` then tears itself down
-  (`M1_KEEP=1` keeps it up). A run of single steps does not; run `down`.
+  (`M1_KEEP=1` keeps it up); let that finish. A run of single steps does
+  not tear down (unless `M1_TEARDOWN_ON_EXIT=1`); run `down`.
 - **Tear down by name:** `./m1-eks.sh m1d-3 down`. If that fails, run
   `../cluster.sh down m1d-3` again. After the TTL, `../reap.sh` finds what
   is left by its tags (`DRY_RUN=1 ../reap.sh` first).
-- **The VM:** Ctrl-C on `vm-n1.sh` ends it. If that machine is gone too, the
-  VM powers itself off, and `make integration-reap` ends it after 3 hours.
+- **The VM:** Ctrl-C on `vm-n1.sh` ends it and then deletes its security
+  group. If that machine is gone too, the VM powers itself off, and
+  `make integration-reap` ends it after 3 hours; the leak check then lists
+  the group.
 - **Leak check:** `./leak-check.sh m1d-3 m1d-3-vm`. It must end with
   "nothing of m1d-3 or m1d-3-vm is left". The source copies in the artifact
   bucket are kept on purpose and not counted.
@@ -140,17 +161,19 @@ holds the Terraform state `down` needs.
 
 ## Known problems
 
-Two product bugs the second run found. Fixes are in progress.
+Two product bugs the second run found, both now fixed on `main`. A run of
+an older commit still meets them.
 
-- **B1: a switch can stall past its deadline.** When a worker holds a
-  sandbox that counts as movable but can never move (a gVisor sandbox from
-  the warm pool, or one in single when only split workers are left), its
-  decommission does not end at the deadline. `switch3` hits this on
-  purpose. Workaround: delete the stuck test sandbox from that step.
-- **B2: a sandbox on a removed worker cannot be deleted.** After the
-  workaround above, the operator may remove the node while the sandbox is
-  still being deleted. Later deletes of that sandbox fail. It goes away
-  with the cluster.
+- **B1: a switch could stall past its deadline** (fixed by #1435). When a
+  worker held a sandbox that counted as movable but could never move (a
+  gVisor sandbox from the warm pool, or one in single when only split
+  workers were left), its decommission did not end at the deadline.
+  `switch3` meets this on purpose. On an older commit: delete the stuck
+  test sandbox from that step.
+- **B2: a sandbox on a removed worker could not be deleted** (fixed by
+  #1436). After the workaround above, the operator could remove the node
+  while the sandbox was still being deleted, and later deletes of it
+  failed. It went away with the cluster.
 
 ## Not in this drill
 
@@ -170,7 +193,7 @@ Two product bugs the second run found. Fixes are in progress.
 | `values.yaml` | the chart values (cluster mode, 2 zones, gVisor moves on, containerd warm pool) |
 | `build-job.yaml` | the in-cluster image build, with throwaway signing keys and the refused helper variants |
 | `n1-bench.sh` | N1 inside the cluster: paired creates, timed from `Server-Timing` |
-| `n1-stats.py` | the N1 verdict: p50, p90, p99, the median difference and its 95% range |
+| `n1-stats.py` | the N1 verdict: p50, p90, p99, the p50 gap, and the paired median difference with its 95% range |
 | `vm-n1.sh`, `vm-userdata.sh`, `vm-bench.py` | Part B on the VM |
 | `leak-check.sh` | lists what is left in AWS; read only |
 | `cost.py` | the cost table and the running cost check |
