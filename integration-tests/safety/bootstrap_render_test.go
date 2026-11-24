@@ -84,6 +84,9 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		"joiner_api_lb", "joiner_api_lb_worker", "joiner_routing_on", "joiner_routing_off", "joiner_containerd_pool", "seed_join", "joiner_join", "joiner_blank", "joiner_join_worker",
 		"joiner_download_mirror", "joiner_join_download_mirror", "joiner_join_buildkit_rootless",
 		"joiner_join_privilege_split", "joiner_privilege_split_oldpath",
+		"joiner_join_privilege_split_firecracker", "joiner_join_privilege_split_isolate",
+		"joiner_join_privilege_split_wasm", "joiner_join_privilege_split_pool", "joiner_join_firecracker",
+		"joiner_join_privilege_split_everything", "joiner_join_everything_single",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)
@@ -202,7 +205,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 			}
 			// Only privilege_mode: split asks for split, and only on the
 			// one-line join path.
-			if branch != "joiner_join_privilege_split" && strings.Contains(out, "--privilege-mode") {
+			if !strings.HasPrefix(branch, "joiner_join_privilege_split") && strings.Contains(out, "--privilege-mode") {
 				t.Errorf("rendered %s bootstrap passes --privilege-mode", branch)
 			}
 			// A one-line worker or ingress joiner never carries the PAT.

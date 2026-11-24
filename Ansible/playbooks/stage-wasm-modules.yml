@@ -15,6 +15,15 @@
 - name: Stage WASM standard modules
   hosts: all
   become: true
+  # In privilege mode split the modules folder is inside /var/lib/sandboxd,
+  # which sandboxd's user owns, and sandboxd writes in it (each WASM
+  # sandbox's checkpoints). Root must not act there: that user can swap any
+  # name for a link, and root would follow it. So in split every task here
+  # runs as sandboxd's user, and the files are its own without a chown. A
+  # link there then leads only where that user could write anyway. Becoming
+  # a user with no rights needs pipelining (ansible.cfg sets it) or ACLs on
+  # the node; without either the play stops before it writes anything.
+  become_user: "{{ 'sandboxd' if (privilege_mode | default('single')) == 'split' else 'root' }}"
   serial: 1
   any_errors_fatal: true
   gather_facts: false
@@ -27,8 +36,6 @@
       ansible.builtin.file:
         path: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}"
         state: directory
-        owner: root
-        group: root
         mode: "0755"
       when: wasm.enabled | default(false) | bool
 
@@ -37,8 +44,6 @@
         url: "{{ item.ref }}"
         dest: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm"
         checksum: "{{ item.digest }}"
-        owner: root
-        group: root
         mode: "0644"
       loop: "{{ wasm.standard_modules | default([]) | selectattr('source', 'equalto', 'url') | list }}"
       loop_control:

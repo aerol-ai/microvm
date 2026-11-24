@@ -484,6 +484,13 @@ variable "firecracker" {
     and kernel_path.config must point at that image's kernel config by the time
     sandboxd restarts or health will degrade because vmgenid support cannot be
     proven.
+
+    With privilege_mode: split in config/cluster.yml, the default kernel_path
+    becomes /usr/local/lib/aerolvm-firecracker/vmlinux (a folder only root
+    writes), and when jailer_uid and jailer_gid are unset split runs the VMs
+    as a user of their own, sandboxd-jailer, which install.sh makes. Unset in
+    single is uid and gid 1000, as before. See Terraform/README.md,
+    "Privilege mode split".
   EOT
   type = object({
     binary_url                   = optional(string, "")
@@ -501,8 +508,8 @@ variable "firecracker" {
     templates_dir                = optional(string, "/var/lib/sandboxd/firecracker/templates")
     use_jailer                   = optional(bool, true)
     jailer_chroot_base           = optional(string, "/srv/jailer")
-    jailer_uid                   = optional(number, 1000)
-    jailer_gid                   = optional(number, 1000)
+    jailer_uid                   = optional(number)
+    jailer_gid                   = optional(number)
     tap_base_cidr                = optional(string, "172.16.0.0/20")
     tap_pool_size                = optional(number, 256)
     skopeo_bin                   = optional(string, "/usr/bin/skopeo")

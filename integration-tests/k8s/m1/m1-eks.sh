@@ -138,14 +138,14 @@ switch_machine() {
   old="$(worker_on "$m")"
   t0=$(now)
   say "$label: cordon $m (worker $old)"
-  k cordon "$m" >/dev/null
+  node_cordon "$m"
   # An optional check that must run while the old worker decommissions.
   [[ -n "$hook" ]] && "$hook" "$old" >&2
   if ! wait_until 1500 "$old decommissioned and its pod gone" pod_gone "$old"; then
-    diag "$label"; k uncordon "$m" >/dev/null || true; return 1
+    diag "$label"; node_uncordon "$m" || true; return 1
   fi
   say "$label: $old gone after $(( $(now) - t0 ))s; uncordon $m"
-  k uncordon "$m" >/dev/null
+  node_uncordon "$m"
   if ! wait_until 900 "a new worker on $m Serving" new_on "$m" "$old"; then diag "$label"; return 1; fi
   new="$(worker_on "$m")"
   say "$label: $new serving on $m in $(mode_of "$new") mode, $(( $(now) - t0 ))s after the cordon"
@@ -843,18 +843,24 @@ check_pid=""
 # anything whose status a || or && tests, that subshell included, so a
 # check went on past a failed command and could still grade PASS. In the
 # background with a wait, so a signal to this shell is handled at once,
-# not when the check's current command ends.
+# not when the check's current command ends. A job of its own (set -m): the
+# check and everything it starts, background children too (f10's fills),
+# share one process group, which stop_check ends at once. Its stdin is
+# /dev/null: a job outside the terminal's group that read it would stop.
 run_check() {
   local s="$1" rc=0
   set +e
+  set -m
   (
+    set +m
     set -e
     trap check_exit EXIT
     trap 'exit 143' TERM
     trap 'exit 130' INT
     "step_$s"
-  ) &
+  ) < /dev/null &
   check_pid=$!
+  set +m
   wait "$check_pid"
   rc=$?
   check_pid=""
@@ -864,9 +870,10 @@ run_check() {
   elif [[ "$rc" != 0 ]]; then result FAIL "$s" "the step exited $rc"; diag "$s"; fi
   return 0
 }
-# check_exit: a check's EXIT trap. It lifts the AerolVM cordons the check
-# placed and did not lift (m1-lib.sh api_cordon), so a check that failed
-# or was stopped part way leaves no worker closed to new sandboxes. Not
+# check_exit: a check's EXIT trap. It lifts the cordons the check placed
+# and did not lift: AerolVM's (m1-lib.sh api_cordon) and a machine's
+# Kubernetes cordon (node_cordon, a switch), so a check that failed or was
+# stopped part way leaves no worker or machine closed. Not
 # when on_exit tears the run down next ($sd/.teardown-next): they go with
 # the cluster.
 check_exit() {
@@ -880,18 +887,27 @@ kill_tree() {
   for kid in $(pgrep -P "$1" 2>/dev/null || true); do kill_tree "$kid"; done
   kill -TERM "$1" 2>/dev/null || true
 }
-# stop_check: on_exit's first act while a check runs: TERM to the check;
-# if a foreground child still holds it after 5 s (bash runs a trap only
-# when that child ends), TERM to the whole tree.
+# stop_check: on_exit's first act while a check runs: TERM to the check's
+# whole process group at once, so no child of it (a background fill, a
+# curl) outlives it; the check's own TERM trap then runs its exit handler.
+# Then CONT to the group: a check in a background group that touched the
+# terminal (an `aws eks get-token` MFA prompt when its cached credentials
+# expire) is stopped by SIGTTIN or SIGTTOU, a stopped process keeps TERM
+# pending, and the wait below then never ended, so the teardown never ran
+# (review of #1439). If the check still runs after 5 s, TERM to its tree;
+# then once more to whatever of the group is left.
 stop_check() {
   [[ -n "$check_pid" ]] || return 0
+  local _
   if kill -0 "$check_pid" 2>/dev/null; then
-    kill -TERM "$check_pid" 2>/dev/null || true
-    local _
+    kill -TERM -- "-$check_pid" 2>/dev/null || kill -TERM "$check_pid" 2>/dev/null || true
+    kill -CONT -- "-$check_pid" 2>/dev/null || kill -CONT "$check_pid" 2>/dev/null || true
     for _ in $(seq 1 50); do kill -0 "$check_pid" 2>/dev/null || break; sleep 0.1; done
-    if kill -0 "$check_pid" 2>/dev/null; then kill_tree "$check_pid"; fi
+    if kill -0 "$check_pid" 2>/dev/null; then kill_tree "$check_pid"; kill -CONT -- "-$check_pid" 2>/dev/null || true; fi
     wait "$check_pid" 2>/dev/null || true
   fi
+  kill -TERM -- "-$check_pid" 2>/dev/null || true
+  kill -CONT -- "-$check_pid" 2>/dev/null || true
   check_pid=""
 }
 
@@ -905,7 +921,8 @@ run_all=0
 torn=0
 stop_teardown=0
 # on_exit: whatever ends the script (a failed command in a step, a step
-# that returns non-zero, the cost limit, Ctrl-C or TERM) tears the run down
+# that returns non-zero, the cost limit, Ctrl-C, TERM, or a closed
+# terminal) tears the run down
 # for `all` (and after stop_run, or with M1_TEARDOWN_ON_EXIT=1), unless
 # M1_KEEP=1. Only a cluster this process made (made_here, set just before
 # cluster.sh up) or passed the gate for: never after a refused estimate,
@@ -917,10 +934,13 @@ on_exit() {
   # From here no INT or TERM stops this script: a second Ctrl-C used to end
   # the run before down. The teardown runs as a job of its own (set -m), in
   # its own process group, so a Ctrl-C at the terminal reaches no part of
-  # it, Terraform included (eks-bank.sh's on_exit). Its stdin is /dev/null:
-  # a job outside the terminal's group that read the terminal would stop.
+  # it, Terraform included (eks-bank.sh's on_exit).
   trap - EXIT
-  trap '' INT TERM
+  trap '' INT TERM HUP
+  # A closed terminal (HUP, exit 129) takes no more writes, and a failed
+  # write must not end this handler (errexit): nothing more goes to it.
+  # The teardown's output still reaches $sd/teardown.log (below).
+  if [[ "$rc" == 129 ]]; then exec > /dev/null 2>&1 < /dev/null || true; fi
   if [[ "$rc" != 0 && ( "$run_all" == 1 || "$stop_teardown" == 1 || "${M1_TEARDOWN_ON_EXIT:-0}" == 1 ) &&
         "${M1_KEEP:-0}" != 1 && "$torn" == 0 && "$dry" != 1 && -f "$sd/terraform.tfstate" ]] &&
      [[ "$made_here" == 1 || ( "$refused" == 0 && "$gated" == 1 ) ]]; then
@@ -930,12 +950,23 @@ on_exit() {
   stop_check
   gw_keeper_stop
   if [[ "$teardown" == 1 ]]; then
-    say "the run stopped (exit $rc): tearing $name down (M1_KEEP=1 keeps it)"
+    say "the run stopped (exit $rc): tearing $name down (M1_KEEP=1 keeps it)" || true
+    # Credentials first, here in the foreground, where an MFA prompt can
+    # be answered (not after a hangup: no terminal is left).
+    [[ "$rc" == 129 ]] || refresh_credentials || true
+    # The teardown's group is in the background: a process of it that read
+    # the terminal (a prompt that still comes) was stopped by SIGTTIN, and
+    # the run then waited for it forever with the cluster up until AWS's
+    # timer (review of #1439). With TTIN and TTOU ignored, inherited by
+    # every process the teardown starts, such a read fails at once and a
+    # write still goes through. Its stdin is /dev/null; its output goes to
+    # the terminal and to $sd/teardown.log.
+    trap '' TTIN TTOU
     set -m
-    { diag exit || true; step_down || exit 1; } < /dev/null &
+    { diag exit || true; step_down || exit 1; } < /dev/null > >(tee -a "$sd/teardown.log") 2>&1 &
     down_pid=$!
     set +m
-    wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL"
+    wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true
   fi
   rm -f "$sd/.teardown-next"
   exit "$rc"
@@ -943,6 +974,9 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# A closed terminal: without this, bash ended on SIGHUP and ran on_exit
+# with status 0, so an `all` run did not tear down.
+trap 'exit 129' HUP
 for s in "${steps[@]}"; do
   case "$s" in
     estimate|up|setup|build|install) "step_$s" ;;

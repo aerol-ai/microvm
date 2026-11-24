@@ -618,6 +618,40 @@ Each is small and stands alone. Together they shrink the root surface now.
     - **Two sockets needed more than the group:** the egress gateway's
       control socket (its peer uid, `SB_EGRESS_PEER_UIDS`) and rootless
       BuildKit's (an ACL for the agent, never the build user's group).
+    **What building it taught us (VM split runtimes, 2026-11-24).**
+    - **Terraform and Ansible now take split with every runtime.** Their
+      refusals of Firecracker, V8 isolates, WASM and the containerd warm
+      pool went once sandboxd and install.sh ran them (#1423 to #1432).
+      What is left is one list, the same in both: the containerd engine and
+      its netns pool, the jailer, `/srv/jailer` as the chroot base, clean
+      paths, the kernel and every binary root runs outside sandboxd's
+      folders, and runtime folders inside them. Terraform names each
+      problem in one plan error (`Terraform/privilege_mode.tf`); Ansible
+      checks in `tasks/privilege-mode-checks.yml`.
+    - **Root never acts on a path inside the agent's folders.** The agent
+      can swap any name there for a link, and root's tools follow links,
+      in the last part of a path and in every folder above it (Ansible's
+      `follow: false` covers only the last). The first cut of this work
+      had root make Firecracker's run and templates folders, stage the
+      WASM modules, and write the shared SSH host key in them, and Ansible
+      already made the secrets folder the agent's before writing keys
+      into it. In split now: sandboxd makes its own folders (its
+      `MkdirAll`s, and `aerolvm-rootd agent-folders` hands over what root
+      left, following no link); the WASM modules are staged as the agent;
+      the secrets folder stays root's (`root:sandboxd 0750`) with the
+      agent's owner-only files inside, and the shared SSH host key goes
+      there. Tests walk every split-mode Ansible task and the split
+      bootstrap render for a root action on an agent path.
+    - **The helper reads `cluster.env`, so it must restart with sandboxd.**
+      The bootstrap and Ansible add settings there after the helper started
+      (WASM, Firecracker, platform volumes); restarting sandboxd alone left
+      the helper serving the old ones. Both now restart the two together.
+    - **Split Firecracker on Terraform goes through install.sh too**
+      (`--with-firecracker`): only install.sh can let the split unit write
+      `/srv/jailer`. The split kernel default moves to root's folder, and
+      with no jailer ids set split runs the VMs as a user of their own,
+      `sandboxd-jailer`. Single renders byte for byte as before, now
+      pinned for every single render.
 10c. Split mode's last containerd gaps (PR 13): the containerd warm pool
     and gVisor checkpoint moves.
     **What building it taught us (PR 13, 2026-11-23).**
@@ -895,11 +929,16 @@ Each is small and stands alone. Together they shrink the root surface now.
         the operator then found nothing to move and removed the node.
         Every delete after that failed, because the sandbox's placement
         still named the removed node.
-      **The split warm claim** is the open item: #1437 now runs the
-      relabel and the egress lift at the same time. In the local box,
-      split alone got about 0.3 ms faster; the two box runs disagree on
-      how far that closes the gap to single, so a live N1 rerun would
-      settle it.
+      **The split warm claim** is the open item: #1437 now runs the relabel
+      and the egress lift at the same time. Two box runs measured it.
+      #1437's own run, in its PR body: the pool stage's gap, split minus
+      single, went from +1.05 ms to +0.40 ms (95% +0.25 to +0.80). An
+      independent review run on another local box (30 paired rounds): split
+      alone was 0.30 ms faster than main (95% -0.40 to -0.05), and the gap,
+      split minus single, stayed at +0.55 ms on both main and #1437. A live
+      N1 rerun on EKS would settle it. #1438 has merged too: it fixes the
+      teardown of a failed warm claim, and the case where that teardown and
+      a bookkeeping write both fail.
       Not proven: a gVisor move between two single workers (its test
       sandbox came from the warm pool). The drill's own scripts had five
       bugs (H1-H5), so F10 and the cross-mode move call were done by hand

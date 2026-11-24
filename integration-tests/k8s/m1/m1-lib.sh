@@ -68,6 +68,21 @@ tfout() {
 refused=0
 gated=0
 refuse() { echo "m1-eks.sh: refusing to run: $*" >&2; refused=1; exit 2; }
+# refresh_credentials: one STS call in the foreground, at most
+# CRED_REFRESH_SECONDS (120) long, just before the teardown starts in a
+# process group of its own. With an MFA assume-role profile whose cached
+# credentials have expired, the AWS CLI prompts on the terminal: here the
+# user can answer, and the teardown's own calls (aws eks get-token under
+# kubectl and Helm, cluster.sh down) then find fresh credentials in the
+# CLI's cache. Best effort: the teardown runs either way. perl's alarm is
+# the time limit because a limit that runs the command in a group of its
+# own (GNU timeout) would take the terminal from it.
+refresh_credentials() {
+  [[ "$dry" == 1 ]] && return 0
+  perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "${CRED_REFRESH_SECONDS:-120}" \
+    aws sts get-caller-identity --query Account --output text >/dev/null ||
+    say "could not refresh the AWS credentials; the teardown tries anyway"
+}
 # caller_account: this machine's AWS account, or "" when STS does not
 # answer. Asked up to three times: one STS blip right after up must not
 # read as other credentials.
@@ -291,18 +306,37 @@ helper() {
 # never target it). The operator never lifts it, so each cordon a check
 # places is written down ($sd/check-cordons) until it lifts it, and the
 # check's exit handler (m1-eks.sh check_exit) lifts what is left: a check
-# that fails or is stopped part way leaves no worker closed.
-api_cordon() { api POST "/v1/cluster/nodes/$1/cordon" >/dev/null; echo "$1" >> "$sd/check-cordons"; }
+# that fails or is stopped part way leaves no worker closed. Written down
+# before the call, so a check stopped during it still lifts it.
+api_cordon() { echo "$1" >> "$sd/check-cordons"; api POST "/v1/cluster/nodes/$1/cordon" >/dev/null; }
 api_uncordon() {
   api POST "/v1/cluster/nodes/$1/uncordon" >/dev/null
-  [[ -f "$sd/check-cordons" ]] || return 0
-  grep -vxF -- "$1" "$sd/check-cordons" > "$sd/check-cordons.new" || true
-  mv "$sd/check-cordons.new" "$sd/check-cordons"
+  forget "$sd/check-cordons" "$1"
+}
+# node_cordon / node_uncordon <machine>: a machine's Kubernetes cordon (a
+# switch's: the operator then decommissions its worker), written down the
+# same way ($sd/check-node-cordons). In a run that is not `all`, a switch
+# stopped while it waited used to leave the machine cordoned.
+node_cordon() { echo "$1" >> "$sd/check-node-cordons"; k cordon "$1" >/dev/null; }
+node_uncordon() {
+  k uncordon "$1" >/dev/null
+  forget "$sd/check-node-cordons" "$1"
+}
+# forget <file> <line>: that line out of the file.
+forget() {
+  [[ -f "$1" ]] || return 0
+  grep -vxF -- "$2" "$1" > "$1.new" || true
+  mv "$1.new" "$1"
 }
 lift_cordons() {
   local n
-  [[ -s "$sd/check-cordons" ]] || return 0
-  for n in $(sort -u "$sd/check-cordons"); do api_uncordon "$n"; done
+  if [[ -s "$sd/check-cordons" ]]; then
+    for n in $(sort -u "$sd/check-cordons"); do api_uncordon "$n"; done
+  fi
+  if [[ -s "$sd/check-node-cordons" ]]; then
+    for n in $(sort -u "$sd/check-node-cordons"); do node_uncordon "$n" || true; done
+  fi
+  return 0
 }
 
 # node_sh <machine> <shell>: runs the shell as root on the machine (a node
