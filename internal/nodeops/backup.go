@@ -171,7 +171,11 @@ func Backup(ctx context.Context, o BackupOptions) (res BackupResult, err error) 
 	if exists(o.StateDB) {
 		dbCopy := filepath.Join(work, "state.db")
 		t0 := o.now()
-		if err := nodeupgrade.VacuumInto(ctx, o.StateDB, dbCopy); err != nil {
+		vacuum := nodeupgrade.VacuumInto
+		if node.Split {
+			vacuum = nodeupgrade.VacuumIntoNoFollow
+		}
+		if err := vacuum(ctx, o.StateDB, dbCopy); err != nil {
 			return res, fmt.Errorf("copy %s: %w", o.StateDB, err)
 		}
 		res.DBTook = o.now().Sub(t0)
@@ -182,15 +186,15 @@ func Backup(ctx context.Context, o BackupOptions) (res BackupResult, err error) 
 	} else {
 		m.add("missing", o.StateDB)
 	}
-	srcs = m.tree(srcs, archiveRaft, o.RaftDir)
+	srcs = m.tree(srcs, archiveRaft, o.RaftDir, !node.Split)
 	if walDir != "" {
 		if n := len(srcs); n > 0 && srcs[n-1].name == archiveRaft {
 			srcs[n-1].skip = raftlogdir.LocationFile
 		}
 		m.add("raft_wal_dir", walDir)
-		srcs = m.tree(srcs, archiveRaft+"/"+raftlogdir.DefaultName, walDir)
+		srcs = m.tree(srcs, archiveRaft+"/"+raftlogdir.DefaultName, walDir, !node.Split)
 	}
-	srcs = m.tree(srcs, archiveConfig, o.ConfigDir)
+	srcs = m.tree(srcs, archiveConfig, o.ConfigDir, true)
 	if exists(o.RaftDir) && !o.Stop && o.Host.UnitActive(ctx, sandboxdUnit) {
 		fmt.Fprintf(o.Out, "note: %s is copied while sandboxd runs; pass --stop for a copy at rest\n", o.RaftDir)
 	}
@@ -222,6 +226,9 @@ func Backup(ctx context.Context, o BackupOptions) (res BackupResult, err error) 
 	}
 
 	w := &archiveWriter{now: start, dirs: map[string]bool{}, stripEnvKey: wrapped}
+	if node.Split {
+		w.agentData = filepath.Dir(o.StateDB)
+	}
 	n, err := w.write(out, m.bytes(), srcs)
 	if err != nil {
 		return res, err
@@ -255,7 +262,7 @@ type manifest struct{ buf bytes.Buffer }
 func (m *manifest) add(k, v string) { fmt.Fprintf(&m.buf, "%s=%s\n", k, v) }
 func (m *manifest) bytes() []byte   { return m.buf.Bytes() }
 
-func (m *manifest) tree(srcs []source, name, path string) []source {
+func (m *manifest) tree(srcs []source, name, path string, follow bool) []source {
 	if !exists(path) {
 		m.add("missing", path)
 		return srcs
@@ -263,7 +270,9 @@ func (m *manifest) tree(srcs []source, name, path string) []source {
 	m.add("included", path)
 	// A tree reached through a symlink (/etc/sandboxd on another disk) is
 	// backed up as what it points to; the link alone would restore empty.
-	if real, err := filepath.EvalSymlinks(path); err == nil {
+	// In privilege mode split only the config folder, root's, is followed:
+	// sandboxd's user owns the others' folder and may have left the link.
+	if real, err := filepath.EvalSymlinks(path); err == nil && follow {
 		path = real
 	}
 	return append(srcs, source{name: name, path: path, tree: true})
@@ -288,6 +297,9 @@ type archiveWriter struct {
 	now         time.Time
 	dirs        map[string]bool
 	stripEnvKey bool
+	// agentData, set in privilege mode split, is sandboxd's data folder:
+	// every source is then read through an os.Root (splitSource).
+	agentData string
 }
 
 func (w *archiveWriter) write(out string, manifest []byte, srcs []source) (int64, error) {
@@ -345,8 +357,14 @@ func (w *archiveWriter) entries(manifest []byte, srcs []source) error {
 		if err := w.parents(s.name); err != nil {
 			return err
 		}
+		if w.agentData != "" {
+			if err := w.splitSource(s); err != nil {
+				return err
+			}
+			continue
+		}
 		if !s.tree {
-			if err := w.entry(s.name, s.path, s.content); err != nil {
+			if err := w.entry(osView{}, s.name, s.path, s.content); err != nil {
 				return err
 			}
 			continue
@@ -370,7 +388,7 @@ func (w *archiveWriter) entries(manifest []byte, srcs []source) error {
 			if rel != "." {
 				name += "/" + filepath.ToSlash(rel)
 			}
-			return w.entry(name, path, "")
+			return w.entry(osView{}, name, path, "")
 		})
 		if err != nil {
 			return err
@@ -406,13 +424,104 @@ func dirName(name string) string {
 	return "./" + name + "/"
 }
 
-// entry writes one path as name. content, when set, is read in place of
-// path (the database copy); the header keeps path's owner, mode and time.
-func (w *archiveWriter) entry(name, path, content string) error {
-	stat := os.Lstat
+// splitSource writes one source in privilege mode split. sandboxd's user
+// owns the data folder and the certificate folders there, and could swap
+// any name in them for a link, so each source is read through an os.Root
+// opened on the data folder (or on the folder that holds the source, when
+// it is elsewhere): Root refuses every path and link that leads out of the
+// folder it was opened on, with no race between a look and a read. A link
+// is still written as a link, as in single.
+func (w *archiveWriter) splitSource(s source) error {
+	if s.content != "" {
+		// The database copy, made with nofollow; the header only names it.
+		return w.entry(lstatView{}, s.name, s.path, s.content)
+	}
+	anchor := filepath.Dir(s.path)
+	switch {
+	case within(s.path, w.agentData):
+		anchor = w.agentData
+	case s.name == archiveConfig:
+		// The config folder is root's (its link, if any, was followed).
+		anchor = s.path
+	}
+	top, err := os.OpenRoot(anchor)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer top.Close()
+	rel, err := filepath.Rel(anchor, s.path)
+	if err != nil {
+		return err
+	}
+	if !s.tree {
+		return w.entry(rootView{top}, s.name, rel, "")
+	}
+	if fi, err := top.Lstat(rel); err != nil || !fi.IsDir() {
+		// Gone, or a link: written as what it is, never walked.
+		return w.entry(rootView{top}, s.name, rel, "")
+	}
+	tree, err := top.OpenRoot(rel)
+	if err != nil {
+		return err
+	}
+	defer tree.Close()
+	return fs.WalkDir(tree.FS(), ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) && path != "." {
+				return nil
+			}
+			return err
+		}
+		if s.skip != "" && path == filepath.ToSlash(s.skip) {
+			return nil
+		}
+		name := s.name
+		if path != "." {
+			name += "/" + path
+		}
+		return w.entry(rootView{tree}, name, path, "")
+	})
+}
+
+// fileView is how entry reads a path: by name on the host (osView), or
+// inside an os.Root (rootView), which keeps every step in its folder.
+type fileView interface {
+	Lstat(name string) (fs.FileInfo, error)
+	Stat(name string) (fs.FileInfo, error)
+	Readlink(name string) (string, error)
+	Open(name string) (*os.File, error)
+}
+
+type osView struct{}
+
+func (osView) Lstat(name string) (fs.FileInfo, error) { return os.Lstat(name) }
+func (osView) Stat(name string) (fs.FileInfo, error)  { return os.Stat(name) }
+func (osView) Readlink(name string) (string, error)   { return os.Readlink(name) }
+func (osView) Open(name string) (*os.File, error)     { return os.Open(name) }
+
+// lstatView is osView whose Stat follows no link.
+type lstatView struct{ osView }
+
+func (lstatView) Stat(name string) (fs.FileInfo, error) { return os.Lstat(name) }
+
+type rootView struct{ r *os.Root }
+
+func (v rootView) Lstat(name string) (fs.FileInfo, error) { return v.r.Lstat(name) }
+func (v rootView) Stat(name string) (fs.FileInfo, error)  { return v.r.Lstat(name) }
+func (v rootView) Readlink(name string) (string, error)   { return v.r.Readlink(name) }
+func (v rootView) Open(name string) (*os.File, error)     { return v.r.Open(name) }
+
+// entry writes one path as name, read through v. content, when set, is read
+// in place of path (the database copy); the header keeps path's owner, mode
+// and time.
+func (w *archiveWriter) entry(v fileView, name, path, content string) error {
+	stat := v.Lstat
 	if content != "" {
 		// The database copy stands in for path, whatever path is.
-		stat = os.Stat
+		stat = v.Stat
 	}
 	fi, err := stat(path)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -425,7 +534,7 @@ func (w *archiveWriter) entry(name, path, content string) error {
 	switch {
 	case fi.Mode().IsDir(), fi.Mode().IsRegular():
 	case fi.Mode()&fs.ModeSymlink != 0:
-		if link, err = os.Readlink(path); err != nil {
+		if link, err = v.Readlink(path); err != nil {
 			return err
 		}
 	default:
@@ -448,11 +557,11 @@ func (w *archiveWriter) entry(name, path, content string) error {
 	if !fi.Mode().IsRegular() {
 		return w.tw.WriteHeader(hdr)
 	}
-	src := path
+	open, src := v.Open, path
 	if content != "" {
-		src = content
+		open, src = os.Open, content
 	}
-	f, err := os.Open(src)
+	f, err := open(src)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) && content == "" {
 			return nil

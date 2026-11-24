@@ -980,6 +980,15 @@
         owner: root
         group: root
 
+    # sandboxd backup runs as root: it reads the env files in /etc/sandboxd,
+    # root's alone. It reads the database (VACUUM INTO), the Raft folder,
+    # the server key files and /etc/sandboxd, and writes one 0600 archive in
+    # sandboxd_backup_output_dir, root's. In privilege mode split, which it
+    # reads from the node's env files, it follows no link in sandboxd's
+    # folders: it reads them through an os.Root and refuses a database that
+    # is not the file at its path (internal/nodeops splitSource,
+    # internal/nodeupgrade VacuumIntoNoFollow), so a link sandboxd's user
+    # left there leads it nowhere.
     - name: Configure local sandboxd backup cron
       when: sandboxd_backup_enabled | bool
       ansible.builtin.cron:
