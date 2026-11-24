@@ -103,20 +103,21 @@
       writes.
   loop: "{{ sandboxd_split_root_files | product(sandboxd_split_agent_dirs) | list }}"
 
-# Nor under a folder that is a link into /usr on Ubuntu and Amazon Linux 2023
-# (/sbin, /bin, /lib): the root helper runs nothing through a link and
-# refuses such a file when it starts. Terraform refuses the same at plan
-# time (Terraform/privilege_mode.tf).
+# Nor under a folder that is a link into /usr on Ubuntu, Debian and Amazon
+# Linux 2023 (/sbin, /bin, /lib): the root helper follows no link in a
+# folder and refuses such a file when it starts. Terraform refuses the same
+# at plan time (Terraform/privilege_mode.tf).
 - name: Refuse root-run Firecracker files under a merged /usr's links
   when: sandboxd_privilege_mode == 'split'
   ansible.builtin.assert:
     that:
       - not item[0].startswith(item[1] ~ '/')
     fail_msg: >-
-      {{ item[0] }} is under {{ item[1] }}, which is a link into /usr on Ubuntu
-      and Amazon Linux 2023, and in privilege mode split the root helper runs
-      nothing through a link. Name the file under /usr in
-      firecracker.kernel_path, binary_path and jailer_path.
+      {{ item[0] }} is under {{ item[1] }}, which is a link into /usr on Ubuntu,
+      Debian and Amazon Linux 2023, and in privilege mode split the root helper
+      follows no link in a folder. In firecracker.kernel_path, binary_path and
+      jailer_path, name each file by the path `readlink -f` prints for it on
+      the node.
   loop: "{{ sandboxd_split_root_files | product(sandboxd_split_merged_usr_links) | list }}"
 
 - name: Refuse runtime folders a split sandboxd cannot write

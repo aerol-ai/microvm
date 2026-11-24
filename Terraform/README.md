@@ -344,8 +344,9 @@ warm pool (`containerd.pool.enabled`). What changes for them:
   (section 2d). The default `firecracker.kernel_path` becomes
   `/usr/local/lib/aerolvm-firecracker/vmlinux`, because the helper refuses a
   kernel in a folder sandboxd writes. The default `firecracker.mkfs_bin`
-  becomes `/usr/sbin/mkfs.ext4`: `/sbin` is a link on Ubuntu and Amazon
-  Linux 2023, and the helper runs nothing through a link. If
+  becomes `/usr/sbin/mkfs.ext4`: `/sbin` is a link on Ubuntu, Debian and
+  Amazon Linux 2023, and the helper follows no link in a folder (a
+  program's own name may be a link, as `mkfs.ext4` is to `mke2fs`). If
   `firecracker.jailer_uid` and `jailer_gid` are unset, the bootstrap writes no
   jailer ids, so the VMs run as `sandboxd-jailer`. In single they stay uid
   and gid 1000, as before.
@@ -372,7 +373,8 @@ The plan fails, and lists each problem, when split is set with:
   `/etc/sandboxd/tls`, `/etc/sandboxd/cluster-ca`, and any folder a node's
   `sandboxd_env` moves them to; or one of those paths under `/bin`, `/sbin`,
   `/lib`, `/lib32`, `/lib64` or `/libx32`, which are links into `/usr` on
-  Ubuntu and Amazon Linux 2023 (the helper runs nothing through a link);
+  Ubuntu, Debian and Amazon Linux 2023 (use the path `readlink -f` prints
+  for the program on a node);
 - a Firecracker or WASM path that is not clean and absolute (with `..`, `.`
   or `//`);
 - a `firecracker.run_dir`, `firecracker.templates_dir`, `wasm.modules_dir` or

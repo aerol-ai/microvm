@@ -32,11 +32,13 @@ locals {
   )
 
   # mkfs.ext4, which the root helper runs. Single keeps its default,
-  # /sbin/mkfs.ext4. On Ubuntu 22.04 and 24.04 and Amazon Linux 2023 /sbin is
-  # a link to /usr/sbin, and the helper runs nothing through a link
-  # (internal/rootd CheckRootProgramPath), so split names the file itself.
+  # /sbin/mkfs.ext4. On Ubuntu, Debian and Amazon Linux 2023 /sbin is a link
+  # to /usr/sbin, and the helper follows no link in a folder
+  # (internal/rootd checkRootBinaryFile), so split names /usr/sbin/mkfs.ext4:
+  # a file on Amazon Linux, and on Ubuntu and Debian a link to mke2fs beside
+  # it, which the helper takes (a program's last name may be a link).
   # A path the operator chose stays as it is; split_problems refuses one
-  # under such a link.
+  # under a folder that is a link.
   firecracker_mkfs_bin = (
     local.split_mode && var.firecracker.mkfs_bin == "/sbin/mkfs.ext4"
     ? "/usr/sbin/mkfs.ext4"
@@ -100,7 +102,7 @@ locals {
     (!local.any_firecracker || var.firecracker.use_jailer) ? "" : "firecracker.use_jailer must be true: the root helper runs every VM through the jailer.",
     (!local.any_firecracker || var.firecracker.jailer_chroot_base == "/srv/jailer") ? "" : "firecracker.jailer_chroot_base must be /srv/jailer: install.sh --privilege-mode split lets sandboxd write there and in no other jailer folder.",
     alltrue([for f in local.split_root_files : !anytrue([for a in local.split_agent_dirs : startswith(f, "${a}/")])]) ? "" : "firecracker.kernel_path, binary_path, jailer_path, mkfs_bin and ip_binary must not be in a folder sandboxd owns (${join(", ", local.split_agent_dirs)}): root runs or links them, and sandboxd could swap them.",
-    alltrue([for f in local.split_root_files : !anytrue([for l in local.split_merged_usr_links : startswith(f, "${l}/")])]) ? "" : "firecracker.kernel_path, binary_path, jailer_path, mkfs_bin and ip_binary must not be under ${join(", ", local.split_merged_usr_links)}: on Ubuntu 22.04 and 24.04 and Amazon Linux 2023 those are links into /usr, and the root helper runs nothing through a link. Name the file under /usr, such as /usr/sbin/mkfs.ext4.",
+    alltrue([for f in local.split_root_files : !anytrue([for l in local.split_merged_usr_links : startswith(f, "${l}/")])]) ? "" : "firecracker.kernel_path, binary_path, jailer_path, mkfs_bin and ip_binary must not be under ${join(", ", local.split_merged_usr_links)}: on Ubuntu, Debian and Amazon Linux 2023 those are links into /usr, and the root helper follows no link in a folder. Name each by the path `readlink -f` prints for it on a node.",
     alltrue([for d in local.split_runtime_dirs : anytrue([for a in ["/var/lib/sandboxd", "/run/sandboxd"] : d == a || startswith(d, "${a}/")])]) ? "" : "firecracker.run_dir, firecracker.templates_dir, wasm.modules_dir and wasm.cache_dir must be in /var/lib/sandboxd or /run/sandboxd: sandboxd writes them, and in split it may write nowhere else.",
   ]) : []
 }
