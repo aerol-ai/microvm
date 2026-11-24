@@ -155,8 +155,46 @@ playbooks/
   ping.yml             # connectivity smoke test
   prepare-role-change.yml # drain + wait-empty guard before Terraform role changes
   configure-ops.yml    # OTEL env, image-pull knobs, ops alert/dashboard/runbook files
+  stage-wasm-modules.yml # stage the WASM standard modules on every node
   tail-logs.yml        # journalctl across the fleet
+  tasks/
+    privilege-mode-checks.yml # what configure-ops.yml refuses for privilege_mode
 ```
+
+## Privilege mode split
+
+`privilege_mode: split` in `config/cluster.yml` runs sandboxd as a user with
+no rights, and a small root helper does the root work. `install.sh
+--privilege-mode split` sets a node up for it; this play never switches a
+node. It checks that each node runs the mode `cluster.yml` names.
+
+Split runs Firecracker, WASM, V8 isolates and the containerd warm pool. Before
+it changes anything, `configure-ops.yml` refuses what split cannot run with,
+and says what to change:
+
+- `container_engine` other than `containerd`, or
+  `containerd.native_netns_pool_enabled: false`;
+- with `firecracker.enabled`: `use_jailer: false`, a `jailer_chroot_base`
+  other than `/srv/jailer`, a `kernel_path`, `binary_path` or `jailer_path`
+  in a folder the `sandboxd` user owns (root installs and runs them), or a
+  node that `install.sh` did not set up with `--with-firecracker` (its
+  sandboxd unit cannot write `/srv/jailer`);
+- a Firecracker or WASM path that is not clean and absolute, or a
+  Firecracker or WASM folder outside `/var/lib/sandboxd` and
+  `/run/sandboxd`, the only folders sandboxd may write in split.
+
+In split, the default `firecracker.kernel_path` becomes
+`/usr/local/lib/aerolvm-firecracker/vmlinux`, a folder only root writes. A
+settings change restarts the root helper together with sandboxd, because the
+helper reads `cluster.env` too. Running sandboxes keep running.
+
+In split, no task acts as root inside a folder the `sandboxd` user owns:
+that user could leave a link there for root to follow. Firecracker's run and
+templates folders are left for sandboxd to make. `stage-wasm-modules.yml`
+runs as the `sandboxd` user. `/etc/sandboxd/secrets` stays root's
+(`root:sandboxd`, mode 0750), and the wrap key, the cluster PAT and the
+shared SSH host key go there as files that user owns.
+`SB_SSH_HOST_KEY_PATH` then names the key there.
 
 ## Connect this cluster to AOCR (mirror + auto-import)
 

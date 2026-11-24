@@ -325,7 +325,8 @@ locals {
     # Privilege mode (cluster.yml privilege_mode, M1 PR 10). Kept with the
     # containerd settings because split runs only the containerd engine, so
     # the bootstrap reads it from the map it already gets. Like
-    # buildkit_rootless, "single" renders nothing new.
+    # buildkit_rootless, "single" renders nothing new. What split changes
+    # and refuses is in privilege_mode.tf.
     privilege_mode = try(local.cluster_ops.privilege_mode, "single")
   }
 
@@ -366,16 +367,11 @@ resource "terraform_data" "validate_cluster_ops" {
       error_message = "privilege_mode in config/cluster.yml must be single or split."
     }
 
+    # Split runs every runtime (privilege_mode.tf); split_problems is what
+    # it still cannot run with, one line each.
     precondition {
-      condition = (
-        local.containerd_cfg.privilege_mode != "split"
-        || (
-          var.one_line_join && local.container_engine == "containerd" && local.wasm_cfg.enabled != "true"
-          && local.containerd_pool_cfg.enabled != "true"
-          && alltrue([for name, n in local.nodes_resolved : !n.with_firecracker && !n.with_isolate])
-        )
-      )
-      error_message = "privilege_mode: split in config/cluster.yml needs container_engine: containerd, one_line_join = true (only that bootstrap passes install.sh --privilege-mode split), wasm.enabled: false, containerd.pool.enabled: false, and no node with with_firecracker or with_isolate: the root helper does not run their host processes or the warm pool's parked sandboxes yet."
+      condition     = length(local.split_problems) == 0
+      error_message = "privilege_mode: split in config/cluster.yml cannot run with these settings:\n- ${join("\n- ", local.split_problems)}"
     }
 
     precondition {

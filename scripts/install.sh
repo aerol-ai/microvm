@@ -3849,7 +3849,14 @@ install_firecracker() {
 
 	install_firecracker_release "$arch" "$tmp_dir"
 	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
-	install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR" "$JAILER_CHROOT_BASE"
+	install -d -m 0755 "$JAILER_CHROOT_BASE"
+	# The templates folder is sandboxd's, inside /var/lib/sandboxd. In split
+	# sandboxd's user owns that folder and could leave a link there for root
+	# to follow, so root makes nothing in it: sandboxd makes the templates
+	# folder itself when it first needs one.
+	if [[ "${PRIVILEGE_MODE:-single}" != "split" ]]; then
+		install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR"
+	fi
 	if ! getent passwd "$JAILER_USER" >/dev/null 2>&1; then
 		useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$JAILER_USER"
 	fi
