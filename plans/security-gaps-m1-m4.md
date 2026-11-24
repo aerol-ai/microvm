@@ -894,11 +894,16 @@ Each is small and stands alone. Together they shrink the root surface now.
         the operator then found nothing to move and removed the node.
         Every delete after that failed, because the sandbox's placement
         still named the removed node.
-      **The split warm claim** is the open item: #1437 now runs the
-      relabel and the egress lift at the same time. In the local box,
-      split alone got about 0.3 ms faster; the two box runs disagree on
-      how far that closes the gap to single, so a live N1 rerun would
-      settle it.
+      **The split warm claim** is the open item: #1437 now runs the relabel
+      and the egress lift at the same time. Two box runs measured it.
+      #1437's own run, in its PR body: the pool stage's gap, split minus
+      single, went from +1.05 ms to +0.40 ms (95% +0.25 to +0.80). An
+      independent review run on another local box (30 paired rounds): split
+      alone was 0.30 ms faster than main (95% -0.40 to -0.05), and the gap,
+      split minus single, stayed at +0.55 ms on both main and #1437. A live
+      N1 rerun on EKS would settle it. #1438 has merged too: it fixes the
+      teardown of a failed warm claim, and the case where that teardown and
+      a bookkeeping write both fail.
       Not proven: a gVisor move between two single workers (its test
       sandbox came from the warm pool). The drill's own scripts had five
       bugs (H1-H5), so F10 and the cross-mode move call were done by hand
