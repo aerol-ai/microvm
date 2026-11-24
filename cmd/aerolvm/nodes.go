@@ -492,6 +492,9 @@ func runDrain(ctx context.Context, a *app, args []string) int {
 	}
 	var deleted, evacuated []string
 	movable := evacuate
+	// stays is, per sandbox the leader does not move, the reason last
+	// shown, so a reason is shown once and again only when it changes.
+	stays := map[string]string{}
 	waitCtx := ctx
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -518,10 +521,28 @@ func runDrain(ctx context.Context, a *app, args []string) int {
 				evacuated = append(evacuated, id)
 				a.progress(c, "aerolvm: moved sandbox %s off %s", id, name)
 			}
-			for id, why := range res.Failed {
+			ids := make([]string, 0, len(res.Failed))
+			for id := range res.Failed {
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			for _, id := range ids {
+				why := res.Failed[id]
+				if reason, ok := strings.CutPrefix(why, "not moved: "); ok {
+					// Not a failed try: the leader does not move it, for
+					// now (no worker can take it) or for good.
+					if stays[id] != reason {
+						stays[id] = reason
+						a.progress(c, "aerolvm: sandbox %s stays on %s: %s", id, name, reason)
+					}
+					continue
+				}
 				a.progress(c, "aerolvm: moving sandbox %s failed (retrying): %s", id, why)
 			}
-			movable = res.RemainingMovable > 0
+			// Passes go on while anything can move, or may later: a sandbox
+			// held back because no worker could take it (not moved) moves
+			// once one can, so it is checked again on the next pass.
+			movable = res.RemainingMovable > 0 || len(res.Failed) > 0
 		}
 		n, err := a.getNode(waitCtx, c, name, idsIf(deleteSandboxes))
 		if err != nil {

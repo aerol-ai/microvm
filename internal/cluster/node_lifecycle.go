@@ -158,6 +158,8 @@ func (c *Cluster) deleteNodeLocal(ctx context.Context, nodeID string, force bool
 	if c.deadOwners != nil {
 		c.deadOwners.clear(nodeID)
 	}
+	// Its decommission, if any, is over.
+	c.keepDecommission(nodeID, nil)
 	c.invalidatePeerClient(nodeID)
 	c.gossip.applyDenySet()
 	c.logger.Info("cluster: deleted node", "node_id", nodeID, "role", deny.Record.Role,
