@@ -496,7 +496,9 @@ func (k *keyedLocks) lock(ctx context.Context, key string) (unlock func(), err e
 		// the slot's block back next (splitClaimFinish); a lift that took
 		// the lock after that block would open the slot again. The agent's
 		// give-up reaches this server before its next call does, so a call
-		// whose context is still live here was not given up first.
+		// whose context is still live here was not given up first. That
+		// order holds within one helper process: during a helper swap the
+		// old and the new process do not share these locks (as before).
 		if ctx.Err() != nil {
 			unlock()
 			return nil, ctxError(ctx)

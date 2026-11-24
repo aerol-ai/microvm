@@ -23,16 +23,22 @@ import (
 type teardownNetns struct {
 	harnessNetns
 	rec func(format string, args ...any) error
-	// backErr fails moving the owner back to the park.
-	backErr error
+	// backErr fails moving the owner back to the park; backHang makes
+	// that write hang until its context ends.
+	backErr  error
+	backHang bool
 }
 
-func (n *teardownNetns) ReassignOwner(_ context.Context, from, to string) error {
+func (n *teardownNetns) ReassignOwner(ctx context.Context, from, to string) error {
 	_ = n.rec("owner %s>%s", from, to)
-	if IsParkedSandboxID(to) {
-		return n.backErr
+	if !IsParkedSandboxID(to) {
+		return nil
 	}
-	return nil
+	if n.backHang {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return n.backErr
 }
 
 func (n *teardownNetns) Release(_ context.Context, id string) error {
@@ -244,8 +250,10 @@ func TestFailedClaimTeardownFailureIsRetriedByThePool(t *testing.T) {
 // TestFailedClaimTeardownWhenTheOwnerCannotMoveBack: moving the netns owner
 // back is a store write; when it fails the teardown still runs, and the
 // sandbox id's slot is freed once the container is gone. When the delete
-// fails too, the slot still goes to the pool's retry list and nothing is
-// freed while the container may run.
+// fails too, the slot still goes to the pool's retry list, without its
+// address, nothing is freed while the container may run, and the create
+// is refused instead of going cold (warm_claim_double_failure_test.go has
+// this over the real store).
 func TestFailedClaimTeardownWhenTheOwnerCannotMoveBack(t *testing.T) {
 	r := newTeardownRig(t, false)
 	r.netns.backErr = errors.New("database is locked")
@@ -262,7 +270,10 @@ func TestFailedClaimTeardownWhenTheOwnerCannotMoveBack(t *testing.T) {
 	r.netns.backErr = errors.New("database is locked")
 	r.fw.onLift = func() { r.busy.Store(true) }
 	r.fw.liftErr = errors.New("helper unavailable")
-	r.claim(context.Background(), t)
+	_, err := r.d.tryWarmAdopt(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-a", "tok", nil, models.RuntimeDocker)
+	if !errors.Is(err, errClaimLeftover) {
+		t.Fatalf("claim err %v, want errClaimLeftover", err)
+	}
 	if !r.slotLeft() || len(r.released) != 0 {
 		t.Fatalf("slot left %v, released %v: want it kept for the retry", r.slotLeft(), r.released)
 	}
@@ -270,8 +281,19 @@ func TestFailedClaimTeardownWhenTheOwnerCannotMoveBack(t *testing.T) {
 		t.Fatalf("pending teardowns %d, want 1", n)
 	}
 	for _, c := range r.fw.recorded() {
-		if strings.HasPrefix(c, "release ") {
-			t.Fatalf("calls %v: a netns slot freed while the container may still run", r.fw.recorded())
+		if strings.HasPrefix(c, "release ") || strings.HasPrefix(c, "clear-") {
+			t.Fatalf("calls %v: %q while the container may still run", r.fw.recorded(), c)
+		}
+	}
+	mark := len(r.fw.recorded())
+	r.busy.Store(false)
+	r.pool.Close()
+	if r.slotLeft() || !slices.Equal(r.released, []string{"park-a"}) {
+		t.Fatalf("slot left %v, released %v after the retry", r.slotLeft(), r.released)
+	}
+	for _, c := range r.fw.recorded()[mark:] {
+		if strings.HasPrefix(c, "clear-") || c == "release sb-a" {
+			t.Fatalf("retry calls %v: %q on what may be the sandbox id's", r.fw.recorded()[mark:], c)
 		}
 	}
 }

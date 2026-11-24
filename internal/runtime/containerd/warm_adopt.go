@@ -14,6 +14,7 @@ import (
 	"github.com/containerd/errdefs"
 
 	"github.com/aerol-ai/microvm/internal/pool/containerdpool"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/gvisorpids"
@@ -171,19 +172,41 @@ func (d *Driver) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 			}
 			return nil, err
 		}
-		d.discardClaimedSlot(ctx, slot, sandboxID)
+		if derr := d.discardClaimedSlot(ctx, slot, sandboxID, err); derr != nil {
+			return nil, derr
+		}
 		return nil, fmt.Errorf("warm adopt failed: %w", err)
 	}
 	return state, nil
 }
 
-// discardClaimedSlot tears down a slot whose claim failed. The slot left
-// the pool at Acquire, so this is the only path that removes it.
+// errClaimLeftover refuses a create whose failed claim left its container
+// running in a network namespace the sandbox id still holds: the owner
+// could not be moved back to the park, and the container could not be
+// removed. The create must not go cold (createContainer returns it): its
+// netns step would hand it that namespace, the one the claim's container
+// still runs in. It is a capacity refusal, which every API surface answers
+// 503 with Retry-After (apihttp Classify), so the caller retries, and in a
+// cluster the retry can go to another node. A retry here that takes a
+// warm slot meets the container by its sandbox label and has it removed as
+// the sandbox's leftover first (service create_leftover.go). One that goes
+// straight to a cold create before the pool's retry has removed the
+// container is not stopped here.
+var errClaimLeftover = fmt.Errorf("an earlier attempt to create this sandbox on this node is still being cleaned up; retry shortly (%w)", capacity.ErrCapacityExceeded)
+
+// claimOwnerBackTimeout bounds moving a failed claim's netns owner back to
+// the park, a local store write. It has its own bound so a hung write does
+// not use up the teardown's: the container is removed either way. A var for
+// tests.
+var claimOwnerBackTimeout = 5 * time.Second
+
+// discardClaimedSlot tears down a slot whose claim failed (cause). The slot
+// left the pool at Acquire, so this is the only path that removes it. It
+// returns errClaimLeftover when the create must not go cold, else nil.
 //
-// It runs on undoContext, not on ctx: a client that hangs up mid-claim
-// cancels ctx, and a teardown on it failed at its first containerd call
-// and left the container behind, as a failed cold create's undo once did
-// (UC-450).
+// It does not run on ctx: a client that hangs up mid-claim cancels ctx,
+// and a teardown on it failed at its first containerd call and left the
+// container behind, as a failed cold create's undo once did (UC-450).
 //
 // A claim moves the slot's netns owner from the park id to the sandbox
 // once the relabel is in: in single mode before the rules, in split mode
@@ -201,20 +224,34 @@ func (d *Driver) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 // netns slot and its block until it is confirmed gone. Releasing the
 // reservation here would leave it with nothing to remove it but a
 // restart's boot purge.
-func (d *Driver) discardClaimedSlot(ctx context.Context, slot *containerdpool.ParkedSlot, sandboxID string) {
-	uctx, cancel := undoContext(ctx)
-	defer cancel()
+//
+// When moving the owner back failed too, the namespace and its address
+// may be the sandbox id's, not the park's. The retry then gets the slot
+// without its address: it removes the container and the park's files
+// only, and clears no rules, since by then the address may carry the
+// sandbox's own rules, or another sandbox's. The slot and its rules are
+// left to the sandbox id's own release: its leftover removal on a retry of
+// the create (Destroy), or the boot reconcile once no container holds it.
+func (d *Driver) discardClaimedSlot(ctx context.Context, slot *containerdpool.ParkedSlot, sandboxID string, cause error) error {
 	var ownerErr error
 	if d.netns != nil && slot.ID != "" && slot.ID != sandboxID {
-		ownerErr = d.netns.ReassignOwner(uctx, sandboxID, slot.ID)
+		octx, ocancel := context.WithTimeout(context.WithoutCancel(ctx), claimOwnerBackTimeout)
+		ownerErr = d.netns.ReassignOwner(octx, sandboxID, slot.ID)
+		ocancel()
 	}
+	uctx, cancel := undoContext(ctx)
+	defer cancel()
 	if err := d.destroyParked(uctx, slot); err != nil {
-		if ownerErr != nil {
-			d.logger.Warn("containerd warm claim: the failed claim's slot could not be torn down, and its network namespace may still be under the sandbox id",
-				"sandbox_id", sandboxID, "slot_id", slot.ID, "error", err, "owner_error", ownerErr)
+		if ownerErr == nil {
+			d.warmPool.RetainFailedDestroy(slot, err)
+			return nil
 		}
-		d.warmPool.RetainFailedDestroy(slot, err)
-		return
+		kept := *slot
+		kept.ContainerIP = ""
+		d.warmPool.RetainFailedDestroy(&kept, err)
+		d.logger.Warn("containerd warm claim: the failed claim's container could not be removed and its network namespace stays under the sandbox id; refusing the create instead of going cold",
+			"sandbox_id", sandboxID, "slot_id", slot.ID, "claim_error", cause, "error", err, "owner_error", ownerErr)
+		return errClaimLeftover
 	}
 	if d.netns != nil {
 		// The container is gone, so a slot the sandbox id still holds
@@ -222,6 +259,7 @@ func (d *Driver) discardClaimedSlot(ctx context.Context, slot *containerdpool.Pa
 		_ = d.netns.Release(uctx, sandboxID)
 	}
 	d.warmPool.ReleasePark(slot.ID)
+	return nil
 }
 
 // adoptParked binds a parked container to sandboxID without renaming the
