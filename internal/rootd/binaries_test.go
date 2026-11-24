@@ -222,3 +222,54 @@ func TestNewRefusesRootBinaries(t *testing.T) {
 		t.Fatalf("a refused helper made its socket: %v", err)
 	}
 }
+
+// TestCheckRootProgramPath: the part of the rule a path alone shows, which
+// the helper's config and every deploy tool's test apply: clean and
+// absolute, outside the agent's folders, and under no folder a merged /usr
+// makes a link.
+func TestCheckRootProgramPath(t *testing.T) {
+	agent := []string{"/var/lib/sandboxd", "/run/sandboxd"}
+	for _, tc := range []struct {
+		path, want string // want "" passes
+	}{
+		{"/usr/local/bin/workerd", ""},
+		{"/usr/sbin/mkfs.ext4", ""},
+		{"/opt/aerolvm-workerd/workerd", ""},
+		{"/usr/local/lib/aerolvm-firecracker/vmlinux", ""},
+		{"/var/lib/sandboxd-helper/runsc", ""}, // beside an agent folder, not in it
+		{"/sbinx/mkfs.ext4", ""},               // a name that only starts like a link
+		{"usr/sbin/mkfs.ext4", "clean absolute path"},
+		{"/usr/sbin/../sbin/mkfs.ext4", "clean absolute path"},
+		{"/usr//sbin/mkfs.ext4", "clean absolute path"},
+		{"/", "clean absolute path"},
+		{"", "clean absolute path"},
+		{"/var/lib/sandboxd/bin/jailer", "inside /var/lib/sandboxd, which the agent writes"},
+		{"/run/sandboxd", "inside /run/sandboxd, which the agent writes"},
+		{"/sbin/mkfs.ext4", "under /sbin, which is a link to /usr/sbin"},
+		{"/bin/ip", "under /bin, which is a link to /usr/bin"},
+		{"/lib/firecracker/jailer", "under /lib, which is a link to /usr/lib"},
+		{"/lib64/x", "under /lib64"},
+	} {
+		err := CheckRootProgramPath(tc.path, agent)
+		if tc.want == "" {
+			if err != nil {
+				t.Errorf("%q refused: %v", tc.path, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%q: %v, want an error naming %q", tc.path, err, tc.want)
+		}
+	}
+	if l := MergedUsrLinks(); !slices.Equal(l, mergedUsrLinks) || &l[0] == &mergedUsrLinks[0] {
+		t.Errorf("MergedUsrLinks = %v, want a copy of %v", l, mergedUsrLinks)
+	}
+	c := Config{Hosts: testHostsConfig(t)}
+	c.Moves = &MovesConfig{Runsc: "/j/runsc"}
+	if got := RootPrograms(c); len(got) != 2 || got["SB_ISOLATE_WORKERD_PATH"] != "/usr/local/bin/workerd" || got["SB_ROOTD_RUNSC"] != "/j/runsc" {
+		t.Errorf("RootPrograms = %v", got)
+	}
+	if err := checkRootPrograms(agent, settingPath{"SB_X", "/sbin/x"}); err == nil || !strings.HasPrefix(err.Error(), "SB_X: ") {
+		t.Errorf("checkRootPrograms names no setting: %v", err)
+	}
+}

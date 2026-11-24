@@ -481,7 +481,10 @@ func TestChartSplitMoves(t *testing.T) {
 // with both host kinds on.
 func TestChartSplitHosts(t *testing.T) {
 	helm := chartHelm(t)
-	hosts := []string{"--set", "privilegeMode=split", "--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true"}
+	// gVisor moves too, so the helper's settings name every program it runs
+	// in a split pod: workerd and runsc.
+	hosts := []string{"--set", "privilegeMode=split", "--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true",
+		"--set", "worker.gvisor.checkpointMoves=true"}
 	for name, flags := range map[string][]string{"single": hosts, "cluster": append(slices.Clone(chartClusterFlags), hosts...)} {
 		t.Run(name, func(t *testing.T) {
 			out, err := renderChart(helm, flags...)
@@ -614,6 +617,26 @@ func TestChartSplitHosts(t *testing.T) {
 			}
 			if cfg.Hosts.Workerd == nil || cfg.Hosts.Workerd.Jail.ChrootBase != base || cfg.Hosts.Workerd.Jail.WorkerdPath != workerd {
 				t.Errorf("helper's V8 hosts = %+v", cfg.Hosts.Workerd)
+			}
+			// Every program the helper runs from these settings passes its
+			// own path rule (rootd.CheckRootProgramPath), with every folder
+			// the agent can write in this pod as its folders.
+			var agentDirs []string
+			for _, m := range containers["agent"] {
+				if !m.ro {
+					agentDirs = append(agentDirs, m.path)
+				}
+			}
+			programs := rootd.RootPrograms(cfg)
+			for _, k := range []string{"SB_ISOLATE_WORKERD_PATH", "SB_ROOTD_RUNSC"} {
+				if programs[k] == "" {
+					t.Errorf("the helper runs no %s here: %v", k, programs)
+				}
+			}
+			for k, p := range programs {
+				if err := rootd.CheckRootProgramPath(p, agentDirs); err != nil {
+					t.Errorf("the chart's split settings: %s: %v", k, err)
+				}
 			}
 		})
 	}

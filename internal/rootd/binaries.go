@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 
 	"golang.org/x/sys/unix"
 
@@ -35,6 +37,64 @@ func rootBinaries(c Config) []settingPath {
 		out = append(out, settingPath{"SB_ROOTD_RUNSC", m.Runsc})
 	}
 	return out
+}
+
+// RootPrograms is rootBinaries by setting: the programs c has root run or
+// copy, for the deploy tools' tests, which check every path they render
+// with CheckRootProgramPath.
+func RootPrograms(c Config) map[string]string {
+	out := map[string]string{}
+	for _, b := range rootBinaries(c) {
+		out[b.setting] = b.path
+	}
+	return out
+}
+
+// mergedUsrLinks are the top folders a merged /usr makes links into /usr:
+// on Ubuntu 22.04 and 24.04, Debian 12 and Amazon Linux 2023, /sbin is a
+// link to usr/sbin.
+var mergedUsrLinks = []string{"/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"}
+
+// MergedUsrLinks is mergedUsrLinks, for the deploy tools' tests: Terraform
+// and Ansible refuse the same folders by name.
+func MergedUsrLinks() []string { return slices.Clone(mergedUsrLinks) }
+
+// CheckRootProgramPath is the part of the rule for a program root runs
+// (checkRootBinaryFile) that the path alone shows: a clean absolute path,
+// not at or inside a folder in agentDirs (the agent can rename anything
+// below its own folders), and not under a folder a merged /usr makes a
+// link, which the start check refuses on every current distribution.
+// ConfigFromEnv applies it to each program it reads, and the deploy tools'
+// tests apply it to each path they render for split (Terraform, Ansible,
+// install.sh, the chart), so neither can name a path the other refuses.
+// Terraform's split_problems and Ansible's split checks mirror it.
+func CheckRootProgramPath(path string, agentDirs []string) error {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
+		return fmt.Errorf("%q: want a clean absolute path", path)
+	}
+	for _, a := range agentDirs {
+		if path == a || strings.HasPrefix(path, a+"/") {
+			return fmt.Errorf("%s is inside %s, which the agent writes", path, a)
+		}
+	}
+	for _, l := range mergedUsrLinks {
+		if strings.HasPrefix(path, l+"/") {
+			return fmt.Errorf("%s is under %s, which is a link to /usr%s on a host with a merged /usr "+
+				"(Ubuntu, Debian 12, Amazon Linux 2023), and root runs nothing through a link: name it under /usr%s", path, l, l, l)
+		}
+	}
+	return nil
+}
+
+// checkRootPrograms is CheckRootProgramPath on each program's path, naming
+// its setting.
+func checkRootPrograms(agentDirs []string, programs ...settingPath) error {
+	for _, p := range programs {
+		if err := CheckRootProgramPath(p.path, agentDirs); err != nil {
+			return fmt.Errorf("%s: %w", p.setting, err)
+		}
+	}
+	return nil
 }
 
 // checkRootBinaries refuses to start a helper that would run or copy as

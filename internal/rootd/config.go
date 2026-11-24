@@ -516,6 +516,9 @@ func movesFromEnv(getenv func(string) string, path func(k, def string) string, l
 	}
 	m := &MovesConfig{Runsc: path("SB_ROOTD_RUNSC", defaultRunsc), StateRoot: path("SB_ROOTD_RUNSC_ROOT", defaultRunscStateRoot),
 		MaxBundleBytes: size, MaxStaged: staged}
+	if err := checkRootPrograms(agentDirs, settingPath{"SB_ROOTD_RUNSC", m.Runsc}); err != nil {
+		return nil, err
+	}
 	for _, a := range agentDirs {
 		for _, p := range []struct{ name, dir string }{{"SB_ROOTD_RUNSC", filepath.Dir(m.Runsc)}, {"SB_ROOTD_RUNSC_ROOT", m.StateRoot}} {
 			if p.dir == a || strings.HasPrefix(p.dir, a+"/") {
@@ -872,8 +875,10 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 	base := path("SB_ISOLATE_JAIL_CHROOT_BASE", "/srv/isolate-jail")
 	// Root reads workerd's libraries (ldd) and copies it into every jail.
 	workerd := path("SB_ISOLATE_WORKERD_PATH", "/usr/local/bin/workerd")
-	if err := outsideAgentFolders(agentDirs, settingPath{"SB_ISOLATE_JAIL_CHROOT_BASE", base},
-		settingPath{"SB_ISOLATE_WORKERD_PATH", workerd}); err != nil {
+	if err := outsideAgentFolders(agentDirs, settingPath{"SB_ISOLATE_JAIL_CHROOT_BASE", base}); err != nil {
+		return h, err
+	}
+	if err := checkRootPrograms(agentDirs, settingPath{"SB_ISOLATE_WORKERD_PATH", workerd}); err != nil {
 		return h, err
 	}
 	h.Workerd = &WorkerdHostsConfig{
@@ -1016,14 +1021,17 @@ func firecrackerHostsFromEnv(getenv func(string) string, path func(k, def string
 	if v := strings.TrimSpace(getenv("SB_FIRECRACKER_IP_BINARY")); v != "" {
 		c.IPBinary = path("SB_FIRECRACKER_IP_BINARY", "")
 	}
+	if err := outsideAgentFolders(agentDirs, settingPath{"SB_JAILER_CHROOT_BASE", c.ChrootBase}); err != nil {
+		return nil, err
+	}
 	// Root runs the jailer, ip and mkfs.ext4, and the jailer copies
 	// firecracker into each jail.
-	trusted := []settingPath{{"SB_JAILER_CHROOT_BASE", c.ChrootBase}, {"SB_JAILER_BINARY", c.JailerBinary},
-		{"SB_FIRECRACKER_BINARY", c.FirecrackerBinary}, {"SB_FIRECRACKER_MKFS_BIN", c.Mkfs4Bin}}
+	programs := []settingPath{{"SB_JAILER_BINARY", c.JailerBinary}, {"SB_FIRECRACKER_BINARY", c.FirecrackerBinary},
+		{"SB_FIRECRACKER_MKFS_BIN", c.Mkfs4Bin}}
 	if c.IPBinary != "" {
-		trusted = append(trusted, settingPath{"SB_FIRECRACKER_IP_BINARY", c.IPBinary})
+		programs = append(programs, settingPath{"SB_FIRECRACKER_IP_BINARY", c.IPBinary})
 	}
-	if err := outsideAgentFolders(agentDirs, trusted...); err != nil {
+	if err := checkRootPrograms(agentDirs, programs...); err != nil {
 		return nil, err
 	}
 	for _, a := range agentDirs {
@@ -1047,10 +1055,11 @@ var lookupEnv = func(getenv func(string) string, k string) (string, bool) {
 	return os.LookupEnv(k)
 }
 
-// outsideAgentFolders refuses a folder or program root trusts (each
-// under its setting's name) at or inside a folder the agent writes: the
-// agent can rename anything below its own folders, a folder root made
-// included. checkRootBinaries checks the programs' owners at start too.
+// outsideAgentFolders refuses a folder root trusts (each under its
+// setting's name) at or inside a folder the agent writes: the agent can
+// rename anything below its own folders, a folder root made included.
+// Programs go through checkRootPrograms, which applies the same rule and
+// more.
 func outsideAgentFolders(agentDirs []string, paths ...settingPath) error {
 	for _, p := range paths {
 		for _, a := range agentDirs {

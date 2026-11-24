@@ -662,6 +662,13 @@ func TestHostsFromEnv(t *testing.T) {
 			t.Errorf("%s=%s: %v, want a refusal naming it", tc.k, tc.v, err)
 		}
 	}
+	// Nor through a merged /usr's link.
+	for _, tc := range []struct{ k, v string }{{"SB_ISOLATE_WORKERD_PATH", "/bin/workerd"}} {
+		_, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true", tc.k: tc.v}))
+		if err == nil || !strings.Contains(err.Error(), tc.k) || !strings.Contains(err.Error(), "under /bin") {
+			t.Errorf("%s=%s: %v, want a refusal naming it", tc.k, tc.v, err)
+		}
+	}
 	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
 	if _, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true"})); err == nil ||
 		!strings.Contains(err.Error(), "shim") {
@@ -824,6 +831,10 @@ func TestFirecrackerHostsFromEnv(t *testing.T) {
 		{"a firecracker in the agent's folder", map[string]string{"SB_FIRECRACKER_BINARY": "/run/sandboxd/firecracker"}, "SB_FIRECRACKER_BINARY"},
 		{"a mkfs.ext4 in the agent's folder", map[string]string{"SB_FIRECRACKER_MKFS_BIN": "/var/lib/sandboxd/mkfs.ext4"}, "SB_FIRECRACKER_MKFS_BIN"},
 		{"an ip in the agent's folder", map[string]string{"SB_FIRECRACKER_IP_BINARY": "/var/lib/sandboxd/ip"}, "SB_FIRECRACKER_IP_BINARY"},
+		// sandboxd's own default, through a merged /usr's link.
+		{"mkfs.ext4 through /sbin", map[string]string{"SB_FIRECRACKER_MKFS_BIN": "/sbin/mkfs.ext4"}, "SB_FIRECRACKER_MKFS_BIN: /sbin/mkfs.ext4 is under /sbin"},
+		{"ip through /bin", map[string]string{"SB_FIRECRACKER_IP_BINARY": "/bin/ip"}, "SB_FIRECRACKER_IP_BINARY: /bin/ip is under /bin"},
+		{"a jailer through /lib", map[string]string{"SB_JAILER_BINARY": "/lib/firecracker/jailer"}, "SB_JAILER_BINARY"},
 	} {
 		if _, err := read(tc.m); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)

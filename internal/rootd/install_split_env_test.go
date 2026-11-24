@@ -24,9 +24,6 @@ import (
 
 const installShFromRootd = "../../scripts/install.sh"
 
-// mergedUsrLinks are the top folders a merged /usr makes links into /usr.
-var mergedUsrLinks = map[string]bool{"bin": true, "sbin": true, "lib": true, "lib32": true, "lib64": true, "libx32": true}
-
 // installShFuncs cuts install.sh's top-level functions names out of src: a
 // function runs to the next top-level function definition (as
 // internal/runtime/firecracker's install tests cut them).
@@ -171,11 +168,17 @@ func TestInstallShSplitWithIsolatesAndFirecrackerLoadsIntoTheHelper(t *testing.T
 		t.Fatalf("the helper runs Firecracker %v and V8 %v, want both", fc != nil, w != nil)
 	}
 	// Root runs each program at the path written, and the helper refuses a
-	// link anywhere on it (checkRootBinaries): none may sit under a folder
-	// that a merged /usr makes a link (Ubuntu's /bin, /sbin and /lib).
-	for _, b := range rootBinaries(cfg) {
-		if top, _, _ := strings.Cut(strings.TrimPrefix(b.path, "/"), "/"); mergedUsrLinks[top] {
-			t.Errorf("%s=%s: /%s is a link on a host with a merged /usr", b.setting, b.path, top)
+	// link anywhere on it (checkRootBinaries): every one passes the path
+	// rule the deploy tools share (CheckRootProgramPath), with sandboxd's
+	// folders as install.sh lays them out.
+	programs := RootPrograms(cfg)
+	if len(programs) < 4 {
+		t.Fatalf("the helper runs %v from install.sh's settings; want workerd, the jailer, firecracker and mkfs.ext4", programs)
+	}
+	agentDirs := []string{"/var/lib/sandboxd", "/run/sandboxd", "/run/aerolvm-procid", "/etc/sandboxd/tls", "/etc/sandboxd/cluster-ca"}
+	for setting, p := range programs {
+		if err := CheckRootProgramPath(p, agentDirs); err != nil {
+			t.Errorf("install.sh's split settings: %s: %v", setting, err)
 		}
 	}
 
