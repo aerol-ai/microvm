@@ -157,7 +157,7 @@ func newRig(t testing.TB, mutate func(*Config, *Options)) *rig {
 		},
 		// The rigs' host configs name programs this machine lacks
 		// (/usr/local/bin/workerd); TestNewRefusesRootBinaries checks them.
-		checkBinary: func(string) error { return nil },
+		checkBinary: func(p string) (string, error) { return p, nil },
 	}
 	if mutate != nil {
 		mutate(&r.cfg, &opts)

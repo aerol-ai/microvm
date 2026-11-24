@@ -128,6 +128,10 @@ type Config struct {
 	// Moves is gVisor checkpoint moves (moves.go); nil when this node
 	// takes none, and the helper serves no move call.
 	Moves *MovesConfig
+	// AgentDirs are the agent's own folders (its run, mounts, credential
+	// and data folders): nothing root runs may be in one, nor be a link to
+	// a file in one (checkRootBinaries).
+	AgentDirs []string
 }
 
 // HostsConfig is what the helper starts host processes with (M1 PR 9),
@@ -766,6 +770,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		},
 		Firewall:  FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect, NodePorts: nodePorts},
 		HostPorts: hostPorts,
+		AgentDirs: []string{runDir, mountsRoot, credDir, dataDir},
 	}
 	if cfg.Mounts, err = mountsFromEnv(getenv, uid, mountsDir, mountCredDir, filepath.Join(stateDir, "mountcache")); err != nil {
 		return Config{}, err

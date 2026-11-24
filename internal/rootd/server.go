@@ -171,7 +171,7 @@ type Options struct {
 	hostLaunchers map[rootpolicy.HostKind]hostLauncher
 	// checkBinary stands in for checkRootBinaryFile in tests, whose
 	// configs name programs this machine lacks. Nil: the real check.
-	checkBinary func(path string) error
+	checkBinary func(path string) (string, error)
 	// wasmOpenPoint and wasmLend stand in for the kernel and the WASM host
 	// in GrantWasmMounts' tests (wasm_mounts.go).
 	wasmOpenPoint func(root, sandboxID string, index int) (*os.File, error)

@@ -89,6 +89,9 @@ func TestConfigFromEnv(t *testing.T) {
 			{Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443}}},
 		// sandboxd's host-port range and redirect listener, its defaults.
 		HostPorts: rootpolicy.HostPortBounds{RangeStart: 22000, RangeEnd: 23000, RedirectPort: 21215},
+		// sandboxd's own folders, its defaults: run, mounts, credentials,
+		// data.
+		AgentDirs: []string{"/var/lib/sandboxd/containerd", "/var/lib/sandboxd/mounts", "/run/sandboxd", "/var/lib/sandboxd"},
 	}
 	for _, tc := range []struct {
 		name string
@@ -129,6 +132,7 @@ func TestConfigFromEnv(t *testing.T) {
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
 			c.Files = FileDirs{Hosts: "/data/rootd/hosts", Ready: "/run/rootd-ready", Runsc: "/data/rootd/runsc", AgentReady: "/run/sbd/docker/ready",
 				Toolbox: "/opt/aerolvm/toolboxd", ImageRoot: "/data/rootd/imageroot"}
+			c.AgentDirs = []string{"/data/ctr", "/data/mounts", "/run/sbd", "/data/state"}
 		}},
 		// M1 PR 7: the agent's toolbox copy sits in a folder it writes (the
 		// chart's); the helper keeps its own copy, which specs bind.
