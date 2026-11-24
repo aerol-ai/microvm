@@ -272,6 +272,14 @@ func (d *Driver) adoptParked(ctx context.Context, req models.CreateSandboxReques
 	if ip := strings.TrimSpace(slot.ContainerIP); ip != "" {
 		labels[containerIPLabelKey] = ip
 	}
+	// In privilege mode split the relabel and the slot's rules are two
+	// trips to the root helper; they go at once (splitClaimFinish).
+	if d.helper != nil {
+		if err := d.splitClaimFinish(ctx, container, labels, slot, sandboxID, req); err != nil {
+			return nil, err
+		}
+		return d.adoptedRuntimeState(slot, sandboxID), nil
+	}
 	if _, err := container.SetLabels(ctx, labels); err != nil {
 		return nil, err
 	}
