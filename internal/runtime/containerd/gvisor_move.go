@@ -136,8 +136,9 @@ func (d *Driver) checkpointForMove(ctx context.Context, client *Client, containe
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	// "--" ends runsc's options: a sandbox ID may begin with '-'.
 	out, err := runscCommandFn(ctx, "--root="+filepath.Join(runscStateRoot, client.Namespace()),
-		"checkpoint", "--image-path="+dir, id)
+		"checkpoint", "--image-path="+dir, "--", id)
 	if err == nil && !runscwrap.HasCheckpoint(dir) {
 		err = errors.New("it wrote no checkpoint")
 	}

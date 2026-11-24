@@ -197,7 +197,9 @@ func (m *moveCalls) checkpoint(ctx context.Context, req *rootdpb.CheckpointMoveR
 		_ = removeFolder(m.out, id)
 		return nil, badRequest("%v", err)
 	}
-	out, err := m.run(ctx, m.cfg.Runsc, "--root="+filepath.Join(m.cfg.StateRoot, m.namespace), "checkpoint", "--image-path="+dir, id)
+	// "--" ends runsc's options: a sandbox ID may begin with '-'
+	// (rootpolicy.ValidateID), and it is always the container's ID.
+	out, err := m.run(ctx, m.cfg.Runsc, "--root="+filepath.Join(m.cfg.StateRoot, m.namespace), "checkpoint", "--image-path="+dir, "--", id)
 	if err == nil && !hasCheckpointAt(m.out, id) {
 		err = errors.New("it wrote no checkpoint")
 	}

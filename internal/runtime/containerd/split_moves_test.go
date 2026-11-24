@@ -79,7 +79,7 @@ func TestSplitMoveThroughTheRealHelper(t *testing.T) {
 		t.Fatalf("stop: %v", err)
 	}
 	ran, _ := os.ReadFile(src.log)
-	if got := strings.TrimSpace(string(ran)); got != "--root=/run/containerd/runsc/aerolvm checkpoint --image-path="+filepath.Join(src.moves, "out", "sb-g")+" sb-g" {
+	if got := strings.TrimSpace(string(ran)); got != "--root=/run/containerd/runsc/aerolvm checkpoint --image-path="+filepath.Join(src.moves, "out", "sb-g")+" -- sb-g" {
 		t.Fatalf("runsc ran with %q", got)
 	}
 	if c.task.deletes == 0 {

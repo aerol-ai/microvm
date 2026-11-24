@@ -133,9 +133,21 @@ func TestMoveCheckpointExportImport(t *testing.T) {
 	if _, err := c.CheckpointMove(ctx, &rootdpb.CheckpointMoveRequest{SandboxId: "sb-1"}); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"/usr/local/bin/runsc", "--root=/run/containerd/runsc/aerolvm", "checkpoint", "--image-path=" + filepath.Join(moves, "out", "sb-1"), "sb-1"}
+	want := []string{"/usr/local/bin/runsc", "--root=/run/containerd/runsc/aerolvm", "checkpoint", "--image-path=" + filepath.Join(moves, "out", "sb-1"), "--", "sb-1"}
 	if len(f.args) != 1 || !slices.Equal(f.args[0], want) {
 		t.Fatalf("runsc ran with %v, want %v", f.args, want)
+	}
+	// A sandbox ID may begin with '-': runsc takes it after "--", as the
+	// container's ID, never as an option.
+	if _, err := c.CheckpointMove(ctx, &rootdpb.CheckpointMoveRequest{SandboxId: "-sb-dash"}); err != nil {
+		t.Fatal(err)
+	}
+	dash := []string{"/usr/local/bin/runsc", "--root=/run/containerd/runsc/aerolvm", "checkpoint", "--image-path=" + filepath.Join(moves, "out", "-sb-dash"), "--", "-sb-dash"}
+	if len(f.args) != 2 || !slices.Equal(f.args[1], dash) {
+		t.Fatalf("runsc ran with %v, want %v", f.args, dash)
+	}
+	if _, err := c.DropMove(ctx, &rootdpb.DropMoveRequest{SandboxId: "-sb-dash", Sides: []rootdpb.MoveSide{rootdpb.MoveSide_MOVE_SIDE_OUT}}); err != nil {
+		t.Fatal(err)
 	}
 	for _, dir := range []string{filepath.Join(moves, "out"), filepath.Join(moves, "in"), filepath.Join(moves, "out", "sb-1")} {
 		if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
