@@ -2,6 +2,7 @@
 """cost.py: the M1 EKS drill's cost table, planned and worst case.
 
     python3 -I cost.py [--ceiling 8] [--ttl-hours 5] [--json out.json]
+    python3 -I cost.py --vm-only --vm-type m7i.xlarge --vm-ttl-min 170 --ceiling 2
 
 Makes nothing and calls nothing. On-demand prices, us-east-1, read from
 AWS's price list on 2026-11-24 (aws pricing get-products); each can be
@@ -58,6 +59,9 @@ ALLOWANCE_A = 0.50     # ECR and S3 storage, Lambda, logs, cross-zone bytes
 # 1.5 h: V8 warm creates ride in each of the four blocks too.
 B_HOURS, B_TTL = 1.5, 3.0
 B_H = P["M7I_XLARGE"] + P["IPV4"] + 40 * GP3_H
+# Part B's machine types with a price here. Any other needs M1_PRICE_VM
+# (its on-demand price per hour), or --vm-only refuses it.
+VM_PRICES = {"m7i.xlarge": P["M7I_XLARGE"], "m7i.large": P["M7I_LARGE"], "c5.metal": P["C5_METAL"]}
 
 
 def main():
@@ -73,9 +77,16 @@ def main():
     ap.add_argument("--vm-end", type=float, default=0)
     ap.add_argument("--limit", type=float, default=6.15)
     ap.add_argument("--vm-hours", type=float, default=B_HOURS, help="part B's planned hours (0: no VM this run)")
+    ap.add_argument("--vm-hourly", type=float, default=0, help="part B's machine's cost per hour (0: m7i.xlarge's)")
+    ap.add_argument("--vm-only", action="store_true", help="part B alone (vm-n1.sh): its cost against --ceiling")
+    ap.add_argument("--vm-type", default="m7i.xlarge")
+    ap.add_argument("--vm-ttl-min", type=float, default=170, help="minutes until the VM powers itself off")
+    ap.add_argument("--hourly-out", help="--vm-only: write the VM's cost per hour here")
     a = ap.parse_args()
     if a.running:
         return running(a)
+    if a.vm_only:
+        return vm_only(a)
 
     print(f"Part A cell: ${CELL_H:.3f}/h = EKS {P['EKS']:.2f} + {SYSTEM} x m7i.large {P['M7I_LARGE']:.4f}"
           f" + {WORKERS} x m7i.xlarge {P['M7I_XLARGE']:.4f} + {SYSTEM + WORKERS} IPv4 x {P['IPV4']:.3f}"
@@ -117,6 +128,30 @@ def main():
     return 0
 
 
+def vm_only(a):
+    """Part B's guard, before vm-n1.sh makes anything: the worst case is the
+    machine running until it powers itself off (--vm-ttl-min) plus 10
+    minutes to end. Exit 3 past the ceiling, or for a type with no price."""
+    price = os.environ.get("M1_PRICE_VM")
+    if price is None:
+        if a.vm_type not in VM_PRICES:
+            print(f"REFUSED: no price for {a.vm_type}; set M1_PRICE_VM to its on-demand price per hour")
+            return 3
+        price = VM_PRICES[a.vm_type]
+    hourly = float(price) + P["IPV4"] + 40 * GP3_H
+    worst_h = (a.vm_ttl_min + 10) / 60
+    planned, worst = hourly * min(B_HOURS, worst_h), hourly * worst_h
+    print(f"Part B VM {a.vm_type}: ${hourly:.3f}/h -> planned ${planned:.2f} ({min(B_HOURS, worst_h):g} h);"
+          f" worst ${worst:.2f} (powers itself off after {a.vm_ttl_min:g} min, plus 10 to end); ceiling ${a.ceiling:.2f}")
+    if a.hourly_out:
+        with open(a.hourly_out, "w") as fh:
+            fh.write(f"{hourly:.4f}\n")
+    if worst > a.ceiling:
+        print(f"REFUSED: the worst case ${worst:.2f} passes the ceiling ${a.ceiling:.2f}")
+        return 3
+    return 0
+
+
 def running(a):
     """Spend so far (time x rate) and the projection: what is spent plus
     the planned minutes of the steps not done yet, plus each part's
@@ -129,9 +164,10 @@ def running(a):
     a_spent = CELL_H * a_h
     left_min = sum(m for s, m, _ in STEPS if s not in done) if not a.cell_end else 0
     a_proj = a_spent + CELL_H * left_min / 60 + (ALLOWANCE_A if a.cell_start else 0)
+    b_rate = a.vm_hourly or B_H
     b_h = ((a.vm_end or now) - a.vm_start) / 3600 if a.vm_start else 0.0
-    b_spent = B_H * b_h
-    b_proj = B_H * (b_h if a.vm_end else max(b_h, a.vm_hours)) if a.vm_start else B_H * a.vm_hours
+    b_spent = b_rate * b_h
+    b_proj = b_rate * (b_h if a.vm_end else max(b_h, a.vm_hours)) if a.vm_start else b_rate * a.vm_hours
     total_spent, total_proj = a_spent + b_spent, a_proj + b_proj
     print(f"COST spent ${total_spent:.2f} (cluster {a_h:.2f} h ${a_spent:.2f}; VM {b_h:.2f} h ${b_spent:.2f}); "
           f"projected ${total_proj:.2f} (cluster ${a_proj:.2f} with {left_min} planned min left; VM ${b_proj:.2f}); limit ${a.limit:.2f}")

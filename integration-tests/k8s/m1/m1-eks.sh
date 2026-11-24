@@ -64,9 +64,11 @@
 #
 # Cost guards: up refuses when cost.py's worst case passes M1_CEILING. After
 # every step the spend so far and its projection go to .state/<name>/cost.log;
-# a projection past M1_COST_LIMIT stops the run and tears it down. down tears
-# down by name (cluster.sh down <name>), then leak-check.sh lists anything of
-# the run still in AWS.
+# a projection past M1_COST_LIMIT stops the run and tears it down. A run of
+# `all` tears itself down whatever stops it (on_exit), in a process group of
+# its own that a second Ctrl-C does not reach. down tears down by name
+# (cluster.sh down <name>), then leak-check.sh lists anything of the run
+# still in AWS.
 #
 # Settings: DRY_RUN (0|1), AEROL_BUILD_REF (default HEAD), M1_CEILING (8),
 # M1_COST_LIMIT (6.15), M1_TTL_HOURS (5), M1_KEEP (0|1), HELM (a Helm 3.8+;
@@ -75,6 +77,8 @@
 # (120), M1_N1_BURST (20), M1_F10_SANDBOXES (5), M1_F10_FILL_MB (3072),
 # M1_GW_PORT (21410, the local end of the API's port-forward).
 set -euo pipefail
+# bash 4 or newer: macOS's /bin/bash is 3.2 (`brew install bash`).
+[[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { echo "m1-eks.sh: needs bash 4 or newer; this is bash $BASH_VERSION" >&2; exit 2; }
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K8S="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$K8S/../.." && pwd)"
@@ -95,6 +99,8 @@ sha="$(git -C "$REPO" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
 T1=v0.0.0-m1drill.1 T2=v0.0.0-m1drill.2 T3=v0.0.0-m1drill.3
 # shellcheck source=m1-lib.sh
 source "$HERE/m1-lib.sh"
+# made_here: this process called cluster.sh up (step_up sets it).
+made_here=0
 CERT_MANAGER_VERSION=v1.21.3
 CERT_MANAGER_SHA256=c04a51295adda2b1a775146751f973e787190778c7f35180861d9678876e5c74
 
@@ -152,6 +158,10 @@ step_estimate() {
 }
 step_up() {
   step_estimate
+  # From here this process makes the cluster, so on_exit may tear it down.
+  # Not before: a refused estimate never tears down an older cluster that
+  # used the same name (its Terraform state is in the same folder).
+  made_here=1
   # The running cost (cost_check) counts the cluster from here.
   [[ "$dry" == 1 ]] || date +%s > "$sd/cost-start"
   x "$K8S/cluster.sh" up "$name" --ttl "${M1_TTL_HOURS:-5}h" \
@@ -167,6 +177,18 @@ step_setup() {
   say "setup: br_netfilter loaded on every worker machine (F2 stand-in)"
 }
 
+# ecr_secret <registry host>: the ecr-push Secret (a docker config.json for
+# BuildKit), with the ECR password read from stdin.
+ecr_secret() {
+  python3 -I -c '
+import base64, json, sys
+host, pw = sys.argv[1], sys.stdin.read().strip()
+b64 = lambda x: base64.b64encode(x.encode()).decode()
+conf = json.dumps({"auths": {host: {"username": "AWS", "password": pw, "auth": b64("AWS:" + pw)}}})
+print(json.dumps({"apiVersion": "v1", "kind": "Secret", "type": "kubernetes.io/dockerconfigjson",
+                  "metadata": {"name": "ecr-push", "namespace": "aerolvm-build"},
+                  "data": {".dockerconfigjson": b64(conf)}}))' "$1"
+}
 step_build() {
   gate
   local region reg bucket key url pass st=""
@@ -187,9 +209,9 @@ step_build() {
   say "build: $sha as $T1, $T2 and the variants; source s3://$bucket/$key"
   k create namespace aerolvm-build --dry-run=client -o yaml | k apply -f - >/dev/null
   # ECR's push token (12 hours), for BuildKit only. In a dry run a
-  # placeholder: no token is ever printed.
-  k -n aerolvm-build create secret docker-registry ecr-push --docker-server="${reg%%/*}" \
-    --docker-username=AWS --docker-password="$pass" --dry-run=client -o yaml | k apply -f - >/dev/null
+  # placeholder: no token is ever printed. The Secret is built from stdin
+  # (printf is a shell builtin), so the token is on no command line.
+  printf '%s' "$pass" | ecr_secret "${reg%%/*}" | k apply -f - >/dev/null
   # In a sed replacement & is "what matched": the presigned URL's & signs
   # are escaped (cell.sh's lesson).
   sed -e "s|@@SOURCE_URL@@|${url//&/\\&}|" -e "s|@@REGISTRY@@|$reg|g" -e "s|@@SHA@@|$sha|g" \
@@ -277,7 +299,9 @@ seed() {
   for p in $(worker_pods); do [[ "$p" == "$w" ]] || api_uncordon "$p"; done
   local c0="" t0
   if [[ -n "$g" ]]; then
-    start_counter "$g"
+    # A counter that did not start is graded later (kept_counting); it must
+    # not end the switch, which every later step needs.
+    start_counter "$g" || say "seed $tag: the counter in $g did not start"
     [[ "$dry" == 1 ]] || sleep 5
     c0="$(count_of "$g" || true)"
   fi
@@ -332,11 +356,11 @@ step_shape() {
   gate
   local w out="$sd/evidence/shape" sc hp
   mkdir -p "$out"
-  w="$(workers_in split | head -1)"
+  w="$(workers_in split | sed -n 1p)"
   need shape "$w" || return 0
   bench_up
   local wn1 p
-  wn1="$(workers_in single | head -1)"
+  wn1="$(workers_in single | sed -n 1p)"
   for p in $(worker_pods); do [[ "$p" == "$w" || "$p" == "$wn1" ]] || api_cordon "$p"; done
   k -n m1-bench exec m1-bench -- env SPLIT_NODE="$w" SINGLE_NODE="$wn1" bash /bench/n1-bench.sh first > "$out/first-create.txt" || true
   for p in $(worker_pods); do [[ "$p" == "$w" || "$p" == "$wn1" ]] || api_uncordon "$p"; done
@@ -366,7 +390,7 @@ step_shape() {
 # the detached overlay on a 6.12 kernel). Multi-layer and USER images too.
 image_user() {
   local ws="$1" wn img sid nid us un ok=1 out="$sd/evidence/image-user.txt"
-  wn="$(workers_in single | head -1)"
+  wn="$(workers_in single | sed -n 1p)"
   : > "$out"
   for img in "$ALPINE" public.ecr.aws/docker/library/node:22-alpine public.ecr.aws/nginx/nginx-unprivileged:alpine; do
     sid="$(only_on "$ws" create "$(body docker "$img" split)")"; nid="$(only_on "$wn" create "$(body docker "$img" single)")"
@@ -393,7 +417,7 @@ bench_up() {
   [[ "$dry" != 1 ]] && kr -n m1-bench get pod m1-bench >/dev/null 2>&1 && return 0
   k create namespace m1-bench --dry-run=client -o yaml | k apply -f - >/dev/null
   if [[ "$dry" == 1 ]]; then echo "dry-run: secret m1-bench/bench-token from the admin token (never printed)" >&2
-  else kubectl --kubeconfig "$sd/kubeconfig" -n m1-bench create secret generic bench-token --from-literal=TOKEN="$(token)" \
+  else kubectl --kubeconfig "$sd/kubeconfig" -n m1-bench create secret generic bench-token --from-file=TOKEN="$(token_file)" \
     --dry-run=client -o yaml | kubectl --kubeconfig "$sd/kubeconfig" apply -f - >/dev/null; fi
   k -n m1-bench create configmap bench --from-file=n1-bench.sh="$HERE/n1-bench.sh" --dry-run=client -o yaml | k apply -f - >/dev/null
   k apply -f - >/dev/null <<YAML
@@ -423,7 +447,7 @@ step_n1() {
   mkdir -p "$out"
   bench_up
   # One worker of each mode open; the rest take no new sandbox meanwhile.
-  open+=("$(workers_in split | head -1)" "$(workers_in single | head -1)")
+  open+=("$(workers_in split | sed -n 1p)" "$(workers_in single | sed -n 1p)")
   need n1 "${open[0]}" || return 0
   need n1 "${open[1]}" || return 0
   for p in $(worker_pods); do [[ " ${open[*]} " == *" $p "* ]] || api_cordon "$p"; done
@@ -443,9 +467,9 @@ step_n1() {
   for p in $(worker_pods); do [[ " ${open[*]} " == *" $p "* ]] || api_uncordon "$p"; done
   [[ "$dry" == 1 ]] && { echo "dry-run: python3 -I n1-stats.py $out/bench.log" >&2; return 0; }
   if python3 -I "$HERE/n1-stats.py" "$out/bench.log" > "$out/verdict.txt" 2>&1; then
-    result PASS n1 "$(grep -E 'median' "$out/verdict.txt" | tr '\n' ';')"
+    result PASS n1 "$(grep -E 'median|p50 gap' "$out/verdict.txt" | tr '\n' ';')"
   else
-    result FAIL n1 "$(grep -E 'median|no N1' "$out/verdict.txt" | tr '\n' ';')"
+    result FAIL n1 "$(grep -E 'median|p50 gap|no N1' "$out/verdict.txt" | tr '\n' ';')"
   fi
 }
 
@@ -474,14 +498,15 @@ step_switch2() {
 step_moves() {
   gate
   local single src dst g c0 c1 t0 out="$sd/evidence/moves-split.txt"
-  single="$(workers_in single | head -1)"
+  single="$(workers_in single | sed -n 1p)"
   [[ -n "$single" ]] && api_cordon "$single"
-  src="$(workers_in split | head -1)"
+  src="$(workers_in split | sed -n 1p)"
   need moves "$src" || return 0
   for p in $(worker_pods); do [[ "$p" == "$src" ]] || api_cordon "$p"; done
   g="$(create "$(body gvisor "$BUSYBOX" split)")"
   for p in $(workers_in split); do [[ "$p" == "$src" ]] || api_uncordon "$p"; done
-  start_counter "$g"; sh_in "$g" 'echo m1-moves > /root/marker' >/dev/null || true
+  start_counter "$g" || say "moves: the counter in $g did not start"
+  sh_in "$g" 'echo m1-moves > /root/marker' >/dev/null || true
   [[ "$dry" == 1 ]] || sleep 20
   c0="$(count_of "$g" || true)"; t0=$(now)
   echo "before: $g on $src, counter $c0" > "$out"
@@ -497,7 +522,7 @@ step_moves() {
 step_switch3() {
   gate
   local w new g r refusals
-  w="$(workers_in single | head -1)"
+  w="$(workers_in single | sed -n 1p)"
   [[ -n "$w" ]] || { result SKIP switch3 "no single worker left"; return 0; }
   seed "$w" s3
   new="$(switch_machine "$(machine_of "$w")" switch3 cross_mode_probe)" || { result FAIL switch3 "worker did not come back"; return 0; }
@@ -536,7 +561,7 @@ snapshot() { # snapshot <file>: per worker its restarts and helper; per sandbox 
 }
 step_s2() {
   gate
-  local out="$sd/evidence/s2" id i mid s0 s1 ok
+  local out="$sd/evidence/s2" id i mid s0 s1 ok upgraded=0
   mkdir -p "$out"
   # shellcheck source=/dev/null
   source "$K8S/minio-store.sh"
@@ -563,7 +588,7 @@ step_s2() {
   for i in 1 2 3; do
     for rtm in gvisor docker; do
       id="$(create "$(body "$rtm" "$ALPINE" split)")"
-      [[ -n "$id" ]] && { start_counter "$id"; echo "$id" >> "$sd/s2-ids"; }
+      [[ -n "$id" ]] && { start_counter "$id" || true; echo "$id" >> "$sd/s2-ids"; }
     done
   done
   [[ "$dry" == 1 ]] || sleep 30
@@ -571,14 +596,16 @@ step_s2() {
   # S2: the rollout the operator runs for a version change swaps every
   # node's agent image in place, servers and gateways too.
   hm upgrade "$release" "$(chart_dir)" -n "$ns" --reuse-values --set "cluster.version=$T2" --set "image.tag=$T2" >/dev/null
-  wait_until 2400 "every node reports $T2" all_at "$T2" || diag s2
+  # Every grade below needs the rollout itself: a sandbox that "kept
+  # counting" proves nothing if no agent was swapped.
+  if wait_until 2400 "every node reports $T2" all_at "$T2"; then upgraded=1; else diag s2; fi
   [[ "$dry" == 1 ]] || sleep 30
   snapshot "$out/after.txt"; s1="$(store_count)"
   ok=1
   for id in $(cat "$sd/s2-ids" 2>/dev/null); do answers "$id" || ok=0; done
   # Counters kept counting (none started again from 1): S2's "no sandbox
   # restarted". runtime and egress restart counts unchanged; agent +1.
-  if [[ "$ok" == 1 ]] && python3 -I - "$out/before.txt" "$out/after.txt" <<'PY'
+  if [[ "$upgraded" == 1 && "$ok" == 1 ]] && python3 -I - "$out/before.txt" "$out/after.txt" <<'PY'
 import re, sys
 b, a = (open(f).read() for f in sys.argv[1:])
 def counts(t): return {m[0]: int(m[1] or 0) for m in re.findall(r"sandbox (\S+) on \S* count (\d*)", t)}
@@ -593,7 +620,7 @@ print("not kept:", bad)
 sys.exit(1 if bad else 0)
 PY
   then result PASS s2 "rollout $T1 -> $T2 swapped every agent in place; every sandbox kept counting; runtime and egress containers did not restart"
-  else result FAIL s2 "see $out/before.txt and after.txt"; diag s2; fi
+  else result FAIL s2 "every node at $T2: $([[ "$upgraded" == 1 ]] && echo yes || echo no); see $out/before.txt and after.txt"; diag s2; fi
   local p hp bad=0
   for p in $(workers_in split); do
     hp="$(helper "$p")"
@@ -601,8 +628,8 @@ PY
   done
   [[ "$bad" == 0 ]] && result PASS s2-helper-swap "every split worker now runs helper $T2 (signed hot swap), sandboxes kept" ||
     result FAIL s2-helper-swap "$(tr '\n' ';' < "$out/helpers.txt")"
-  if [[ "${s1:-0}" -gt "${s0:-0}" ]] && answers "$mid"; then result PASS ov-e2-swap "the mount kept writing across the agent swap ($s0 -> $s1 files)"
-  else result FAIL ov-e2-swap "store files $s0 -> $s1"; fi
+  if [[ "$upgraded" == 1 && "${s1:-0}" -gt "${s0:-0}" ]] && answers "$mid"; then result PASS ov-e2-swap "the mount kept writing across the agent swap ($s0 -> $s1 files)"
+  else result FAIL ov-e2-swap "store files $s0 -> $s1; every node at $T2: $([[ "$upgraded" == 1 ]] && echo yes || echo no)"; fi
   helper_restart "$(owner "$mid")" "$mid"
 }
 all_at() { # all_at <version>: every AerolNode reports it
@@ -642,7 +669,7 @@ step_variants() {
   gate
   local w reg v want since h0 h1 r0 log
   reg="$(tfout ecr_registry)"
-  w="$(workers_in split | head -1)"
+  w="$(workers_in split | sed -n 1p)"
   need variants "$w" || return 0
   # The operator puts the release image back within seconds (swapAgent), so
   # each variant runs only briefly. An unsigned image never reaches the
@@ -719,7 +746,7 @@ step_f10() {
 step_f8() {
   gate
   local w m uid u t0 out="$sd/evidence/f8.txt" newuid check
-  w="$(workers_in split | head -1)"
+  w="$(workers_in split | sed -n 1p)"
   need f8 "$w" || return 0
   m="$(machine_of "$w")"; uid="$(uid_of "$w")"; u="${uid//-/_}"
   [[ -n "$uid" && -n "$m" ]] || { result FAIL f8 "no pod uid or machine for $w"; return 0; }
@@ -767,10 +794,11 @@ step_down() {
   # another context is never used (cluster.sh down still runs; it checks the
   # account and works from the run's Terraform state).
   if [[ "$dry" == 1 ]] || ctx_ok; then
-    hm uninstall "$release" -n "$ns" --wait --timeout 10m >/dev/null 2>&1 || true
+    # stdout only to /dev/null: a dry run prints both calls on stderr.
+    hm uninstall "$release" -n "$ns" --wait --timeout 10m >/dev/null || true
     # The servers' volumes (claims the operator made): deleted while the
     # CSI driver still runs, so they go now, not at the reaper.
-    k -n "$ns" delete pvc --all --wait=true --timeout=5m >/dev/null 2>&1 || true
+    k -n "$ns" delete pvc --all --wait=true --timeout=5m >/dev/null || true
   fi
   # The commit's source copy (.state/<name>/src-*) stays with the run's
   # evidence; remove the folder by hand once the leak check is clean.
@@ -792,47 +820,129 @@ cost_check() {
   out="$(python3 -I "$HERE/cost.py" --running --limit "${M1_COST_LIMIT:-6.15}" --vm-hours "${M1_VM_HOURS:-1.5}" \
     --cell-start "$(cat "$sd/cost-start" 2>/dev/null || echo 0)" --cell-end "$(cat "$sd/cost-end" 2>/dev/null || echo 0)" \
     --done "$(paste -sd, "$sd/done-steps")" \
-    --vm-start "$(cat "$vm_sd/started-at" 2>/dev/null || echo 0)" --vm-end "$(cat "$vm_sd/ended-at" 2>/dev/null || echo 0)")" || rc=$?
+    --vm-start "$(cat "$vm_sd/started-at" 2>/dev/null || echo 0)" --vm-end "$(cat "$vm_sd/ended-at" 2>/dev/null || echo 0)" \
+    --vm-hourly "$(cat "$vm_sd/hourly" 2>/dev/null || echo 0)")" || rc=$?
   say "after $1: $out"
   echo "$(date -u +%FT%TZ) after $1: $out" >> "$sd/cost.log"
   return "$rc"
 }
-stop_run() { # stop_run <why>: evidence, then teardown, then out
+stop_run() { # stop_run <why>: a FAIL line, then out; on_exit tears the run down
   say "STOP: $1"
   result FAIL run-stopped "$1"
-  diag stop
-  step_down || true
-  torn=1
+  stop_teardown=1
   exit 5
 }
 
 # --- running steps ------------------------------------------------------------------
 core=(up setup build install)
 checks=(kernel switch1 shape n1 switch2 moves switch3 s2 variants f10 f8 final)
+check_pid=""
+# run_check <step>: one check in a subshell of its own with errexit on, so
+# a command that fails ends the check (a FAIL line and its diagnostics) and
+# the run goes on. Not `( set -e; ... ) || rc=$?`: bash ignores set -e in
+# anything whose status a || or && tests, that subshell included, so a
+# check went on past a failed command and could still grade PASS. In the
+# background with a wait, so a signal to this shell is handled at once,
+# not when the check's current command ends.
 run_check() {
   local s="$1" rc=0
-  ( set -e; "step_$s" ) || rc=$?
+  set +e
+  (
+    set -e
+    trap check_exit EXIT
+    trap 'exit 143' TERM
+    trap 'exit 130' INT
+    "step_$s"
+  ) &
+  check_pid=$!
+  wait "$check_pid"
+  rc=$?
+  check_pid=""
+  set -e
   # Exit 2 is the gate's refusal: nothing more is read or changed.
   if [[ "$rc" == 2 ]]; then result FAIL "$s" "refused by the gate (see above)"
   elif [[ "$rc" != 0 ]]; then result FAIL "$s" "the step exited $rc"; diag "$s"; fi
   return 0
 }
-steps=("$@")
-# up runs the estimate first (and stops past the ceiling).
-[[ "${steps[*]}" == all ]] && steps=("${core[@]}" "${checks[@]}" down)
-torn=0
-on_exit() {
+# check_exit: a check's EXIT trap. It lifts the AerolVM cordons the check
+# placed and did not lift (m1-lib.sh api_cordon), so a check that failed
+# or was stopped part way leaves no worker closed to new sandboxes. Not
+# when on_exit tears the run down next ($sd/.teardown-next): they go with
+# the cluster.
+check_exit() {
   local rc=$?
-  gw_keeper_stop
-  # Only a run that made something, and was not refused, is torn down.
-  if [[ "$rc" != 0 && ( "${1:-}" == all || "${M1_TEARDOWN_ON_EXIT:-0}" == 1 ) && "${M1_KEEP:-0}" != 1 && "$torn" == 0 && "$dry" != 1 &&
-        "$refused" == 0 && -f "$sd/terraform.tfstate" ]]; then
-    say "the run stopped (exit $rc): tearing down (M1_KEEP=1 keeps it)"
-    diag exit || true
-    step_down || true
-  fi
+  trap : INT TERM
+  [[ -f "$sd/.teardown-next" ]] || lift_cordons || true
+  exit "$rc"
 }
-trap 'on_exit "$*"' EXIT
+kill_tree() {
+  local kid
+  for kid in $(pgrep -P "$1" 2>/dev/null || true); do kill_tree "$kid"; done
+  kill -TERM "$1" 2>/dev/null || true
+}
+# stop_check: on_exit's first act while a check runs: TERM to the check;
+# if a foreground child still holds it after 5 s (bash runs a trap only
+# when that child ends), TERM to the whole tree.
+stop_check() {
+  [[ -n "$check_pid" ]] || return 0
+  if kill -0 "$check_pid" 2>/dev/null; then
+    kill -TERM "$check_pid" 2>/dev/null || true
+    local _
+    for _ in $(seq 1 50); do kill -0 "$check_pid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$check_pid" 2>/dev/null; then kill_tree "$check_pid"; fi
+    wait "$check_pid" 2>/dev/null || true
+  fi
+  check_pid=""
+}
+
+steps=("$@")
+# up runs the estimate first (and stops past the ceiling). run_all is read
+# here, at the top level: an EXIT trap's "$*" is the arguments of the
+# function bash exits from, not the script's, so on_exit cannot ask.
+run_all=0
+[[ "$*" == all ]] && run_all=1
+[[ "$run_all" == 1 ]] && steps=("${core[@]}" "${checks[@]}" down)
+torn=0
+stop_teardown=0
+# on_exit: whatever ends the script (a failed command in a step, a step
+# that returns non-zero, the cost limit, Ctrl-C or TERM) tears the run down
+# for `all` (and after stop_run, or with M1_TEARDOWN_ON_EXIT=1), unless
+# M1_KEEP=1. Only a cluster this process made (made_here, set just before
+# cluster.sh up) or passed the gate for: never after a refused estimate,
+# so an older cluster that used the name is not taken down. A gate that
+# refuses after this run's own up (an STS blip) does not keep it up:
+# cluster.sh down checks the account itself.
+on_exit() {
+  local rc=$? teardown=0 down_pid
+  # From here no INT or TERM stops this script: a second Ctrl-C used to end
+  # the run before down. The teardown runs as a job of its own (set -m), in
+  # its own process group, so a Ctrl-C at the terminal reaches no part of
+  # it, Terraform included (eks-bank.sh's on_exit). Its stdin is /dev/null:
+  # a job outside the terminal's group that read the terminal would stop.
+  trap - EXIT
+  trap '' INT TERM
+  if [[ "$rc" != 0 && ( "$run_all" == 1 || "$stop_teardown" == 1 || "${M1_TEARDOWN_ON_EXIT:-0}" == 1 ) &&
+        "${M1_KEEP:-0}" != 1 && "$torn" == 0 && "$dry" != 1 && -f "$sd/terraform.tfstate" ]] &&
+     [[ "$made_here" == 1 || ( "$refused" == 0 && "$gated" == 1 ) ]]; then
+    teardown=1
+    : > "$sd/.teardown-next"
+  fi
+  stop_check
+  gw_keeper_stop
+  if [[ "$teardown" == 1 ]]; then
+    say "the run stopped (exit $rc): tearing $name down (M1_KEEP=1 keeps it)"
+    set -m
+    { diag exit || true; step_down || exit 1; } < /dev/null &
+    down_pid=$!
+    set +m
+    wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL"
+  fi
+  rm -f "$sd/.teardown-next"
+  exit "$rc"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 for s in "${steps[@]}"; do
   case "$s" in
     estimate|up|setup|build|install) "step_$s" ;;
@@ -842,7 +952,7 @@ for s in "${steps[@]}"; do
     # starts only once the gate passes: a kubeconfig the gate refuses may
     # name another cluster. run_check then shows the refusal.
     kernel|switch1|shape|n1|switch2|moves|switch3|s2|variants|f10|f8|final|verifynow)
-      if ( gate ) 2>/dev/null; then gw_keeper_start; fi
+      if ( gate ) 2>/dev/null; then gated=1; gw_keeper_start; fi
       run_check "$s" ;;
     *) echo "m1-eks.sh: unknown step $s" >&2; exit 2 ;;
   esac

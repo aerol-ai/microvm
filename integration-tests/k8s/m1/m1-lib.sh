@@ -62,10 +62,24 @@ tfout() {
 # gate: every step after up talks only to the cluster cluster.sh made for
 # $name, with this machine's AWS credentials in that cluster's account. A
 # refusal changes nothing (eks-bank.sh's gate, without the bank flag).
-# A refusal never tears anything down (on_exit reads refused): it may be the
-# wrong credentials or another cluster's kubeconfig.
+# A refusal tears nothing down unless this process made the cluster
+# (on_exit reads refused and made_here): it may be the wrong credentials
+# or another cluster's kubeconfig. gated says a gate passed in this run.
 refused=0
+gated=0
 refuse() { echo "m1-eks.sh: refusing to run: $*" >&2; refused=1; exit 2; }
+# caller_account: this machine's AWS account, or "" when STS does not
+# answer. Asked up to three times: one STS blip right after up must not
+# read as other credentials.
+caller_account() {
+  local a="" try
+  for try in 1 2 3; do
+    a="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+    [[ "$a" =~ ^[0-9]{12}$ ]] && { echo "$a"; return 0; }
+    [[ "$try" == 3 ]] || sleep 2
+  done
+  echo ""
+}
 # ctx_ok: the run's kubeconfig names the run's own EKS cluster.
 ctx_ok() {
   local ctx
@@ -80,16 +94,18 @@ gate() {
   local ctx acct
   ctx="$(KUBECONFIG="$sd/kubeconfig" kubectl config current-context 2>/dev/null || true)"
   [[ "$ctx" =~ ^arn:aws:eks:us-east-1:[0-9]{12}:cluster/${name}$ ]] || refuse "the run's kubeconfig names context \"$ctx\", not EKS cluster $name"
-  acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+  acct="$(caller_account)"
+  [[ -n "$acct" ]] || refuse "STS did not answer three times: this machine's AWS account is unknown"
   [[ "$(cut -d: -f5 <<<"$ctx")" == "$acct" ]] || refuse "this machine's AWS credentials are not the cluster's account"
+  gated=1
 }
 same_account() {
   [[ "$dry" == 1 ]] && return 0
   local want got
   want="$(jq -r '.aws_account // ""' "$sd/run.tfvars.json" 2>/dev/null || true)"
   [[ -n "$want" ]] || return 0
-  got="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
-  [[ "$got" == "$want" ]] || refuse "this machine's AWS credentials are not the account $name was made in"
+  got="$(caller_account)"
+  [[ "$got" == "$want" ]] || refuse "this machine's AWS credentials (\"$got\") are not the account $name was made in"
 }
 
 # wait_until <seconds> <what> <cmd...>: polls every 5 s. A dry run waits not.
@@ -132,15 +148,30 @@ gw_keeper_start() {
   gwkeeper=$!
   echo "$gwkeeper" > "$sd/gw-keeper.pid"
 }
+# pid_runs <pid> <text>: that process is alive and its command line holds
+# text.
+pid_runs() {
+  [[ "$1" =~ ^[0-9]+$ && "$1" != "$$" ]] || return 1
+  local c
+  c="$(ps -o command= -p "$1" 2>/dev/null || true)"
+  [[ -n "$c" && "$c" == *"$2"* ]]
+}
 gw_keeper_stop() {
-  local k
+  local k f
   k="$(cat "$sd/gw-keeper.pid" 2>/dev/null || true)"
+  f="$(cat "$sd/gw-kubectl.pid" 2>/dev/null || true)"
   # A keeper already gone makes kill fail; under errexit that failure (the
   # last command of an && list) ended step_down and on_exit before the
-  # teardown (live run m1d-2). The pid files are emptied once read, so a
-  # later stop never signals a pid the system has given to another process.
-  [[ -n "$k" ]] && { kill "$k" 2>/dev/null || true; }
-  [[ -s "$sd/gw-kubectl.pid" ]] && { kill "$(cat "$sd/gw-kubectl.pid")" 2>/dev/null || true; }
+  # teardown (live run m1d-2). A pid is signalled only while it is still
+  # what this run wrote down: the keeper (a subshell of this script, so its
+  # command line is this run's m1-eks.sh <name> ...) or kubectl
+  # port-forward on this run's port with this run's kubeconfig. A pid the
+  # system has given to another process since is left alone. The files are
+  # emptied once read.
+  if [[ -n "$k" ]] && pid_runs "$k" "m1-eks.sh $name "; then kill "$k" 2>/dev/null || true; fi
+  if [[ -n "$f" ]] && pid_runs "$f" "port-forward svc/aerolvm-gateway $gw_lport:21212" && pid_runs "$f" "$sd/kubeconfig"; then
+    kill "$f" 2>/dev/null || true
+  fi
   : > "$sd/gw-keeper.pid" 2>/dev/null || true
   : > "$sd/gw-kubectl.pid" 2>/dev/null || true
   gwkeeper=""
@@ -156,11 +187,21 @@ gw_up() { # the keeper's forward answers (up to 30 s)
   return 1
 }
 gw_down() { :; }
-token() {
+# token_file: the admin token's file (0600), read once from the cluster.
+# The token itself never goes on a command line: curl reads its header
+# from auth_header (0600) and the bench pod's Secret is made from the file.
+token_file() {
   if [[ ! -s "$sd/admin-token" && "$dry" != 1 ]]; then
     ( umask 077; kr -n "$ns" get secret "$cname-admin" -o jsonpath='{.data.token}' | base64 -d | tr -d '\n' > "$sd/admin-token" )
   fi
-  [[ "$dry" == 1 ]] && echo dry || cat "$sd/admin-token"
+  echo "$sd/admin-token"
+}
+auth_header() {
+  local f="$sd/admin-auth-header"
+  if [[ ! -s "$f" ]]; then
+    ( umask 077; printf 'Authorization: Bearer %s\n' "$(cat "$(token_file)")" > "$f" )
+  fi
+  echo "$f"
 }
 # api <method> <path> [json]: prints the HTTP code, then the body. A broken
 # forward (a gateway's agent restarts in the rollout) is made again once.
@@ -169,7 +210,7 @@ api() {
   local out try
   for try in 1 2; do
     gw_up || { echo 000; echo '{"error":"no port-forward"}'; return 0; }
-    out="$(curl -sS -m 300 -w '\n%{http_code}' -X "$1" -H "Authorization: Bearer $(token)" \
+    out="$(curl -sS -m 300 -w '\n%{http_code}' -X "$1" -H "@$(auth_header)" \
       -H 'Content-Type: application/json' ${3:+-d "$3"} "http://127.0.0.1:$gw_lport$2" 2>/dev/null || true)"
     [[ "$(tail -1 <<<"$out")" != 000 ]] && break
     gw_down
@@ -247,9 +288,22 @@ helper() {
   head -1 <<<"$out"
 }
 # AerolVM's own cordon: admission only (placement skips the node, moves
-# never target it). The operator never lifts it.
-api_cordon() { api POST "/v1/cluster/nodes/$1/cordon" >/dev/null; }
-api_uncordon() { api POST "/v1/cluster/nodes/$1/uncordon" >/dev/null; }
+# never target it). The operator never lifts it, so each cordon a check
+# places is written down ($sd/check-cordons) until it lifts it, and the
+# check's exit handler (m1-eks.sh check_exit) lifts what is left: a check
+# that fails or is stopped part way leaves no worker closed.
+api_cordon() { api POST "/v1/cluster/nodes/$1/cordon" >/dev/null; echo "$1" >> "$sd/check-cordons"; }
+api_uncordon() {
+  api POST "/v1/cluster/nodes/$1/uncordon" >/dev/null
+  [[ -f "$sd/check-cordons" ]] || return 0
+  grep -vxF -- "$1" "$sd/check-cordons" > "$sd/check-cordons.new" || true
+  mv "$sd/check-cordons.new" "$sd/check-cordons"
+}
+lift_cordons() {
+  local n
+  [[ -s "$sd/check-cordons" ]] || return 0
+  for n in $(sort -u "$sd/check-cordons"); do api_uncordon "$n"; done
+}
 
 # node_sh <machine> <shell>: runs the shell as root on the machine (a node
 # debug pod, chroot /host; AL2023 has a shell) and prints its output.
@@ -276,12 +330,12 @@ verify() {
   [[ "$dry" == 1 ]] && { echo "dry-run: aerolvm k8s verify ($1), --skip-signatures (dev images)" >&2; return 0; }
   [[ -x "$sd/aerolvm" ]] || (cd "$(src_tree)" && go build -o "$sd/aerolvm" ./cmd/aerolvm)
   gw_up || true
-  KUBECONFIG="$sd/kubeconfig" SB_API_URL="http://127.0.0.1:$gw_lport" SB_PAT_TOKEN="$(token)" "$sd/aerolvm" k8s verify \
+  KUBECONFIG="$sd/kubeconfig" SB_API_URL="http://127.0.0.1:$gw_lport" SB_PAT_TOKEN="$(cat "$(token_file)")" "$sd/aerolvm" k8s verify \
     --namespace "$ns" --worker-namespace "$workers" --release "$release" --cluster "$cname" \
     --skip-signatures --probe-runtimes gvisor --probe-image "$ALPINE" > "$out" 2>&1 || rc=$?
-  local modes; modes="$(grep -i 'privilege mode' "$out" | head -3 | tr '\n' ' ')"
+  local modes; modes="$(grep -i 'privilege mode' "$out" | sed -n 1,3p | tr '\n' ' ')"
   if [[ "$rc" == 0 ]]; then result PASS "verify-$1" "aerolvm k8s verify passed; $modes"
-  else result FAIL "verify-$1" "aerolvm k8s verify exited $rc: $(grep -iE 'fail|error' "$out" | head -4 | tr '\n' ' ')"; fi
+  else result FAIL "verify-$1" "aerolvm k8s verify exited $rc: $(grep -iE 'fail|error' "$out" | sed -n 1,4p | tr '\n' ' ')"; fi
 }
 src_tree() { (cd "$K8S" && sd="$sd" bash -c 'source ./lib.sh; source_tree "$0"' "$sha"); }
 

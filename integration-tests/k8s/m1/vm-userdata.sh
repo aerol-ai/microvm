@@ -22,7 +22,12 @@ curl -fsS --retry 5 --retry-all-errors -o src.tgz "@SRC_URL@" &&
   curl -fsS --retry 5 --retry-all-errors -o kit.tgz "@KIT_URL@" || { say "staging download FAILED"; finish; exit 0; }
 mkdir -p src kit && tar -xzf src.tgz -C src && tar -xzf kit.tgz -C kit
 gov="$(awk '/^go /{print $2; exit}' src/go.mod)"
-curl -fsSL --retry 5 "https://go.dev/dl/go${gov}.linux-amd64.tar.gz" | tar -C /usr/local -xz
+# Go, unpacked only after its SHA-256 matches the one go.dev lists for it.
+curl -fsSL --retry 5 -o go.json 'https://go.dev/dl/?mode=json&include=all' &&
+  want="$(python3 -I -c 'import json, sys; print(next(f["sha256"] for r in json.load(open(sys.argv[1])) for f in r["files"] if f["filename"] == sys.argv[2]))' go.json "go${gov}.linux-amd64.tar.gz")" &&
+  curl -fsSL --retry 5 -o go.tgz "https://go.dev/dl/go${gov}.linux-amd64.tar.gz" &&
+  echo "$want  go.tgz" | sha256sum -c - >/dev/null &&
+  tar -C /usr/local -xzf go.tgz || { say "Go ${gov} download FAILED or its SHA-256 did not match"; finish; exit 0; }
 export PATH=/usr/local/go/bin:$PATH GOFLAGS=-buildvcs=false
 
 # The two WASM modules the busy mix refills (python, ruby), checked by

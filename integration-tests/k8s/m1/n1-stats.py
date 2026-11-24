@@ -9,11 +9,16 @@ per-round differences split - single with a bootstrap 95% interval (10,000
 resamples of the rounds, fixed seed). The budget (plan §3.7) is on the
 worker's create p50: +1 ms warm, +3 ms cold.
 
-Verdict per phase:
-  MEETS          the interval's top is at or under the budget
-  LIKELY MEETS   the median difference is at or under it, the interval is not
-  OVER           the interval's bottom is over the budget
-  UNCLEAR        otherwise: run more rounds
+Two tests per phase, and a phase passes only when both do:
+  p50 gap         split's p50 minus single's p50, the budget's own terms:
+                  INSIDE (at or under the budget) or OVER
+  paired median   the median per-round difference and its interval:
+    MEETS          the interval's top is at or under the budget
+    LIKELY MEETS   the median difference is at or under it, the interval is not
+    OVER           the interval's bottom is over the budget
+    UNCLEAR        otherwise: run more rounds
+The paired median alone graded run m1d-2's warm phase LIKELY MEETS (+0.80
+ms) while its p50 gap was +1.30 ms, over the +1 ms budget.
 Warm rounds where either side took over 100 ms are counted as pool misses
 and left out (reported), so a miss never reads as split's cost.
 """
@@ -82,8 +87,10 @@ def main():
             kept = [p for p in pairs if p[0][0] <= 100 and p[1][0] <= 100]
             misses = len(pairs) - len(kept)
             pairs = kept
+        p50 = {}
         for side, i in (("split", 0), ("single", 1)):
             w = [p[i][0] for p in pairs]
+            p50[side] = pct(w, 50)
             c = [p[i][1] for p in pairs]
             if w:
                 print(f"{phase:<6} {side:<6} n={len(w):<4} worker create ms p50 {pct(w, 50):8.2f} p90 {pct(w, 90):8.2f} p99 {pct(w, 99):8.2f}"
@@ -102,10 +109,13 @@ def main():
             v = "LIKELY MEETS"
         else:
             v = "UNCLEAR"
-        verdicts[phase] = v
+        gap = p50["split"] - p50["single"]
+        g = "INSIDE" if gap <= budget else "OVER"
+        verdicts[phase] = (v, g)
         extra = f"; {misses} pool-miss rounds left out" if warm else ""
         print(f"{phase:<6} split-single median {med:+.2f} ms (95% {lo:+.2f} to {hi:+.2f}), budget +{budget:g}: {v}{extra}")
-    return 0 if all(v in ("MEETS", "LIKELY MEETS") for v in verdicts.values()) else 1
+        print(f"{phase:<6} split-single p50 gap {gap:+.2f} ms ({p50['split']:.2f} - {p50['single']:.2f}), budget +{budget:g}: {g}")
+    return 0 if all(v in ("MEETS", "LIKELY MEETS") and g == "INSIDE" for v, g in verdicts.values()) else 1
 
 
 if __name__ == "__main__":

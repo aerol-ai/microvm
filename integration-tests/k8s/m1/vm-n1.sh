@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # vm-n1.sh: part B of the M1 drill: N1's WASM warm-create question on one
 # EC2 machine (the chart refuses WASM in a split worker pod, so EKS cannot
-# answer it). One m7i.xlarge, Ubuntu 24.04, us-east-1, default VPC, no
-# inbound rule and no SSH: results come back on the serial console.
+# answer it). One m7i.xlarge, Ubuntu 24.04, us-east-1, default VPC, in a
+# security group of its own with no inbound rule, no SSH: results come back
+# on the serial console.
 #
 #   vm-n1.sh <vm name>              # e.g. m1d-1-vm
 #   DRY_RUN=1 vm-n1.sh <vm name>    # print every AWS call; make nothing
@@ -17,7 +18,13 @@
 # terminates it on any exit (M1_VM_KEEP=1 leaves it to its TTL). It carries
 # the tags scripts/integration-reap.sh looks for (itest, ttl 3 h), so
 # `make integration-reap` ends it too if all else fails.
-# Settings: M1_VM_TYPE (m7i.xlarge), M1_VM_ROUNDS (15), M1_VM_BUSY (8).
+#
+# Cost guard: before anything is made, cost.py --vm-only prices the worst
+# case (the machine runs until it powers itself off, plus 10 minutes) and
+# refuses past M1_VM_CEILING ($2), or a type it has no price for unless
+# M1_PRICE_VM gives one.
+# Settings: M1_VM_TYPE (m7i.xlarge), M1_VM_TTL_MIN (170), M1_VM_CEILING (2),
+# M1_VM_ROUNDS (15), M1_VM_BUSY (8). Runs on macOS's bash 3.2 too.
 # The report: integration-tests/k8s/.state/<vm name>/vm-report.txt; the
 # verdict: n1-stats.py on it.
 set -euo pipefail
@@ -36,6 +43,10 @@ mkdir -p "$sd"
 report="$sd/vm-report.txt"
 : > "$report"
 say() { echo "[$(date -u +%T)] $*" | tee -a "$report" >&2; }
+[[ "$ttl_min" =~ ^[0-9]+$ ]] || { echo "vm-n1.sh: M1_VM_TTL_MIN must be whole minutes" >&2; exit 2; }
+# The cost guard, before any upload or launch (exit 3 past the ceiling).
+python3 -I "$HERE/cost.py" --vm-only --vm-type "$itype" --vm-ttl-min "$ttl_min" --ceiling "${M1_VM_CEILING:-2}" \
+  --hourly-out "$sd/hourly" | tee -a "$report"
 x() {
   if [[ "$dry" == 1 ]]; then printf 'dry-run:' >&2; printf ' %q' "$@" >&2; printf '\n' >&2; return 0; fi
   "$@"
@@ -75,15 +86,49 @@ if [[ "$dry" == 1 ]]; then ami=ami-dry; ttl=2099-01-01T00:00:00Z; else
   ttl="$(date -u -v+3H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+3 hours' +%Y-%m-%dT%H:%M:%SZ)"
 fi
 tags="{Key=Name,Value=$vm},{Key=aerol:run,Value=$vm},{Key=aerol:purpose,Value=m1-vm},{Key=aerol:ttl,Value=$ttl},{Key=aerol:owner,Value=itest},{Key=itest,Value=true},{Key=ttl,Value=3}"
-id=""
+id="" sg=""
+# finish_vm (on any exit): the machine terminated, then its security group
+# deleted once the machine is gone (a group in use cannot be deleted).
+# Both carry the run's tags, so leak-check.sh lists either if it is left.
+finish_vm() {
+  [[ -z "$id" ]] || x aws ec2 terminate-instances --region "$region" --instance-ids "$id" >/dev/null || true
+  [[ "$dry" == 1 || -z "$id" ]] || date +%s > "$sd/ended-at"
+  if [[ -n "$sg" ]]; then
+    [[ -z "$id" ]] || x aws ec2 wait instance-terminated --region "$region" --instance-ids "$id" || true
+    x aws ec2 delete-security-group --region "$region" --group-id "$sg" ||
+      say "security group $sg is left: aws ec2 delete-security-group --region $region --group-id $sg"
+  fi
+}
+keep_vm() {
+  [[ "$dry" == 1 || -z "$id" ]] || date +%s > "$sd/ended-at"
+  [[ -z "$sg" ]] || say "M1_VM_KEEP=1: once $id has ended, delete its group: aws ec2 delete-security-group --region $region --group-id $sg"
+}
+if [[ "${M1_VM_KEEP:-0}" == 1 ]]; then trap keep_vm EXIT; else trap finish_vm EXIT; fi
+# The VM's own security group in the default VPC: a new group has no
+# inbound rule and lets everything out (the downloads), so nothing can
+# reach the machine.
+if [[ "$dry" == 1 ]]; then
+  vpc=vpc-dry
+  x aws ec2 create-security-group --region "$region" --group-name "$vm" --vpc-id "$vpc" \
+    --description "M1 drill VM $vm: no inbound rule" --tag-specifications "ResourceType=security-group,Tags=[$tags]"
+  sg=sg-dry
+else
+  vpc="$(aws ec2 describe-vpcs --region "$region" --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)"
+  [[ "$vpc" == vpc-* ]] || { say "no default VPC in $region (got \"$vpc\")"; exit 1; }
+  sg="$(aws ec2 create-security-group --region "$region" --group-name "$vm" --vpc-id "$vpc" \
+    --description "M1 drill VM $vm: no inbound rule" --tag-specifications "ResourceType=security-group,Tags=[$tags]" \
+    --query GroupId --output text)"
+fi
 if [[ "$dry" == 1 ]]; then
   x aws ec2 run-instances --region "$region" --image-id "$ami" --instance-type "$itype" --count 1 \
+    --security-group-ids "$sg" \
     --instance-initiated-shutdown-behavior terminate --user-data "file://$sd/userdata.sh" \
     --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}' \
     --tag-specifications "ResourceType=instance,Tags=[$tags]" "ResourceType=volume,Tags=[$tags]"
   id=i-dry
 else
   id="$(aws ec2 run-instances --region "$region" --image-id "$ami" --instance-type "$itype" --count 1 \
+    --security-group-ids "$sg" \
     --instance-initiated-shutdown-behavior terminate --user-data "file://$sd/userdata.sh" \
     --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=40,VolumeType=gp3,DeleteOnTermination=true}' \
     --tag-specifications "ResourceType=instance,Tags=[$tags]" "ResourceType=volume,Tags=[$tags]" \
@@ -91,12 +136,7 @@ else
 fi
 # The running cost (m1-eks.sh cost_check) counts the VM from here to its end.
 [[ "$dry" == 1 ]] || { date +%s > "$sd/started-at"; echo "$id" > "$sd/instance-id"; }
-finish_vm() {
-  x aws ec2 terminate-instances --region "$region" --instance-ids "$id" >/dev/null 2>&1 || true
-  [[ "$dry" == 1 ]] || date +%s > "$sd/ended-at"
-}
-if [[ "${M1_VM_KEEP:-0}" == 1 ]]; then trap '[[ "$dry" == 1 ]] || date +%s > "$sd/ended-at"' EXIT; else trap finish_vm EXIT; fi
-say "instance $id"
+say "instance $id in security group $sg"
 if [[ "$dry" == 1 ]]; then
   echo "dry-run: follow aws ec2 get-console-output --instance-id $id --latest every 20 s until 'VMN1 DONE' (at most $ttl_min min)" >&2
   echo "dry-run: python3 -I $HERE/n1-stats.py $report > $sd/vm-verdict.txt" >&2
@@ -108,7 +148,8 @@ fi
 start=$(date +%s) last="" done=""
 while (( $(date +%s) - start < ttl_min * 60 )); do
   out="$(aws ec2 get-console-output --region "$region" --instance-id "$id" --latest --query Output --output text 2>/dev/null || true)"
-  mapfile -t lines < <(grep -oE '(VMN1|N1) .*' <<<"$out" | sed 's/\r$//' || true)
+  lines=()
+  while IFS= read -r l; do lines+=("$l"); done < <(grep -oE '(VMN1|N1) .*' <<<"$out" | sed 's/\r$//' || true)
   from=0
   if [[ -n "$last" ]]; then
     for (( i = ${#lines[@]} - 1; i >= 0; i-- )); do
