@@ -49,7 +49,23 @@ func (f *fakeSnapshotMoves) ReleaseForSnapshotMove(_ context.Context, id, target
 	f.mu.Lock()
 	f.lifetime = lifetime
 	f.mu.Unlock()
+	if f.releaseTo != "" {
+		return f.releaseTo
+	}
 	return "released"
+}
+
+// countCalls is how many of f's calls start with prefix.
+func (f *fakeSnapshotMoves) countCalls(prefix string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, prefix) {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *fakeSnapshotMoves) ImportMove(_ context.Context, id, source string, rc *MoveRecreate) error {
@@ -494,6 +510,59 @@ func TestPlacementWantsSnapshotMove(t *testing.T) {
 	}
 	if why := snapshotTargetFits(fc(nil), split, mover); why != "" {
 		t.Fatalf("a Firecracker move bound by the privilege mode: %q", why)
+	}
+}
+
+// Whether any other worker can restore a snapshot taken on the source:
+// only workers that could be a move's target count (alive, may own
+// sandboxes, not drained, not deleted), and one whose labels are not known
+// yet counts as one that may, never as one that cannot.
+func TestSnapshotRestorers(t *testing.T) {
+	label := func(mode string) capacity.Snapshot {
+		snap := capacity.Snapshot{HostCPUCores: 8, HostMemoryTotalMB: 16384, CPUBudget: 8, MemoryBudgetMB: 16384, CanAdmit: true}
+		if mode != "" {
+			snap.Labels = map[string]string{CheckpointMovesLabel: mode}
+		}
+		return snap
+	}
+	worker := func(id, mode string) Member {
+		return Member{NodeID: id, Alive: true, Role: config.NodeRoleWorker, Capacity: label(mode), Arch: "amd64", Version: "v1"}
+	}
+	single := Member{NodeID: "src", Alive: true, Role: config.NodeRoleWorker, Capacity: label(CheckpointMovesSingle), Arch: "amd64", Version: "v1"}
+	gvisor := Placement{SandboxID: "sb", Spec: &models.CreateSandboxRequest{Runtime: models.RuntimeGvisor}}
+	firecracker := Placement{SandboxID: "sb", Spec: &models.CreateSandboxRequest{Runtime: models.RuntimeFirecracker}}
+	for _, tc := range []struct {
+		name    string
+		p       Placement
+		members []Member
+		drained map[string]bool
+		denied  map[string]bool
+		want    string // "" when one can; else a part of why none can
+	}{
+		{"a worker of the source's mode", gvisor, []Member{single, worker("b", CheckpointMovesSplit), worker("c", CheckpointMovesSingle)}, nil, nil, ""},
+		{"every other worker split (m1d-2 switch3)", gvisor, []Member{single, worker("b", CheckpointMovesSplit), worker("c", CheckpointMovesSplit)}, nil, nil,
+			"no other worker can restore its memory (target b restores gVisor checkpoints in privilege mode split, the source saves them in single)"},
+		{"no other worker at all", gvisor, []Member{single}, nil, nil, "no other worker can take it"},
+		{"the only one of its mode is drained", gvisor, []Member{single, worker("b", CheckpointMovesSingle)}, map[string]bool{"b": true}, nil, "no other worker can take it"},
+		{"the only one of its mode was deleted", gvisor, []Member{single, worker("b", CheckpointMovesSingle)}, nil, map[string]bool{"b": true}, "no other worker can take it"},
+		{"the only one of its mode is dead", gvisor, []Member{single, func() Member { m := worker("b", CheckpointMovesSingle); m.Alive = false; return m }()}, nil, nil, "no other worker can take it"},
+		{"the only one of its mode owns no sandboxes", gvisor, []Member{single, func() Member { m := worker("b", CheckpointMovesSingle); m.Role = config.NodeRoleServer; return m }()}, nil, nil, "no other worker can take it"},
+		{"no heartbeat yet: it may", gvisor, []Member{single, {NodeID: "b", Alive: true, Role: config.NodeRoleWorker, CapacityStale: true, Arch: "amd64", Version: "v1"}}, nil, nil, ""},
+		{"no heartbeat, but another build", gvisor, []Member{single, {NodeID: "b", Alive: true, Role: config.NodeRoleWorker, CapacityStale: true, Arch: "amd64", Version: "v2"}}, nil, nil, "runs v2"},
+		{"Firecracker: a worker of the same build", firecracker, []Member{single, worker("b", "")}, nil, nil, ""},
+		{"Firecracker: every other worker on another build", firecracker, []Member{single, func() Member { m := worker("b", ""); m.Version = "v2"; return m }()}, nil, nil, "runs v2, the source v1"},
+		{"no spec", Placement{SandboxID: "sb"}, []Member{single}, nil, nil, ""},
+	} {
+		r := &snapshotRestorers{source: single, drained: tc.drained, members: tc.members, denied: tc.denied, loaded: true}
+		got := r.refusal(tc.p)
+		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+		// Kept per runtime for the pass: the fleet is read once.
+		r.members = nil
+		if again := r.refusal(tc.p); again != got {
+			t.Errorf("%s: asked again %q, first %q", tc.name, again, got)
+		}
 	}
 }
 

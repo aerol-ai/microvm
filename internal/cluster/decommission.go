@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aerol-ai/microvm/pkg/docker"
 	"github.com/aerol-ai/microvm/pkg/models"
 	"github.com/hashicorp/raft"
 )
@@ -42,6 +43,28 @@ import (
 // A move whose release or swap fails is left for the next pass. A source
 // that dies mid-decommission is no longer evacuated: the dead-owner
 // failover takes it from there.
+//
+// A sandbox that cannot move is one of the others, whatever its policy
+// asked for: it is noticed, stopped at the deadline and orphaned (a
+// recreate-policy one goes to the failover when the node is deleted). The
+// leader knows it cannot move when
+//
+//   - its placement says so: its image is kept on this node only
+//     (local_only, or built here), so no other node can run it;
+//   - no other worker can restore its snapshot (snapshotRestorers): a
+//     gVisor checkpoint of the source's privilege mode, or a build and
+//     architecture the source's snapshot fits. Checked again every pass, so
+//     a worker that joins makes it movable again;
+//   - its source refused the move for good (MoveRefusedPrefix: a warm-pool
+//     gVisor sandbox, a runtime that moves nothing by snapshot). This
+//     leader remembers that for the decommission; a new leader asks again;
+//   - the deadline passed and its move failed: past the deadline every
+//     sandbox gets one more try, and one that fails it is stopped with the
+//     rest. Before the deadline a failure is retried every pass.
+//
+// Without that, a sandbox that was counted as movable but never moved kept
+// RemainingMovable above zero, and the operator, which ends a decommission
+// past its deadline only once nothing movable is left, never ended it.
 
 // MoveHandler is the worker's half, which the leader calls on a peer over
 // its internal route and on itself directly. *service.Service implements
@@ -78,8 +101,9 @@ type EvacuateResult struct {
 	NodeID string            `json:"node_id"`
 	Moved  []string          `json:"moved,omitempty"`
 	Failed map[string]string `json:"failed,omitempty"`
-	// RemainingMovable is how many recreate-policy sandboxes are still on
-	// the node after this pass.
+	// RemainingMovable is how many sandboxes that can still move are on
+	// the node after this pass: recreate-policy and snapshot moves, less
+	// those that cannot move (see above).
 	RemainingMovable int `json:"remaining_movable"`
 	// Remaining is how many other sandboxes are still placed on it.
 	Remaining int `json:"remaining"`
@@ -100,6 +124,12 @@ const (
 	// MoveSuffix is the worker's internal move route: POST
 	// /v1/cluster/nodes/{id}/move.
 	MoveSuffix = "/move"
+	// MoveRefusedPrefix starts a source's answer to a release it refuses
+	// for good, followed by why: the sandbox cannot move from there at all,
+	// so trying again changes nothing. Any other answer that is not
+	// released or gone is an error the leader tries again. A leader from
+	// before reads it as such an error.
+	MoveRefusedPrefix = "refused: "
 )
 
 var (
@@ -177,11 +207,46 @@ func RunMoveAction(ctx context.Context, h MoveHandler, a MoveAction) (MoveAction
 type moveHandlerHolder struct {
 	mu sync.RWMutex
 	h  MoveHandler
-	// noticed is the nodes this leader has already told owners about.
-	noticed map[string]bool
+	// decom is what this leader remembers of each node it evacuates. It is
+	// not Raft state: a new leader starts empty, tells the owners again
+	// and asks each source again.
+	decom map[string]*decomMemory
 	// peers stands in for other nodes' handlers in tests: a move action
 	// for one of them runs here instead of over the internal route.
 	peers map[string]MoveHandler
+}
+
+// decomMemory is one node's: the sandboxes whose owners were told, and
+// those this leader no longer tries to move.
+type decomMemory struct {
+	noticed   map[string]bool
+	unmovable map[string]unmovableMark
+}
+
+// unmovableMark is why a sandbox no longer moves, for the lifetime it was
+// learned on: a new lifetime with the same id is asked again.
+type unmovableMark struct {
+	incarnation string
+	reason      string
+}
+
+// moveRefusedError is a move its source refused for good
+// (MoveRefusedPrefix).
+type moveRefusedError struct {
+	source, reason string
+}
+
+func (e *moveRefusedError) Error() string {
+	return e.source + " refuses to move it: " + e.reason
+}
+
+// releaseRefusal is the error for a release on source that answered r
+// instead of released.
+func releaseRefusal(source, r string) error {
+	if reason, ok := strings.CutPrefix(r, MoveRefusedPrefix); ok {
+		return &moveRefusedError{source: source, reason: reason}
+	}
+	return errors.New("release on " + source + ": " + r)
 }
 
 // AttachMoveHandler wires in the worker side (the service).
@@ -197,19 +262,85 @@ func (c *Cluster) moveHandler() MoveHandler {
 	return c.moves.h
 }
 
-// noticeOnce reports whether this leader has not told nodeID's owners yet,
-// and records that it now has.
-func (c *Cluster) noticeOnce(nodeID string) bool {
+// decomLocked is nodeID's memory, made on first use. Caller holds mu.
+func (h *moveHandlerHolder) decomLocked(nodeID string) *decomMemory {
+	if h.decom == nil {
+		h.decom = make(map[string]*decomMemory)
+	}
+	m := h.decom[nodeID]
+	if m == nil {
+		m = &decomMemory{noticed: map[string]bool{}, unmovable: map[string]unmovableMark{}}
+		h.decom[nodeID] = m
+	}
+	return m
+}
+
+// noticeOnce is those of ids whose owners this leader has not told yet
+// about nodeID's decommission, and records that it now has. A sandbox that
+// turns out not to move later in the decommission is told then.
+func (c *Cluster) noticeOnce(nodeID string, ids []string) []string {
 	c.moves.mu.Lock()
 	defer c.moves.mu.Unlock()
-	if c.moves.noticed[nodeID] {
-		return false
+	m := c.moves.decomLocked(nodeID)
+	var fresh []string
+	for _, id := range ids {
+		if !m.noticed[id] {
+			m.noticed[id] = true
+			fresh = append(fresh, id)
+		}
 	}
-	if c.moves.noticed == nil {
-		c.moves.noticed = make(map[string]bool)
+	return fresh
+}
+
+// markUnmovable records that this leader no longer tries to move p off
+// nodeID, and why.
+func (c *Cluster) markUnmovable(nodeID string, p Placement, reason string) {
+	c.moves.mu.Lock()
+	defer c.moves.mu.Unlock()
+	c.moves.decomLocked(nodeID).unmovable[p.SandboxID] = unmovableMark{incarnation: strings.TrimSpace(p.IncarnationID), reason: reason}
+}
+
+// unmovableReason is why this leader no longer tries to move p off nodeID,
+// or "" when it still does.
+func (c *Cluster) unmovableReason(nodeID string, p Placement) string {
+	c.moves.mu.RLock()
+	defer c.moves.mu.RUnlock()
+	m := c.moves.decom[nodeID]
+	if m == nil {
+		return ""
 	}
-	c.moves.noticed[nodeID] = true
-	return true
+	mark, ok := m.unmovable[p.SandboxID]
+	if !ok || mark.incarnation != strings.TrimSpace(p.IncarnationID) {
+		return ""
+	}
+	return mark.reason
+}
+
+// keepDecommission forgets what this leader remembers of nodeID's
+// sandboxes that are not in owned, and all of nodeID with owned nil (the
+// node was deleted), so the memory stays as large as the sandboxes still on
+// nodes being evacuated.
+func (c *Cluster) keepDecommission(nodeID string, owned map[string]bool) {
+	c.moves.mu.Lock()
+	defer c.moves.mu.Unlock()
+	m := c.moves.decom[nodeID]
+	if m == nil {
+		return
+	}
+	if owned == nil {
+		delete(c.moves.decom, nodeID)
+		return
+	}
+	for id := range m.noticed {
+		if !owned[id] {
+			delete(m.noticed, id)
+		}
+	}
+	for id := range m.unmovable {
+		if !owned[id] {
+			delete(m.unmovable, id)
+		}
+	}
 }
 
 // moveCall runs a move action on node m: locally when it is this node.
@@ -242,7 +373,8 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 	if nodeID == "" {
 		return res, errors.New("cluster: node id required")
 	}
-	if !c.fsm.drainedNodesSnapshot()[nodeID] {
+	drained := c.fsm.drainedNodesSnapshot()
+	if !drained[nodeID] {
 		return res, ErrNodeNotDrained
 	}
 	source, ok := c.gossip.lookupMember(nodeID)
@@ -261,72 +393,100 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 	if req.DeadlineUnix > 0 {
 		deadline = time.Unix(req.DeadlineUnix, 0)
 	}
+	restorers := &snapshotRestorers{c: c, source: source, drained: drained}
 
-	var movable []Placement
+	var movable []evacuee
 	var others []string
 	othersLifetimes := make(map[string]string)
+	stays := func(p Placement) {
+		others = append(others, p.SandboxID)
+		if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
+			othersLifetimes[p.SandboxID] = inc
+		}
+	}
+	notMoved := func(id, why string) {
+		if res.Failed == nil {
+			res.Failed = make(map[string]string)
+		}
+		res.Failed[id] = "not moved: " + why
+	}
 	for _, id := range c.fsm.idsOwnedBy(nodeID) {
 		p, ok := c.fsm.get(id)
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID || p.IsDeleting() {
 			continue
 		}
-		if placementRebuildsElsewhere(p) || placementWantsSnapshotMove(p, source) {
-			movable = append(movable, p)
-		} else {
-			if refusal := hostOnlyRefusal(p); refusal != nil && placementWantsFailoverRecreate(p) {
-				// Refused up front: another node would not rebuild it
-				// (rebuild_refusal.go). It stays with the others below.
-				if res.Failed == nil {
-					res.Failed = make(map[string]string)
-				}
-				res.Failed[id] = "not moved: " + refusal.Error()
-			}
-			others = append(others, id)
-			if inc := strings.TrimSpace(p.IncarnationID); inc != "" {
-				othersLifetimes[id] = inc
-			}
+		kind, why := c.evacuationOf(p, source, restorers)
+		if kind != evacuateStays {
+			movable = append(movable, evacuee{p: p, kind: kind})
+			continue
 		}
+		if why != "" {
+			notMoved(id, why)
+		}
+		stays(p)
 	}
-	sort.Slice(movable, func(i, j int) bool { return movable[i].SandboxID < movable[j].SandboxID })
-	sort.Strings(others)
+	sort.Slice(movable, func(i, j int) bool { return movable[i].p.SandboxID < movable[j].p.SandboxID })
 
 	// Moves run side by side: the slow part is each target's image pull.
 	batch := movable[:min(limit, len(movable))]
 	type outcome struct {
-		id  string
+		p   Placement
 		err error
 	}
 	results := make(chan outcome, len(batch))
 	var wg sync.WaitGroup
-	for _, p := range batch {
+	for _, e := range batch {
 		wg.Add(1)
-		go func(p Placement) {
+		go func(e evacuee) {
 			defer wg.Done()
 			move := c.moveOne
-			if placementWantsSnapshotMove(p, source) {
+			if e.kind == evacuateSnapshot {
 				move = c.moveSnapshotOne
 			}
-			results <- outcome{id: p.SandboxID, err: move(ctx, p, source)}
-		}(p)
+			results <- outcome{p: e.p, err: move(ctx, e.p, source)}
+		}(e)
 	}
 	wg.Wait()
 	close(results)
 	for o := range results {
-		if o.err != nil {
+		id := o.p.SandboxID
+		if o.err == nil {
+			res.Moved = append(res.Moved, id)
+			decommissionMoves.Add("moved", 1)
+			continue
+		}
+		decommissionMoves.Add("failed", 1)
+		var refused *moveRefusedError
+		switch {
+		case errors.As(o.err, &refused):
+			// Trying again changes nothing: it does not move, from now on.
+			c.markUnmovable(nodeID, o.p, refused.Error())
+			decommissionMoves.Add("refused", 1)
+			c.logger.Info("cluster: decommission: a sandbox cannot move; it stops at the deadline", "node_id", nodeID, "sandbox_id", id, "err", o.err)
+			notMoved(id, refused.Error())
+			stays(o.p)
+		case req.StopRemaining && ctx.Err() == nil:
+			// Its last try, past the deadline, failed: it stops now with the
+			// rest. A pass cut short by its caller (ctx) is not a try.
+			why := "its move past the deadline failed: " + o.err.Error()
+			c.markUnmovable(nodeID, o.p, why)
+			decommissionMoves.Add("given_up", 1)
+			c.logger.Warn("cluster: decommission: a sandbox did not move by the deadline; it stops with the rest", "node_id", nodeID, "sandbox_id", id, "err", o.err)
+			notMoved(id, why)
+			stays(o.p)
+		default:
+			// Before the deadline: the next pass tries again.
 			if res.Failed == nil {
 				res.Failed = make(map[string]string)
 			}
-			res.Failed[o.id] = o.err.Error()
-			decommissionMoves.Add("failed", 1)
-			continue
+			res.Failed[id] = o.err.Error()
 		}
-		res.Moved = append(res.Moved, o.id)
-		decommissionMoves.Add("moved", 1)
 	}
 	sort.Strings(res.Moved)
+	sort.Strings(others)
 
-	if len(others) > 0 && c.noticeOnce(nodeID) {
-		out, err := c.moveCall(ctx, source, MoveAction{Action: "notice", IDs: others, DeadlineUnix: deadline.Unix()})
+	if fresh := c.noticeOnce(nodeID, others); len(fresh) > 0 {
+		out, err := c.moveCall(ctx, source, MoveAction{Action: "notice", IDs: fresh, DeadlineUnix: deadline.Unix()})
 		if err != nil {
 			// Told on the next leader's pass, or not at all: the notice is
 			// a courtesy, the deadline stop still comes.
@@ -346,21 +506,91 @@ func (c *Cluster) EvacuateNode(ctx context.Context, nodeID string, req EvacuateR
 		}
 	}
 
+	owned := make(map[string]bool)
 	for _, id := range c.fsm.idsOwnedBy(nodeID) {
 		p, ok := c.fsm.get(id)
 		if !ok || strings.TrimSpace(p.OwnerNodeID) != nodeID {
 			continue
 		}
-		if placementRebuildsElsewhere(p) || placementWantsSnapshotMove(p, source) {
+		owned[id] = true
+		if kind, _ := c.evacuationOf(p, source, restorers); kind != evacuateStays {
 			res.RemainingMovable++
 		} else {
 			res.Remaining++
 		}
 	}
+	c.keepDecommission(nodeID, owned)
 	res.Done = res.RemainingMovable == 0 && res.Remaining == 0
 	c.logger.Info("cluster: decommission pass", "node_id", nodeID, "moved", len(res.Moved), "failed", len(res.Failed),
 		"remaining_movable", res.RemainingMovable, "remaining", res.Remaining, "stopped", res.Stopped)
 	return res, nil
+}
+
+// evacuation is how a decommission pass treats one sandbox.
+type evacuation int
+
+const (
+	// evacuateStays: one of the others, noticed, stopped at the deadline
+	// and orphaned when the node is deleted.
+	evacuateStays evacuation = iota
+	// evacuateRecreate: moveOne, stopped here and recreated on the target.
+	evacuateRecreate
+	// evacuateSnapshot: moveSnapshotOne, moved with its memory.
+	evacuateSnapshot
+)
+
+// evacuee is a sandbox a pass moves, and how.
+type evacuee struct {
+	p    Placement
+	kind evacuation
+}
+
+// evacuationOf is how a pass treats p on source, and, for a sandbox that
+// asked to move but cannot, why not (see the package comment above). Both
+// counts of a pass, and the move it makes, read it, so a sandbox that
+// cannot move is never counted as movable.
+func (c *Cluster) evacuationOf(p Placement, source Member, restorers *snapshotRestorers) (evacuation, string) {
+	kind := evacuateStays
+	switch {
+	case placementRebuildsElsewhere(p):
+		kind = evacuateRecreate
+	case placementWantsSnapshotMove(p, source):
+		kind = evacuateSnapshot
+	default:
+		if refusal := hostOnlyRefusal(p); refusal != nil && placementWantsFailoverRecreate(p) {
+			// Refused up front: another node would not rebuild it
+			// (rebuild_refusal.go).
+			return evacuateStays, refusal.Error()
+		}
+		return evacuateStays, ""
+	}
+	if why := c.unmovableReason(source.NodeID, p); why != "" {
+		return evacuateStays, why
+	}
+	if why := imageStaysOn(p, source.NodeID); why != "" {
+		return evacuateStays, why
+	}
+	if kind == evacuateSnapshot {
+		if why := restorers.refusal(p); why != "" {
+			return evacuateStays, why
+		}
+	}
+	return kind, ""
+}
+
+// imageStaysOn is why p's image runs only on nodeID, or "": no target
+// selection takes it elsewhere (selectRecreationTargetAvoiding).
+func imageStaysOn(p Placement, nodeID string) string {
+	if p.Spec == nil {
+		return ""
+	}
+	if p.Spec.ImageDistributionMode == models.ImageDistributionLocalOnly {
+		return "its image is kept on this node only (image distribution local_only)"
+	}
+	if node, ok := docker.BuiltImagePlacementNode(p.Spec.Image); ok && node == nodeID {
+		return "its image was built on this node and is kept there only"
+	}
+	return ""
 }
 
 // releaseAction is the action that stops p on its source, naming the
@@ -404,7 +634,7 @@ func (c *Cluster) moveOne(ctx context.Context, p Placement, source Member) error
 		return err
 	}
 	if r := out.Results[p.SandboxID]; r != "released" && r != "gone" {
-		return errors.New("release on " + source.NodeID + ": " + r)
+		return releaseRefusal(source.NodeID, r)
 	}
 	return c.applyCommand(ctx, command{
 		Op:                     opReassign,
