@@ -34,6 +34,12 @@ type hostHelper interface {
 	OpenHost(ctx context.Context, kind rootdpb.HostKind, id string, pid int, ticks uint64) (*rootclient.HostProcess, error)
 }
 
+// mountLender is the helper's loan of a WASM sandbox's mount points
+// (*rootclient.Client).
+type mountLender interface {
+	GrantWasmMounts(ctx context.Context, sandboxID string, kind rootdpb.HostKind, hostID string) (int, error)
+}
+
 // splitWorkerdLauncher is the V8-isolate driver's jail launcher in split
 // mode (pkg/isolate JailLauncher): the helper builds each group's jail and
 // runs its workerd; sandboxd keeps the group's servers and config in the
@@ -141,6 +147,34 @@ func (l splitWasmLauncher) Launch(ctx context.Context, key, socketPath, cacheDir
 			key, resp.GetSocket(), socketPath)
 	}
 	return l.h.HoldHost(l.kind, key, int(resp.GetPid()), resp.GetStartTicks()), nil
+}
+
+// splitMountLender has the helper lend a WASM sandbox's mount points to the
+// host that serves it (GrantWasmMounts, M1 PR 15), which sandboxd names by
+// the socket the helper serves it on in socketDir (worker.GrantPolicy
+// Lend): sandboxd cannot reach the helper's mount points to pass them.
+func splitMountLender(h mountLender, socketDir string) func(ctx context.Context, sandboxID, socket string) error {
+	return func(ctx context.Context, sandboxID, socket string) error {
+		kind, id, ok := rootpolicy.WasmHostOfSocket(socketDir, socket)
+		if !ok {
+			return fmt.Errorf("%s is not a socket the root helper serves a WASM host on (%s)", socket, socketDir)
+		}
+		wire := rootdpb.HostKind_HOST_KIND_WASM_WORKER
+		if kind == rootpolicy.HostWasmResident {
+			wire = rootdpb.HostKind_HOST_KIND_WASM_RESIDENT
+		}
+		_, err := h.GrantWasmMounts(ctx, sandboxID, wire, id)
+		return err
+	}
+}
+
+// splitSlotSocket is the socket of a WASM warm-pool slot's worker in split
+// mode: a WASM worker host of the helper's, named by the slot's id, which
+// the helper serves in socketDir (rootpolicy.WasmHostSocket).
+func splitSlotSocket(socketDir string) func(slotID string) (string, error) {
+	return func(slotID string) (string, error) {
+		return rootpolicy.WasmHostSocket(socketDir, rootpolicy.HostWasmWorker, slotID)
+	}
 }
 
 // splitWasmWorkers lists the WASM hosts the helper holds, for boot adoption

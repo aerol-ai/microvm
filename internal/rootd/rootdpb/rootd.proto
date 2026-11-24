@@ -284,6 +284,19 @@ service RootHelper {
   // it out, with checks of its own.
   rpc HandOutFirecrackerFiles(FirecrackerFilesRequest) returns (FirecrackerFilesResponse);
 
+  // GrantWasmMounts lends a WASM sandbox's external mounts to the WASM
+  // host that serves it (M1 PR 15). A WASM guest reaches a mount through
+  // its mount point, opened and passed to its host as a folder. In
+  // privilege mode single sandboxd does that as root; in split it cannot
+  // reach the helper's mount points, so the helper does. The agent names
+  // the sandbox and the host, never a path: the helper asks the host, on
+  // the socket it serves the host on, whether it holds that sandbox, and
+  // only then opens each of the sandbox's mount points it holds itself,
+  // by the path it built, without entering the mount, and passes them
+  // over the same socket. Safe to retry and to repeat: a later loan
+  // replaces an earlier one.
+  rpc GrantWasmMounts(GrantWasmMountsRequest) returns (GrantWasmMountsResponse);
+
   // The calls below are gVisor checkpoint moves (M1 PR 13; C21 of the
   // Kubernetes plan): a running gVisor sandbox moves to another worker
   // with its memory. On the source the helper runs runsc checkpoint, which
@@ -1091,6 +1104,21 @@ message FirecrackerFilesRequest {
 }
 
 message FirecrackerFilesResponse {}
+
+message GrantWasmMountsRequest {
+  // The sandbox whose mounts are lent.
+  string sandbox_id = 1;
+  // The host that serves it: WASM_WORKER (its own worker, or the warm-pool
+  // slot's it took) or WASM_RESIDENT, by the id SpawnHost named it.
+  HostKind kind = 2;
+  string host_id = 3;
+}
+
+message GrantWasmMountsResponse {
+  // How many mount points went to the host; 0 when the sandbox has none
+  // here.
+  uint32 granted = 1;
+}
 
 message CheckpointMoveRequest {
   // The sandbox: its containerd container, run by the gVisor shim in the

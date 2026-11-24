@@ -21,6 +21,11 @@ type ContainerBind struct {
 	// recreated: a live mount is never restarted under it, since rclone may
 	// hold writes it has not flushed.
 	RootOnly bool
+	// Lent marks a mount point the root helper keeps (privilege mode
+	// split, NewRemote): sandboxd cannot reach it, so a WASM worker is lent
+	// it by the helper, never passed it by sandboxd (pkg/wasm/worker
+	// lend.go). A container's runtime binds it as any other.
+	Lent bool
 }
 
 // TmpfsOptions returns the mount options for a Tmpfs bind.

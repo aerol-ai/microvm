@@ -64,7 +64,41 @@ func (f *fakeHostHelper) OpenHost(_ context.Context, _ rootdpb.HostKind, id stri
 	return f.held, f.err
 }
 
+func (f *fakeHostHelper) GrantWasmMounts(_ context.Context, sandboxID string, kind rootdpb.HostKind, hostID string) (int, error) {
+	f.note("lend " + sandboxID + " " + rootdpb.HostKindName(kind) + " " + hostID)
+	return 1, f.err
+}
+
 func fmtU(n uint64) string { return strconv.FormatUint(n, 10) }
+
+// TestSplitMountLender: sandboxd names the host to lend a sandbox's mounts
+// to by the socket it dials, which must be one the helper serves a WASM
+// host on.
+func TestSplitMountLender(t *testing.T) {
+	f := &fakeHostHelper{}
+	lend := splitMountLender(f, "/run/aerolvm-rootd/wasm")
+	ctx := context.Background()
+	for _, sock := range []string{"/run/aerolvm-rootd/wasm/w-sb-1.sock", "/run/aerolvm-rootd/wasm/r-o0123456789abcdef-b.sock"} {
+		if err := lend(ctx, "sb-1", sock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !slices.Equal(f.calls, []string{"lend sb-1 wasm_worker sb-1", "lend sb-1 wasm_resident o0123456789abcdef-b"}) {
+		t.Fatalf("calls %v", f.calls)
+	}
+	for _, bad := range []string{"/var/lib/sandboxd/wasm/run/sockets/sb-1.sock", "/run/aerolvm-rootd/wasm/w-../x.sock", "/run/aerolvm-rootd/wasm/x.sock"} {
+		if err := lend(ctx, "sb-1", bad); err == nil {
+			t.Errorf("lent through %s", bad)
+		}
+	}
+	if len(f.calls) != 2 {
+		t.Fatalf("calls %v", f.calls)
+	}
+	f.err = errors.New("helper down")
+	if err := lend(ctx, "sb-1", "/run/aerolvm-rootd/wasm/w-sb-1.sock"); !errors.Is(err, f.err) {
+		t.Fatalf("lend = %v", err)
+	}
+}
 
 func TestSplitWorkerdLauncher(t *testing.T) {
 	ctx := context.Background()
@@ -257,5 +291,30 @@ func TestWireWasmRuntimeSplit(t *testing.T) {
 	}
 	if !slices.Contains(f.calls, "list") {
 		t.Fatalf("boot adoption did not ask the helper: %v", f.calls)
+	}
+}
+
+// TestWireWasmWarmPoolSplit: in privilege mode split the WASM warm pool is
+// wired (M1 PR 15), each slot's worker on the helper's socket for the
+// slot's id.
+func TestWireWasmWarmPoolSplit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := openTestStore(t)
+	svc := service.New(config.Config{}, testLogger(), st, nil, nil, nil, nil, nil, nil)
+	pool := wireWasmRuntime(ctx, config.Config{
+		WasmRunDir: t.TempDir(), WasmModulesDir: t.TempDir(), WasmEngine: "wazero", WasmPoolEnabled: true, WasmPoolDepthDefault: 1,
+		WasmWorkerUID: 61000, WasmWorkerGID: 61000, RootdWasmSocketDir: "/run/aerolvm-rootd/wasm",
+	}, testLogger(), svc, st, &fakeHostHelper{})
+	if pool == nil {
+		t.Fatal("no warm pool in split")
+	}
+	defer pool.Close()
+	sock := splitSlotSocket("/run/aerolvm-rootd/wasm")
+	if got, err := sock("pool-0123456789abcdef"); err != nil || got != "/run/aerolvm-rootd/wasm/w-pool-0123456789abcdef.sock" {
+		t.Fatalf("slot socket %q %v", got, err)
+	}
+	if _, err := sock("../x"); err == nil {
+		t.Fatal("a socket for a bad slot id")
 	}
 }

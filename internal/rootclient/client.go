@@ -683,6 +683,9 @@ var retrySafe = map[string]bool{
 	// already as done, and a hand-out sets the same group and mode again.
 	rootdpb.FeatureShareFirecrackerFiles:   true,
 	rootdpb.FeatureHandOutFirecrackerFiles: true,
+	// A WASM sandbox's mount points lent again (M1 PR 15) replace the
+	// host's earlier loan of the same folders.
+	rootdpb.FeatureGrantWasmMounts: true,
 	// gVisor checkpoint moves (M1 PR 13). StagedMove is a read and
 	// DropMove "make sure it is gone". CheckpointMove is not tried again:
 	// runsc ends the sandbox once it is saved, so a second try finds no

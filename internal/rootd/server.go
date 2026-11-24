@@ -169,6 +169,10 @@ type Options struct {
 	TapSysctls func() error
 	// hostLaunchers stand in for the kinds' own parts in tests.
 	hostLaunchers map[rootpolicy.HostKind]hostLauncher
+	// wasmOpenPoint and wasmLend stand in for the kernel and the WASM host
+	// in GrantWasmMounts' tests (wasm_mounts.go).
+	wasmOpenPoint func(root, sandboxID string, index int) (*os.File, error)
+	wasmLend      func(ctx context.Context, socket, sandboxID string, paths []string, files []*os.File) error
 	// reassertEvery paces both firewalls' re-assert timers. Zero:
 	// defaultReassertEvery. Tests make it short; it is fixed once the
 	// server is built, as each timer's goroutine reads it.
@@ -293,7 +297,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
 		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts, tc: s.taps, gf: s.gf,
-		mv: mv})
+		wm: newWasmMountCalls(cfg, opts, mc, s.hosts, log), mv: mv})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -548,6 +552,9 @@ type helper struct {
 	// nil without Firecracker.
 	tc *tapCalls
 	gf *guestFirewall
+	// wm lends WASM sandboxes' mount points to their hosts; nil unless the
+	// helper serves both mounts and WASM hosts.
+	wm *wasmMountCalls
 	// mv serves gVisor checkpoint moves; nil without them.
 	mv *moveCalls
 }
@@ -588,6 +595,9 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 	}
 	if h.hc.firecracker() != nil {
 		served = append(served, firecrackerFileFeatures...)
+	}
+	if h.wm != nil {
+		served = append(served, rootdpb.FeatureGrantWasmMounts)
 	}
 	if h.mv != nil {
 		served = append(served, moveFeatures...)
@@ -965,6 +975,15 @@ func (h helper) HandOutFirecrackerFiles(ctx context.Context, req *rootdpb.Firecr
 	}
 	resp, err := h.hc.handOutFirecrackerFiles(ctx, req)
 	return answer(ctx, h, rootdpb.RootHelper_HandOutFirecrackerFiles_FullMethodName, resp, err)
+}
+
+func (h helper) GrantWasmMounts(ctx context.Context, req *rootdpb.GrantWasmMountsRequest) (*rootdpb.GrantWasmMountsResponse, error) {
+	if h.wm == nil {
+		return nil, status.Errorf(codes.Unimplemented, "root helper %s: %s needs a mount user and WASM hosts in its own settings",
+			version.Version, rootdpb.FeatureGrantWasmMounts)
+	}
+	resp, err := h.wm.grant(ctx, req)
+	return answer(ctx, h, rootdpb.RootHelper_GrantWasmMounts_FullMethodName, resp, err)
 }
 
 func (h helper) CheckpointMove(ctx context.Context, req *rootdpb.CheckpointMoveRequest) (*rootdpb.CheckpointMoveResponse, error) {

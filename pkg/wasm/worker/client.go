@@ -268,11 +268,17 @@ func (c *Client) Instantiate(sandboxID string, caps wasmengine.Capabilities) err
 	if err != nil {
 		return err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgInstantiate, SandboxID: sandboxID, Payload: body}, preopenPaths(caps)...)
+	paths, lent := lentGrants(caps, preopenPaths(caps))
+	reply, err := c.roundTrip(Envelope{Type: MsgInstantiate, SandboxID: sandboxID, Payload: body}, paths...)
 	if err != nil {
 		return err
 	}
-	return c.expectOK(reply)
+	if err := c.expectOK(reply); err != nil {
+		return err
+	}
+	// The worker holds the sandbox from here: the helper lends to no one
+	// else.
+	return c.lend(context.Background(), lent, sandboxID)
 }
 
 // Exec re-instantiates with caps, invokes export, and returns captured IO.
@@ -281,7 +287,11 @@ func (c *Client) Exec(sandboxID string, caps wasmengine.Capabilities, export str
 	if err != nil {
 		return wasmengine.RunResult{}, err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgExec, SandboxID: sandboxID, Payload: body}, preopenPaths(caps)...)
+	paths, lent := lentGrants(caps, preopenPaths(caps))
+	if err := c.lend(context.Background(), lent, sandboxID); err != nil {
+		return wasmengine.RunResult{}, err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgExec, SandboxID: sandboxID, Payload: body}, paths...)
 	if err != nil {
 		return wasmengine.RunResult{}, err
 	}
@@ -342,11 +352,15 @@ func (c *Client) Restore(sandboxID, dir string, caps wasmengine.Capabilities) er
 		return err
 	}
 	files := wasmengine.SnapshotFiles(dir)
-	reply, err := c.roundTripStrict(Envelope{Type: MsgRestore, SandboxID: sandboxID, Payload: body}, append(preopenPaths(caps), files...), files)
+	paths, lent := lentGrants(caps, preopenPaths(caps))
+	reply, err := c.roundTripStrict(Envelope{Type: MsgRestore, SandboxID: sandboxID, Payload: body}, append(paths, files...), files)
 	if err != nil {
 		return err
 	}
-	return c.expectOK(reply)
+	if err := c.expectOK(reply); err != nil {
+		return err
+	}
+	return c.lend(context.Background(), lent, sandboxID)
 }
 
 // SetCapability hot-updates memory/wall-timeout caps on a running instance.
@@ -355,7 +369,11 @@ func (c *Client) SetCapability(sandboxID string, caps wasmengine.Capabilities) e
 	if err != nil {
 		return err
 	}
-	reply, err := c.roundTrip(Envelope{Type: MsgSetCapability, SandboxID: sandboxID, Payload: body}, preopenPaths(caps)...)
+	paths, lent := lentGrants(caps, preopenPaths(caps))
+	if err := c.lend(context.Background(), lent, sandboxID); err != nil {
+		return err
+	}
+	reply, err := c.roundTrip(Envelope{Type: MsgSetCapability, SandboxID: sandboxID, Payload: body}, paths...)
 	if err != nil {
 		return err
 	}

@@ -197,3 +197,28 @@ func WasmHostSocket(dir string, kind HostKind, id string) (string, error) {
 	}
 	return p, nil
 }
+
+// WasmHostOfSocket reads a WASM host's kind and id back from the socket
+// WasmHostSocket named for it in dir: ok only for a socket it would name.
+func WasmHostOfSocket(dir, socket string) (HostKind, string, bool) {
+	if path.Dir(socket) != path.Clean(dir) {
+		return "", "", false
+	}
+	name, ok := strings.CutSuffix(path.Base(socket), ".sock")
+	if !ok {
+		return "", "", false
+	}
+	var kind HostKind
+	var id string
+	if id, ok = strings.CutPrefix(name, "w-"); ok {
+		kind = HostWasmWorker
+	} else if id, ok = strings.CutPrefix(name, "r-"); ok {
+		kind = HostWasmResident
+	} else {
+		return "", "", false
+	}
+	if p, err := WasmHostSocket(dir, kind, id); err != nil || p != socket {
+		return "", "", false
+	}
+	return kind, id, true
+}

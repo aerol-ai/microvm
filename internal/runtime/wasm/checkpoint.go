@@ -31,9 +31,6 @@ func (d *Driver) checkpointSandbox(ctx context.Context, sandbox *models.Sandbox,
 	if sandbox == nil {
 		return "", "", fmt.Errorf("checkpoint: nil sandbox")
 	}
-	if err := d.splitCheckpointGap(); err != nil {
-		return "", "", err
-	}
 	inst, err := d.instance(sandbox.ID)
 	if err != nil {
 		return "", "", err

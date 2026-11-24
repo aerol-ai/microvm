@@ -75,13 +75,12 @@ func checkPrivilegeMode(cfg config.Config) error {
 			"set SB_ISOLATE_USE_JAIL=true, or run this node in privilege mode single")
 	}
 	// WASM workers and resident hosts are the helper's from M1 PR 9 too
-	// (split_hosts.go), shared with sandboxd by the worker user's group.
+	// (split_hosts.go), shared with sandboxd by the worker user's group;
+	// from M1 PR 15 so are the warm pool's slot workers, each a worker host
+	// by its slot's id (wasm_wiring.go).
 	if cfg.EnableWasm {
 		if err := checkSplitWasm(cfg); err != nil {
 			return err
-		}
-		if warmPoolEffectivelyEnabled(cfg) {
-			gaps = append(gaps, privmode.StepWasmWarmPool)
 		}
 	}
 	// Firecracker VMs are the helper's from M1 PR 9b (split_firecracker.go):

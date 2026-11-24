@@ -76,6 +76,9 @@ const (
 	FeatureShareFirecrackerFiles   = "ShareFirecrackerFiles"
 	FeatureHandOutFirecrackerFiles = "HandOutFirecrackerFiles"
 
+	// A WASM sandbox's external mounts, lent to its host (M1 PR 15).
+	FeatureGrantWasmMounts = "GrantWasmMounts"
+
 	// gVisor checkpoint moves (M1 PR 13). ExportMove and ImportMove are the
 	// helper's two streaming calls.
 	FeatureCheckpointMove = "CheckpointMove"
@@ -140,6 +143,7 @@ func Features() []string {
 		FeatureEnsureTap, FeatureRemoveTap, FeatureMakeFilesystem,
 		FeatureEnsureGuestFirewall, FeatureSetGuestNodeGuard, FeatureSetGuestEgressFloor, FeatureGuestRules,
 		FeatureShareFirecrackerFiles, FeatureHandOutFirecrackerFiles,
+		FeatureGrantWasmMounts,
 		FeatureCheckpointMove, FeatureExportMove, FeatureImportMove, FeatureStagedMove, FeatureDropMove}
 }
 

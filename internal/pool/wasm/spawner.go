@@ -3,7 +3,6 @@ package wasm
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/aerol-ai/microvm/pkg/wasm/worker"
@@ -43,7 +42,9 @@ func (s *SupervisorSpawner) Warm(ctx context.Context, slotID, socketPath, module
 		memoryMB = s.MemoryMB
 	}
 	if s.CompileCache != nil {
-		if dir := s.CompileCache(filepath.Dir(socketPath)); dir != "" {
+		// Keyed by the slot's own folder: in privilege mode split every
+		// slot's socket is in the root helper's one folder.
+		if dir := s.CompileCache(slotDirFrom(ctx, socketPath)); dir != "" {
 			ctx = worker.WithCompileCache(ctx, dir)
 		}
 	}
