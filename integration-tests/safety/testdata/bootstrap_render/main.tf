@@ -396,6 +396,123 @@ output "joiner_join_privilege_split" {
   }))
 }
 
+# Split with each runtime (TestBootstrapSplitRunsEveryRuntime). Firecracker
+# takes nodes.tf's split values (Terraform/privilege_mode.tf): the kernel in
+# root's folder and no jailer ids, so install.sh's sandboxd-jailer user runs
+# the VMs. V8 isolates, WASM and the containerd warm pool take nothing new.
+output "joiner_join_privilege_split_firecracker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                 = false
+    role                    = "worker"
+    one_line_join           = true
+    join_token              = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg          = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    with_firecracker        = true
+    firecracker_kernel_path = "/usr/local/lib/aerolvm-firecracker/vmlinux"
+    firecracker_use_jailer  = true
+    firecracker_jailer_uid  = null
+    firecracker_jailer_gid  = null
+  }))
+}
+
+output "joiner_join_privilege_split_isolate" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    one_line_join  = true
+    join_token     = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    with_isolate   = true
+  }))
+}
+
+output "joiner_join_privilege_split_wasm" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    one_line_join  = true
+    join_token     = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    wasm_cfg       = { enabled = "true", cache_dir = "/var/lib/sandboxd/wasm/cache", modules_dir = "/var/lib/sandboxd/wasm/modules", pool_depth_default = "2", pool_enabled = "true", pull_timeout = "60s", push_host = "", registry_allowlist = "", registry_pat_path = "", registry_username = "", standard_modules = "" }
+  }))
+}
+
+output "joiner_join_privilege_split_pool" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed             = false
+    one_line_join       = true
+    join_token          = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg      = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    containerd_pool_cfg = { enabled = "true", depth = "2", images = "", max_images = "8", idle_ttl = "15m", refill_interval = "5s" }
+  }))
+}
+
+# A split node with everything on that writes files: the AOCR keys, the shared
+# SSH host key, Firecracker at its real folders, WASM, the warm pool, V8
+# isolates. TestBootstrapSplitRootStaysOutOfAgentFolders reads every command
+# in it for a root action inside a folder sandboxd's user owns.
+locals {
+  everything = {
+    is_seed                        = false
+    role                           = "worker"
+    one_line_join                  = true
+    join_token                     = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg                 = { socket = "/run/containerd/containerd.sock", namespace = "aerolvm", cni_plugin_dir = "/opt/cni/bin", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    container_engine               = "containerd"
+    with_firecracker               = true
+    with_isolate                   = true
+    with_gvisor                    = true
+    firecracker_auto_install       = true
+    firecracker_binary_url         = ""
+    firecracker_jailer_url         = ""
+    firecracker_kernel_url         = ""
+    firecracker_kernel_config_url  = ""
+    firecracker_binary_path        = "/usr/local/bin/firecracker"
+    firecracker_jailer_path        = "/usr/local/bin/jailer"
+    firecracker_kernel_path        = "/usr/local/lib/aerolvm-firecracker/vmlinux"
+    firecracker_run_dir            = "/run/sandboxd/firecracker"
+    firecracker_templates_dir      = "/var/lib/sandboxd/firecracker/templates"
+    firecracker_use_jailer         = true
+    firecracker_jailer_chroot_base = "/srv/jailer"
+    firecracker_jailer_uid         = null
+    firecracker_jailer_gid         = null
+    aocr_enabled                   = true
+    aocr_upstream_wrap_key         = "d3JhcA=="
+    aocr_cluster_pat               = "pat"
+    ssh_host_key_pem               = "-----BEGIN OPENSSH PRIVATE KEY-----\nFAKE\n-----END OPENSSH PRIVATE KEY-----"
+    wasm_cfg                       = { enabled = "true", cache_dir = "/var/lib/sandboxd/wasm/cache", modules_dir = "/var/lib/sandboxd/wasm/modules", pool_depth_default = "2", pool_enabled = "true", pull_timeout = "60s", push_host = "", registry_allowlist = "", registry_pat_path = "", registry_username = "", standard_modules = "" }
+    containerd_pool_cfg            = { enabled = "true", depth = "2", images = "", max_images = "8", idle_ttl = "15m", refill_interval = "5s" }
+  }
+}
+
+output "joiner_join_privilege_split_everything" {
+  value = templatefile("__TEMPLATE__", merge(local.base, local.everything))
+}
+
+# The same node in single: its bootstrap writes in sandboxd's folders as root,
+# as it always has (sandboxd is root there too). The test reads it to prove it
+# finds such writes.
+output "joiner_join_everything_single" {
+  value = templatefile("__TEMPLATE__", merge(local.base, local.everything, {
+    containerd_cfg         = { socket = "/run/containerd/containerd.sock", namespace = "aerolvm", cni_plugin_dir = "/opt/cni/bin", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "single" }
+    firecracker_jailer_uid = 1000
+    firecracker_jailer_gid = 1000
+  }))
+}
+
+# Single with Firecracker on: Terraform installs it itself, as before, so
+# install.sh gets no --with-firecracker, and the jailer runs as uid 1000.
+output "joiner_join_firecracker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                = false
+    role                   = "worker"
+    one_line_join          = true
+    join_token             = "aaaaaa.00000000000000000000000000000000"
+    with_firecracker       = true
+    firecracker_use_jailer = true
+    firecracker_jailer_uid = 1000
+    firecracker_jailer_gid = 1000
+  }))
+}
+
 # The old join path never passes it, whatever cluster.yml says: Terraform's
 # plan refuses split there (validate_cluster_ops).
 output "joiner_privilege_split_oldpath" {

@@ -280,6 +280,13 @@ INSTALL_ARGS+=(--buildkit-rootless)
 # only the containerd engine, and builds with rootless BuildKit, which
 # install.sh turns on with it.
 INSTALL_ARGS+=(--with-containerd-engine --privilege-mode split)
+%{ if with_firecracker ~}
+# Firecracker in split: the root helper runs each VM, and install.sh sets
+# the node up for it. It lets sandboxd write the jailer's folder, puts the
+# guest kernel in a folder only root writes, and makes the sandboxd-jailer
+# user. Section 2d below still fetches this cluster's own Firecracker files.
+INSTALL_ARGS+=(--with-firecracker)
+%{ endif ~}
 %{ endif ~}
 %{ endif ~}
 %{ if ingress_proxy_routing == true ~}
@@ -853,12 +860,23 @@ fi
 
 apt-get install -y skopeo umoci e2fsprogs iproute2
 
+%{ if one_line_join && containerd_cfg.privilege_mode == "split" ~}
+# Privilege mode split: the run and templates folders are sandboxd's, inside
+# folders its user owns, and sandboxd makes them itself when it first needs
+# them. Root makes nothing there: a link its user left would take root
+# anywhere. The folders below are root's (the plan refuses them in sandboxd's).
+install -d -m 0755 \
+  "$(dirname '${firecracker_binary_path}')" \
+  "$(dirname '${firecracker_jailer_path}')" \
+  "$(dirname '${firecracker_kernel_path}')"
+%{ else ~}
 install -d -m 0755 \
   "$(dirname '${firecracker_binary_path}')" \
   "$(dirname '${firecracker_jailer_path}')" \
   "$(dirname '${firecracker_kernel_path}')" \
   '${firecracker_run_dir}' \
   '${firecracker_templates_dir}'
+%{ endif ~}
 
 %{ if firecracker_use_jailer ~}
 install -d -m 0755 '${firecracker_jailer_chroot_base}'
@@ -1004,8 +1022,12 @@ SB_FIRECRACKER_RUN_DIR=${firecracker_run_dir}
 SB_FIRECRACKER_TEMPLATES_DIR=${firecracker_templates_dir}
 SB_FIRECRACKER_USE_JAILER=${firecracker_use_jailer}
 SB_JAILER_CHROOT_BASE=${firecracker_jailer_chroot_base}
+%{ if firecracker_jailer_uid != null ~}
 SB_JAILER_UID=${firecracker_jailer_uid}
+%{ endif ~}
+%{ if firecracker_jailer_gid != null ~}
 SB_JAILER_GID=${firecracker_jailer_gid}
+%{ endif ~}
 SB_FIRECRACKER_TAP_BASE_CIDR=${firecracker_tap_base_cidr}
 SB_FIRECRACKER_TAP_POOL_SIZE=${firecracker_tap_pool_size}
 SB_FIRECRACKER_SKOPEO_BIN=${firecracker_skopeo_bin}
@@ -1046,7 +1068,15 @@ EOF
 # 0600; the upstream wrap key is read-only (0400) because the loader rejects
 # writable key files so accidental rotation/editing cannot happen in place.
 ###############################################################################
+%{ if one_line_join && containerd_cfg.privilege_mode == "split" ~}
+# Privilege mode split: sandboxd runs as the sandboxd user and must read these
+# files. The folder stays root's (sandboxd's group may only enter it), so
+# sandboxd cannot swap a name in it for a link, and root writes only here. The
+# files are sandboxd's, owner-only, as its loaders want.
+sudo install -d -m 0750 -o root -g sandboxd /etc/sandboxd/secrets
+%{ else ~}
 sudo install -d -m 0700 -o root -g root /etc/sandboxd/secrets
+%{ endif ~}
 
 %{ if aocr_upstream_wrap_key != "" ~}
 # Base64 AES-GCM wrap key. Must match an entry in AOCR's
@@ -1056,7 +1086,11 @@ umask 077
 cat > /etc/sandboxd/secrets/upstream-wrap.key <<'EOF'
 ${aocr_upstream_wrap_key}
 EOF
+%{ if one_line_join && containerd_cfg.privilege_mode == "split" ~}
+sudo chown sandboxd:sandboxd /etc/sandboxd/secrets/upstream-wrap.key
+%{ else ~}
 sudo chown root:root /etc/sandboxd/secrets/upstream-wrap.key
+%{ endif ~}
 sudo chmod 0400 /etc/sandboxd/secrets/upstream-wrap.key
 %{ endif ~}
 
@@ -1068,7 +1102,11 @@ umask 077
 cat > /etc/sandboxd/secrets/cluster-pat <<'EOF'
 ${aocr_cluster_pat}
 EOF
+%{ if one_line_join && containerd_cfg.privilege_mode == "split" ~}
+sudo chown sandboxd:sandboxd /etc/sandboxd/secrets/cluster-pat
+%{ else ~}
 sudo chown root:root /etc/sandboxd/secrets/cluster-pat
+%{ endif ~}
 sudo chmod 0600 /etc/sandboxd/secrets/cluster-pat
 %{ endif ~}
 
@@ -1079,6 +1117,17 @@ sudo chmod 0600 /etc/sandboxd/secrets/cluster-pat
 # "REMOTE HOST IDENTIFICATION HAS CHANGED" warnings. Omit the var to keep
 # per-node keys (sandboxd generates one on first boot). The daemon reads this
 # path via SB_SSH_HOST_KEY_PATH.
+%{ if one_line_join && containerd_cfg.privilege_mode == "split" ~}
+# Privilege mode split: /var/lib/sandboxd is sandboxd's user's, so root writes
+# the key in the secrets folder above instead, and SB_SSH_HOST_KEY_PATH below
+# points there.
+umask 077
+cat > /etc/sandboxd/secrets/ssh_host_ed25519_key <<'EOF'
+${ssh_host_key_pem}
+EOF
+sudo chown sandboxd:sandboxd /etc/sandboxd/secrets/ssh_host_ed25519_key
+sudo chmod 0600 /etc/sandboxd/secrets/ssh_host_ed25519_key
+%{ else ~}
 umask 077
 sudo install -d -m 0700 -o root -g root /var/lib/sandboxd
 cat > /var/lib/sandboxd/ssh_host_ed25519_key <<'EOF'
@@ -1086,6 +1135,7 @@ ${ssh_host_key_pem}
 EOF
 sudo chown root:root /var/lib/sandboxd/ssh_host_ed25519_key
 sudo chmod 0600 /var/lib/sandboxd/ssh_host_ed25519_key
+%{ endif ~}
 %{ endif ~}
 
 cat >> /tmp/aerolvm-ops.env <<'EOF'
@@ -1112,6 +1162,11 @@ SB_SNAPSHOT_PUSH_RECONCILE_INTERVAL=${aocr_snapshot_push_reconcile_interval}
 SB_SNAPSHOT_PUSH_MAX_IN_FLIGHT=${aocr_snapshot_push_max_in_flight}
 SB_SNAPSHOT_PUSH_TAG_SUFFIX=${aocr_snapshot_push_tag_suffix}
 EOF
+%{ if one_line_join && containerd_cfg.privilege_mode == "split" && ssh_host_key_pem != "" ~}
+cat >> /tmp/aerolvm-ops.env <<'EOF'
+SB_SSH_HOST_KEY_PATH=/etc/sandboxd/secrets/ssh_host_ed25519_key
+EOF
+%{ endif ~}
 %{ endif ~}
 
 %{ if fleet_enabled ~}
@@ -1480,7 +1535,15 @@ UNIT
 %{ endif ~}
 fi
 
+%{ if one_line_join && containerd_cfg.privilege_mode == "split" ~}
+# Privilege mode split: the root helper reads cluster.env too, and it started
+# before the lines above were added (the WASM, Firecracker and volume
+# settings among them). So it restarts with sandboxd. Restarting the helper
+# stops no sandbox.
+sudo systemctl restart aerolvm-rootd sandboxd
+%{ else ~}
 sudo systemctl restart sandboxd
+%{ endif ~}
 
 ${extra_user_data}
 
