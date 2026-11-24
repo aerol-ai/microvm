@@ -12,9 +12,14 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
+
+	"github.com/aerol-ai/microvm/internal/nodeupgrade"
 	"github.com/aerol-ai/microvm/internal/raftlogdir"
+	"github.com/aerol-ai/microvm/internal/rootfolder"
 )
 
 // RestoreOptions is one `sandboxd restore`.
@@ -34,9 +39,11 @@ type RestoreOptions struct {
 	// Err gets the warnings the script printed to stderr.
 	Err io.Writer
 
-	now        func() time.Time
-	euid       func() int
-	lchown     func(path string, uid, gid int) error
+	now  func() time.Time
+	euid func() int
+	// chown, when set, stands in for every owner change, with the path it
+	// would change: an unprivileged test cannot give a file root's owner.
+	chown      func(path string, uid, gid int) error
 	healthPoll time.Duration
 	// liveRoot is the root that is this node itself: "/". Tests point it
 	// at a temporary directory.
@@ -89,11 +96,26 @@ func Restore(ctx context.Context, o RestoreOptions) (RestoreResult, error) {
 	if err != nil {
 		return res, fmt.Errorf("%s: %w", o.Input, err)
 	}
+	// In privilege mode split, on this node or on the one backed up,
+	// sandboxd's user owns some of the folders the archive lands in
+	// (agentTrees). This node's settings are read before the archive's
+	// replace them.
+	here, err := ReadNode(filepath.Join(root, filepath.FromSlash(archiveConfig)))
+	if err != nil && !errors.Is(err, syscall.ENOTDIR) {
+		// A file where the config folder goes has no settings; the
+		// restore replaces it.
+		return res, err
+	}
+	backedUp, err := idx.node()
+	if err != nil {
+		return res, fmt.Errorf("%s: %w", o.Input, err)
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return res, err
 	}
 
-	r := &restorer{o: &o, root: root, stamp: o.now().UTC().Format(restoreStamp)}
+	r := &restorer{o: &o, root: root, stamp: o.now().UTC().Format(restoreStamp),
+		split: here.Split || backedUp.Split, agent: agentTrees(here, backedUp)}
 	if idx.has(archiveDB) {
 		r.setAside(archiveDB, archiveDB+"-wal", archiveDB+"-shm")
 	}
@@ -143,15 +165,18 @@ func Restore(ctx context.Context, o RestoreOptions) (RestoreResult, error) {
 		return res, r.err
 	}
 	res.MovedAside = r.moved
+	if testHookRestore != nil {
+		testHookRestore("keys", r.path(archiveLib))
+	}
+	// The wrapped key and the ring were written 0600 (restorer.mode): a
+	// chmod by name here would follow a link put in their place.
 	if p := r.path(key(wrappedName)); exists(p) {
 		// Custody "wrapped": sandboxd unwraps this at boot through the key
 		// store, which must be reachable. A backup taken before a key
 		// version was retired no longer opens once that version is gone.
-		_ = os.Chmod(p, 0o600)
 		fmt.Fprintln(o.Out, "the server key is wrapped: run `sandboxd key verify` with the key store reachable before starting sandboxd")
 	}
 	if p := r.path(key(ringName)); exists(p) {
-		_ = os.Chmod(p, 0o600)
 		fmt.Fprintf(o.Out, "the server key was rotated: the ring at %s holds it; keep it with SB_CREDENTIAL_KEY_RING_PATH unset or pointing there\n", p)
 	}
 	if node, err := ReadNode(r.path(archiveConfig)); err == nil && node.RaftWALDir != "" && idx.hasTree(archiveRaft) {
@@ -191,9 +216,6 @@ func (o *RestoreOptions) defaults() {
 	if o.euid == nil {
 		o.euid = os.Geteuid
 	}
-	if o.lchown == nil {
-		o.lchown = os.Lchown
-	}
 	if o.HealthTimeout <= 0 {
 		o.HealthTimeout = 2 * time.Minute
 	}
@@ -229,7 +251,36 @@ func startAndWait(ctx context.Context, h Host, out io.Writer, url string, timeou
 }
 
 // archiveIndex is what the first read of an archive found.
-type archiveIndex struct{ names map[string]bool }
+type archiveIndex struct {
+	names map[string]bool
+	// env holds the env files the archive carries (sandboxd.env and
+	// cluster.env in the config folder), by name.
+	env map[string][]byte
+}
+
+// maxEnvBytes bounds an env file read from an archive; sandboxd's are a
+// few KiB.
+const maxEnvBytes = 1 << 20
+
+// node is the backed-up node's settings, read from the env files the
+// archive carries as ReadNode reads them on a node.
+func (x *archiveIndex) node() (Node, error) {
+	merged := map[string]string{}
+	for _, name := range []string{"sandboxd.env", "cluster.env"} {
+		raw, ok := x.env[name]
+		if !ok {
+			continue
+		}
+		vals, err := nodeupgrade.ParseEnv(raw)
+		if err != nil {
+			return Node{}, fmt.Errorf("%s/%s: %w", archiveConfig, name, err)
+		}
+		for k, v := range vals {
+			merged[k] = v
+		}
+	}
+	return nodeFromEnv(DefaultConfigDir, merged), nil
+}
 
 func (x *archiveIndex) has(name string) bool { return x.names[name] }
 
@@ -258,7 +309,7 @@ func scanArchive(file string) (*archiveIndex, error) {
 	if err != nil {
 		return nil, fmt.Errorf("not a gzipped backup archive: %w", err)
 	}
-	idx := &archiveIndex{names: map[string]bool{}}
+	idx := &archiveIndex{names: map[string]bool{}, env: map[string][]byte{}}
 	links := map[string]bool{}
 	tr := tar.NewReader(gz)
 	for {
@@ -292,6 +343,18 @@ func scanArchive(file string) (*archiveIndex, error) {
 			target, err := entryName(h.Linkname)
 			if err != nil || allowed(target, &tar.Header{Typeflag: tar.TypeReg}) != nil || !idx.names[target] {
 				return nil, fmt.Errorf("%s links to %q, which is not an earlier file of the backup", name, h.Linkname)
+			}
+		}
+		if path.Dir(name) == archiveConfig && (h.Typeflag == tar.TypeReg || h.Typeflag == tar.TypeRegA) { //nolint:staticcheck // old tars
+			if base := path.Base(name); base == "sandboxd.env" || base == "cluster.env" {
+				raw, err := io.ReadAll(io.LimitReader(tr, maxEnvBytes+1))
+				if err != nil {
+					return nil, fmt.Errorf("read archive: %w", err)
+				}
+				if len(raw) > maxEnvBytes {
+					return nil, fmt.Errorf("archive entry %s is larger than %d bytes, which an env file never is", name, maxEnvBytes)
+				}
+				idx.env[base] = raw
 			}
 		}
 		idx.names[name] = true
@@ -366,6 +429,10 @@ type restorer struct {
 	// undo is the moves to reverse, oldest first.
 	undo [][2]string
 	err  error
+	// split is set when this node or the backed-up one runs in privilege
+	// mode split; agent is agentTrees.
+	split bool
+	agent []string
 }
 
 func (r *restorer) path(name string) string { return filepath.Join(r.root, filepath.FromSlash(name)) }
@@ -439,6 +506,21 @@ func (r *restorer) extract(file string) error {
 	}
 }
 
+// testHookRestore, when set, runs at points where a name the restore works
+// on could be swapped: "write" with an entry's path, once the folder that
+// holds it is open; "temp" with a regular file's temporary name, once its
+// content is written; "keys" with the data folder, after the archive is
+// written. Tests swap files there.
+var testHookRestore func(stage, path string)
+
+// Every entry below the config folder or the data folder is written
+// through the folder that holds it, opened from the top of its tree one
+// name at a time with no link followed (openParent), and changed through
+// handles and names in that folder, never through a path: a link in the
+// way, whenever it is put there, sends no write, mode or owner elsewhere.
+// That matters in privilege mode split, where sandboxd's user owns the
+// data folder and the certificate folders and can put a link anywhere in
+// them; root's restore must not follow one.
 func (r *restorer) entry(name string, h *tar.Header, body io.Reader) error {
 	dst := r.path(name)
 	switch name {
@@ -450,101 +532,342 @@ func (r *restorer) entry(name string, h *tar.Header, body io.Reader) error {
 		// artefacts: made if missing, their owner and mode left alone.
 		return os.MkdirAll(dst, 0o755)
 	}
-	if err := r.noLinkAbove(name); err != nil {
+	if name == archiveConfig && h.Typeflag == tar.TypeDir {
+		return r.configFolder(dst, h)
+	}
+	dir, base, err := r.openParent(name)
+	if err != nil {
 		return err
 	}
+	defer unix.Close(dir)
+	if testHookRestore != nil {
+		testHookRestore("write", dst)
+	}
+	switch h.Typeflag {
+	case tar.TypeDir:
+		return r.folder(dir, base, name, h)
+	case tar.TypeSymlink:
+		if err := r.clear(dir, base, dst); err != nil {
+			return err
+		}
+		if err := unix.Symlinkat(h.Linkname, dir, base); err != nil {
+			return err
+		}
+		if !r.owner(name) {
+			return nil
+		}
+		if r.o.chown != nil {
+			return r.o.chown(dst, h.Uid, h.Gid)
+		}
+		return unix.Fchownat(dir, base, h.Uid, h.Gid, unix.AT_SYMLINK_NOFOLLOW)
+	case tar.TypeLink:
+		return r.hardLink(dir, base, name, h)
+	}
+	return r.file(dir, base, name, h, body)
+}
+
+// configFolder is the config folder's own entry, handled as it always
+// was: the folder and those above it are root's in both privilege modes,
+// and an operator may have linked it to another disk, which stays a link.
+func (r *restorer) configFolder(dst string, h *tar.Header) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
 	mode := fs.FileMode(h.Mode).Perm()
-	switch h.Typeflag {
-	case tar.TypeDir:
-		// Stat, not Lstat: a config directory an operator linked to
-		// another disk stays a link.
-		if fi, err := os.Stat(dst); err != nil || !fi.IsDir() {
-			if err := removeNonDir(dst); err != nil {
-				return err
-			}
-		}
-		if err := os.MkdirAll(dst, mode); err != nil {
-			return err
-		}
-		if err := os.Chmod(dst, mode); err != nil {
-			return err
-		}
-		return r.chown(dst, h)
-	case tar.TypeSymlink:
+	// Stat, not Lstat: a config directory an operator linked to another
+	// disk stays a link.
+	if fi, err := os.Stat(dst); err != nil || !fi.IsDir() {
 		if err := removeNonDir(dst); err != nil {
 			return err
 		}
-		if err := os.Symlink(h.Linkname, dst); err != nil {
-			return err
-		}
-		return r.chown(dst, h)
-	case tar.TypeLink:
-		target, _ := entryName(h.Linkname)
-		if err := removeNonDir(dst); err != nil {
-			return err
-		}
-		return os.Link(r.path(target), dst)
 	}
-	// A regular file: written beside its place and renamed over it, so a
-	// link already there is replaced, never written through.
-	if fi, err := os.Lstat(dst); err == nil && fi.IsDir() {
-		return fmt.Errorf("%s is a directory", dst)
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".restore-")
-	if err != nil {
+	if err := os.MkdirAll(dst, mode); err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	_, err = io.Copy(tmp, body)
-	if err == nil {
-		err = tmp.Chmod(mode)
-	}
-	if err == nil {
-		err = tmp.Sync()
-	}
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = r.chown(tmpName, h)
-	}
-	if err == nil {
-		err = os.Chtimes(tmpName, h.ModTime, h.ModTime)
-	}
-	if err != nil {
+	if err := os.Chmod(dst, mode); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, dst)
+	if r.o.euid() != 0 {
+		return nil
+	}
+	if r.o.chown != nil {
+		return r.o.chown(dst, h.Uid, h.Gid)
+	}
+	return os.Lchown(dst, h.Uid, h.Gid)
 }
 
-// noLinkAbove refuses to write through a link that sits inside the config
-// directory or below the state directory on the target. The roots
-// themselves may be links (an operator's /var/lib/sandboxd on a data
-// disk); a link below them would send the write somewhere else.
-func (r *restorer) noLinkAbove(name string) error {
-	anchor := archiveLib
+// walkFlags open a folder to work in, following no link.
+const walkFlags = rootfolder.FolderFlags
+
+// openParent opens the folder that holds name and returns it with name's
+// last element. The top of name's tree (the config folder, or the data
+// folder) is opened by its path: it and the folders above it are root's,
+// and an operator may have linked it to another disk. Below it each folder
+// is opened through the one above, with no link followed, and made there
+// if missing (0755, as mkdir -p made them; 0700 in sandboxd's user's
+// folders, see mode).
+func (r *restorer) openParent(name string) (int, string, error) {
+	top := archiveLib
 	if under(name, archiveConfig) {
-		anchor = archiveConfig
+		top = archiveConfig
 	}
-	for p := path.Dir(name); p != anchor && p != "." && strings.HasPrefix(p, anchor+"/"); p = path.Dir(p) {
-		fi, err := os.Lstat(r.path(p))
-		if err == nil && fi.Mode()&fs.ModeSymlink != 0 {
-			return fmt.Errorf("%s is a link; refusing to write %s through it", r.path(p), name)
+	if name == top {
+		top = path.Dir(name)
+	}
+	if err := os.MkdirAll(r.path(top), 0o755); err != nil {
+		return -1, "", err
+	}
+	fd, err := unix.Open(r.path(top), walkFlags&^unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, "", fmt.Errorf("open %s: %w", r.path(top), err)
+	}
+	at := top
+	for _, part := range strings.Split(strings.TrimPrefix(path.Dir(name), top), "/") {
+		if part == "" {
+			continue
 		}
+		at += "/" + part
+		next, err := unix.Openat(fd, part, walkFlags, 0)
+		if errors.Is(err, unix.ENOENT) {
+			// EEXIST is fine: the open below judges what is there.
+			if merr := unix.Mkdirat(fd, part, uint32(r.mode(at, &tar.Header{Typeflag: tar.TypeDir, Mode: 0o755}))); merr != nil && !errors.Is(merr, unix.EEXIST) {
+				_ = unix.Close(fd)
+				return -1, "", fmt.Errorf("make %s: %w", r.path(at), merr)
+			}
+			next, err = unix.Openat(fd, part, walkFlags, 0)
+		}
+		if err != nil {
+			var st unix.Stat_t
+			if unix.Fstatat(fd, part, &st, unix.AT_SYMLINK_NOFOLLOW) == nil && st.Mode&unix.S_IFMT == unix.S_IFLNK {
+				err = fmt.Errorf("%s is a link; refusing to write %s through it", r.path(at), name)
+			} else {
+				err = fmt.Errorf("open %s: %w", r.path(at), err)
+			}
+			_ = unix.Close(fd)
+			return -1, "", err
+		}
+		_ = unix.Close(fd)
+		fd = next
+	}
+	return fd, path.Base(name), nil
+}
+
+// folder makes or keeps the folder base in dir, with the archive's mode
+// and, as root, its owner (mode, owner), set through a handle on it.
+func (r *restorer) folder(dir int, base, name string, h *tar.Header) error {
+	dst := r.path(name)
+	mode := r.mode(name, h)
+	var st unix.Stat_t
+	err := unix.Fstatat(dir, base, &st, unix.AT_SYMLINK_NOFOLLOW)
+	switch {
+	case errors.Is(err, unix.ENOENT):
+	case err != nil:
+		return err
+	case st.Mode&unix.S_IFMT == unix.S_IFDIR:
+	default:
+		if st.Mode&unix.S_IFMT == unix.S_IFLNK {
+			// The mode and owner would land on the folder a link points
+			// to, wherever that is. A link to anything else, or to
+			// nothing, is replaced, as it always was.
+			var to unix.Stat_t
+			if unix.Fstatat(dir, base, &to, 0) == nil && to.Mode&unix.S_IFMT == unix.S_IFDIR {
+				return fmt.Errorf("%s is a link where the backup has a folder; refusing to change the folder it points to: remove the link and restore again", dst)
+			}
+		}
+		if err := unix.Unlinkat(dir, base, 0); err != nil {
+			return err
+		}
+	}
+	if err := unix.Mkdirat(dir, base, uint32(mode)); err != nil && !errors.Is(err, unix.EEXIST) {
+		return err
+	}
+	fd, err := unix.Openat(dir, base, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open %s without following a link: %w", dst, err)
+	}
+	f := os.NewFile(uintptr(fd), dst)
+	defer f.Close()
+	if err := f.Chmod(mode); err != nil {
+		return err
+	}
+	return r.fchown(f, name, h)
+}
+
+// file writes a regular file beside its place and renames it over it, so
+// a link already there is replaced, never written through. Its mode,
+// owner and time are set through the open file.
+func (r *restorer) file(dir int, base, name string, h *tar.Header, body io.Reader) error {
+	dst := r.path(name)
+	var st unix.Stat_t
+	if err := unix.Fstatat(dir, base, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil && st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		return fmt.Errorf("%s is a directory", dst)
+	}
+	tmp, err := rootfolder.TmpName(base + ".restore")
+	if err != nil {
+		return err
+	}
+	fd, err := unix.Openat(dir, tmp, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(filepath.Dir(dst), tmp))
+	renamed := false
+	defer func() {
+		if !renamed {
+			_ = unix.Unlinkat(dir, tmp, 0)
+		}
+	}()
+	_, err = io.Copy(f, body)
+	if err == nil && testHookRestore != nil {
+		testHookRestore("temp", f.Name())
+	}
+	if err == nil {
+		err = f.Chmod(r.mode(name, h))
+	}
+	if err == nil {
+		err = r.fchown(f, name, h)
+	}
+	if err == nil {
+		tv := unix.NsecToTimeval(h.ModTime.UnixNano())
+		err = unix.Futimes(int(f.Fd()), []unix.Timeval{tv, tv})
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if err := unix.Renameat(dir, tmp, dir, base); err != nil {
+		return err
+	}
+	renamed = true
+	return nil
+}
+
+// hardLink links base in dir to an earlier file of the archive, reached
+// as every entry is (openParent). In sandboxd's user's folders in
+// privilege mode split it writes a copy instead: the root helper leaves a
+// file with two names root's (handing it over could hand over a file root
+// reaches by another name), and sandboxd could not open it.
+func (r *restorer) hardLink(dir int, base, name string, h *tar.Header) error {
+	target, _ := entryName(h.Linkname)
+	tdir, tbase, err := r.openParent(target)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(tdir)
+	if r.agentOwned(name) {
+		fd, err := unix.Openat(tdir, tbase, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open %s without following a link: %w", r.path(target), err)
+		}
+		src := os.NewFile(uintptr(fd), r.path(target))
+		defer src.Close()
+		if st, err := src.Stat(); err != nil || !st.Mode().IsRegular() {
+			return fmt.Errorf("%s is not a regular file of the backup", r.path(target))
+		}
+		return r.file(dir, base, name, h, src)
+	}
+	if err := r.clear(dir, base, r.path(name)); err != nil {
+		return err
+	}
+	return unix.Linkat(tdir, tbase, dir, base, 0)
+}
+
+// clear removes base from dir unless it is a folder, which is refused.
+func (r *restorer) clear(dir int, base, dst string) error {
+	var st unix.Stat_t
+	err := unix.Fstatat(dir, base, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if st.Mode&unix.S_IFMT == unix.S_IFDIR {
+		return fmt.Errorf("%s is a directory", dst)
+	}
+	if err := unix.Unlinkat(dir, base, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+		return err
 	}
 	return nil
 }
 
-// chown puts the archive's owner back when running as root, as tar does.
-func (r *restorer) chown(p string, h *tar.Header) error {
-	if r.o.euid() != 0 {
+// mode is the mode an entry gets: the archive's, but for the server-key
+// files sandboxd reads alone (0600) and, in privilege mode split, what
+// lands in sandboxd's user's folders: there the archive's modes were that
+// user's to choose, so group and others get nothing, as sandboxd makes
+// its folders (0700).
+func (r *restorer) mode(name string, h *tar.Header) fs.FileMode {
+	switch name {
+	case archiveLib + "/" + wrappedName, archiveLib + "/" + ringName:
+		return 0o600
+	}
+	mode := fs.FileMode(h.Mode).Perm()
+	if r.agentOwned(name) {
+		mode &= 0o700
+	}
+	return mode
+}
+
+// owner reports whether name gets the archive's owner, as tar gives it
+// as root. In privilege mode split what lands in sandboxd's user's
+// folders stays root's: the archive's numbers are the backed-up node's,
+// whose sandboxd user may have had another uid, one that may be someone
+// else's here. `aerolvm-rootd agent-folders`, which runs before every
+// sandboxd start, gives root's files there to this node's sandboxd user,
+// following no link.
+func (r *restorer) owner(name string) bool {
+	return r.o.euid() == 0 && !r.agentOwned(name)
+}
+
+func (r *restorer) fchown(f *os.File, name string, h *tar.Header) error {
+	if !r.owner(name) {
 		return nil
 	}
-	return r.o.lchown(p, h.Uid, h.Gid)
+	if r.o.chown != nil {
+		return r.o.chown(r.path(name), h.Uid, h.Gid)
+	}
+	return f.Chown(h.Uid, h.Gid)
+}
+
+// agentOwned reports whether name is in one of sandboxd's user's folders
+// in privilege mode split.
+func (r *restorer) agentOwned(name string) bool {
+	if !r.split {
+		return false
+	}
+	for _, t := range r.agent {
+		if under(name, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// agentTrees are the archive names of the folders sandboxd's user owns in
+// privilege mode split that a restore writes into, from the settings of
+// each node given: the data folder (the archive's var/lib/sandboxd) and
+// the certificate folders in the config folder, as `aerolvm-rootd
+// agent-folders` reads them (internal/rootd). The config folder itself is
+// root's, and so are its other folders (secrets, the operator's
+// dashboards).
+func agentTrees(nodes ...Node) []string {
+	trees := []string{archiveLib, archiveConfig + "/tls"}
+	for _, n := range nodes {
+		for _, dir := range []string{n.ClusterTLSDir, n.ClusterCADir} {
+			if !filepath.IsAbs(dir) {
+				continue
+			}
+			if rel, ok := strings.CutPrefix(filepath.Clean(dir), DefaultConfigDir+"/"); ok {
+				trees = append(trees, archiveConfig+"/"+filepath.ToSlash(rel))
+			}
+		}
+	}
+	return trees
 }
 
 func removeNonDir(p string) error {

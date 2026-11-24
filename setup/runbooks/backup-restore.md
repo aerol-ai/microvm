@@ -57,7 +57,11 @@ In privilege mode split, `sandboxd` runs as the `sandboxd` user, which owns
 root, because it reads root's env files. It reads that user's folders without
 following any symbolic link out of them. A link is stored as a link. The
 backup also refuses a `state.db` that is a link, or that SQLite opens as
-another file, and a file that changes between its check and its read.
+another file, and a file that changes between its check and its read. It
+refuses a `state.db`, `-wal`, `-shm` or `-journal` that is not a regular
+file, and it gives up if SQLite cannot open the database within 30 seconds,
+instead of waiting forever. In split the database is read in two passes (a
+page copy, then `VACUUM INTO`), so the copy takes up to about twice as long.
 
 A Raft log on a disk of its own is taken only from `SB_RAFT_WAL_DIR` in the
 env files. The record in the Raft folder that names the log's folder is
@@ -127,6 +131,20 @@ Set `SB_RAFT_WAL_DIR` to the log's folder if they refuse yours.
    key store must be reachable when sandboxd starts. An archive made before
    backups carried the key file keeps the node's own key file, with a
    warning: that only works for a restore in place.
+
+   The restore writes each file through the folder that holds it, and it
+   follows no symbolic link below `/etc/sandboxd` or `/var/lib/sandboxd`.
+   Those two folders may themselves be links (to another disk). If the node
+   has a link where the backup has a folder, the restore stops and says so:
+   remove the link and run it again.
+
+   In privilege mode split (on this node, or on the node you backed up), the
+   files that land in the `sandboxd` user's folders (`/var/lib/sandboxd`,
+   `tls/` and `cluster-ca/`) stay owned by root, with no group or other
+   access. The next `sandboxd` start gives them to the `sandboxd` user
+   (`aerolvm-rootd agent-folders` runs before each start). Files in root's
+   folders, such as the env files and `secrets/`, keep the owner and mode in
+   the archive.
 
 4. Verify expected files:
 
