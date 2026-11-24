@@ -39,6 +39,12 @@ func serveFromOwnerCache(c cluster.Client, cache *cluster.OwnerCache, id string,
 		if caller := strings.TrimSpace(service.OwnerRefForCreate(r.Context())); caller != "" && (!route.HasOwnerRef || route.OwnerRef != caller) {
 			ok = false
 		}
+		// An entry for a node deleted since it was written is never used:
+		// nothing there can serve the call (abandoned.go).
+		if ok && cluster.NodeDeleted(c, route.Endpoint.NodeID) {
+			cache.Forget(id)
+			ok = false
+		}
 	}
 	if !ok {
 		cluster.RecordOwnerCacheMiss()

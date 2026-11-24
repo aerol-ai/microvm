@@ -187,6 +187,64 @@ func snapshotTargetFits(p Placement, source, target Member) string {
 	return ""
 }
 
+// snapshotRestorers answers, for one decommission pass, whether any other
+// worker can restore a snapshot taken on source: one that is alive, may own
+// sandboxes and is neither drained nor deleted, and that snapshotTargetFits.
+// A sandbox no worker can restore does not move (evacuationOf). Whether one
+// fits depends only on the sandbox's runtime, so the fleet is read once per
+// pass and the answer kept per runtime; the next pass reads it again, and a
+// worker that joined meanwhile makes the sandbox movable again.
+type snapshotRestorers struct {
+	c       *Cluster
+	source  Member
+	drained map[string]bool
+	members []Member
+	denied  map[string]bool
+	loaded  bool
+	why     map[string]string
+}
+
+// refusal is why no worker can restore p's snapshot, or "" when one can or
+// may.
+func (r *snapshotRestorers) refusal(p Placement) string {
+	if p.Spec == nil {
+		return ""
+	}
+	rt := strings.TrimSpace(p.Spec.Runtime)
+	if why, ok := r.why[rt]; ok {
+		return why
+	}
+	if !r.loaded {
+		r.members, r.denied, r.loaded = r.c.membersWithCapacity(), r.c.fsm.deniedNodeSet(), true
+	}
+	why := "no other worker can take it"
+	for _, m := range r.members {
+		if m.NodeID == r.source.NodeID || !m.Alive || !CanOwnSandboxRole(m.Role) || r.drained[m.NodeID] || r.denied[m.NodeID] {
+			continue
+		}
+		if m.CapacityStale || !hasCapacitySnapshot(m.Capacity) {
+			// Its labels ride its heartbeats, and none is fresh (a new
+			// leader has none for its first seconds): judge it by what
+			// gossip carries, as if it moved gVisor sandboxes in the
+			// source's mode. Never "cannot move" for want of a heartbeat.
+			m.Capacity.Labels = map[string]string{CheckpointMovesLabel: r.source.Capacity.Labels[CheckpointMovesLabel]}
+		}
+		w := snapshotTargetFits(p, r.source, m)
+		if w == "" {
+			why = ""
+			break
+		}
+		if why == "no other worker can take it" {
+			why = "no other worker can restore its memory (" + w + ")"
+		}
+	}
+	if r.why == nil {
+		r.why = make(map[string]string)
+	}
+	r.why[rt] = why
+	return why
+}
+
 // moveSnapshotOne moves p off source by snapshot.
 func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Member) error {
 	importTimeout := importMoveTimeout
@@ -197,7 +255,11 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 		defer cancel()
 		importTimeout = checkpointMoveBudget
 	}
-	target, err := c.selectRecreationTargetAvoiding(p, c.lastKnownZone(source.NodeID), source.NodeID)
+	// Only a worker that can restore the snapshot: with any target, a fleet
+	// of both gVisor privilege modes failed every move that drew the other
+	// mode, though a worker of the source's mode had room.
+	restores := func(m Member) bool { return snapshotTargetFits(p, source, m) == "" }
+	target, err := c.selectRecreationTargetWhere(p, c.lastKnownZone(source.NodeID), restores, source.NodeID)
 	if err != nil {
 		return err
 	}
@@ -228,7 +290,7 @@ func (c *Cluster) moveSnapshotOne(ctx context.Context, p Placement, source Membe
 		return err
 	}
 	if r := out.Results[p.SandboxID]; r != "released" {
-		return errors.New("release on " + source.NodeID + ": " + r)
+		return releaseRefusal(source.NodeID, r)
 	}
 	drop := func(why error) error {
 		dctx, cancel := context.WithTimeout(context.Background(), moveStepTimeout)

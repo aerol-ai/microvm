@@ -31,6 +31,7 @@ type fleet struct {
 	rows    map[string]map[string]bool // node -> sandbox ids it holds a local row for
 	nodes   map[string]*fleetNode
 	dead    map[string]bool // nodes gossip reports dead
+	denied  map[string]bool // nodes an operator deleted (the deny set)
 	lookups atomic.Int64    // control-plane reads made by every node's router
 	index   uint64          // the last "log index": every owner change takes the next one
 }
@@ -78,11 +79,12 @@ func newFleet(t testing.TB, withCache bool, ids ...string) *fleet {
 func newFleetWithConfig(t testing.TB, withCache bool, cfg config.Config, ids ...string) *fleet {
 	t.Helper()
 	f := &fleet{
-		t:     t,
-		place: map[string]fleetPlacement{},
-		rows:  map[string]map[string]bool{},
-		nodes: map[string]*fleetNode{},
-		dead:  map[string]bool{},
+		t:      t,
+		place:  map[string]fleetPlacement{},
+		rows:   map[string]map[string]bool{},
+		nodes:  map[string]*fleetNode{},
+		dead:   map[string]bool{},
+		denied: map[string]bool{},
 	}
 	for _, id := range ids {
 		n := &fleetNode{Noop: cluster.NewNoop(id, "http://"+id, ""), f: f, id: id}

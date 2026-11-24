@@ -1638,6 +1638,7 @@ func (c *Cluster) applyCommand(ctx context.Context, cmd command) error {
 		if payload, cmd, err = c.stampProposal(payload, cmd, c.nodeID, true); err != nil {
 			return err
 		}
+		c.forgetUncordoned(cmd)
 		if isRawObligationReport(cmd) {
 			// Queued, not applied: the batcher folds every owner's report
 			// into one entry per window.
@@ -1706,6 +1707,7 @@ func (c *Cluster) ApplyEncoded(ctx context.Context, payload []byte) error {
 	if payload, cmd, err = c.stampProposal(payload, cmd, sender, role == JoinRoleServer); err != nil {
 		return err
 	}
+	c.forgetUncordoned(cmd)
 	if isRawObligationReport(cmd) {
 		c.obligations.add(cmd.ObligationReports)
 		return nil
