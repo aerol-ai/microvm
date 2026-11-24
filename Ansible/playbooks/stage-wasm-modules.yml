@@ -15,6 +15,15 @@
 - name: Stage WASM standard modules
   hosts: all
   become: true
+  # In privilege mode split the modules folder is inside /var/lib/sandboxd,
+  # which sandboxd's user owns, and sandboxd writes in it (each WASM
+  # sandbox's checkpoints). Root must not act there: that user can swap any
+  # name for a link, and root would follow it. So in split every task here
+  # runs as sandboxd's user, and the files are its own without a chown. A
+  # link there then leads only where that user could write anyway. Becoming
+  # a user with no rights needs pipelining (ansible.cfg sets it) or ACLs on
+  # the node; without either the play stops before it writes anything.
+  become_user: "{{ 'sandboxd' if (privilege_mode | default('single')) == 'split' else 'root' }}"
   serial: 1
   any_errors_fatal: true
   gather_facts: false
@@ -22,20 +31,11 @@
   vars_files:
     - "../../config/cluster.yml"
 
-  vars:
-    # In privilege mode split sandboxd runs as the sandboxd user and writes
-    # in the modules folder (each WASM sandbox's checkpoints live there), so
-    # the folder and the modules are its user's, as its start would make
-    # them anyway. Root's folder would stop checkpoints until then.
-    wasm_modules_owner: "{{ 'sandboxd' if (privilege_mode | default('single')) == 'split' else 'root' }}"
-
   tasks:
     - name: Ensure WASM modules dir exists
       ansible.builtin.file:
         path: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}"
         state: directory
-        owner: "{{ wasm_modules_owner }}"
-        group: "{{ wasm_modules_owner }}"
         mode: "0755"
       when: wasm.enabled | default(false) | bool
 
@@ -44,8 +44,6 @@
         url: "{{ item.ref }}"
         dest: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm"
         checksum: "{{ item.digest }}"
-        owner: "{{ wasm_modules_owner }}"
-        group: "{{ wasm_modules_owner }}"
         mode: "0644"
       loop: "{{ wasm.standard_modules | default([]) | selectattr('source', 'equalto', 'url') | list }}"
       loop_control:
@@ -63,7 +61,7 @@
           oras pull "{{ item.ref }}" -o "$tmp" >/dev/null;
           src="$(find "$tmp" -name '*.wasm' -type f | head -1)";
           test -n "$src";
-          install -m 0644 -o {{ wasm_modules_owner }} -g {{ wasm_modules_owner }} "$src" "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm";
+          install -m 0644 "$src" "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm";
           rm -rf "$tmp"
       args:
         creates: "{{ wasm.modules_dir | default('/var/lib/sandboxd/wasm/modules') }}/{{ item.alias }}.wasm"

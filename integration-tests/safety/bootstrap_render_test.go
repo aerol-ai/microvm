@@ -86,6 +86,7 @@ func TestBootstrapTemplateRenders(t *testing.T) {
 		"joiner_join_privilege_split", "joiner_privilege_split_oldpath",
 		"joiner_join_privilege_split_firecracker", "joiner_join_privilege_split_isolate",
 		"joiner_join_privilege_split_wasm", "joiner_join_privilege_split_pool", "joiner_join_firecracker",
+		"joiner_join_privilege_split_everything", "joiner_join_everything_single",
 	} {
 		t.Run(branch, func(t *testing.T) {
 			out, err := run("output", "-raw", branch)

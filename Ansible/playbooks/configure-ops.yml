@@ -41,6 +41,17 @@
     # user, which reads them. It never writes SB_PRIVILEGE_MODE.
     sandboxd_privilege_mode: "{{ privilege_mode | default('single') }}"
     sandboxd_file_owner: "{{ 'sandboxd' if sandboxd_privilege_mode == 'split' else 'root' }}"
+    # Root never creates, changes or writes a path inside a folder sandboxd's
+    # user owns in split (/var/lib/sandboxd, /run/sandboxd and the rest): that
+    # user can swap any name there for a link, and root's tools follow links
+    # in every folder of a path, not only the last. So in split the secrets
+    # folder stays root's (sandboxd's group may enter it), root writes the
+    # files sandboxd reads only there, and the shared SSH host key moves there
+    # too. tasks/privilege-mode-checks.yml refuses settings that would put a
+    # root-run file in sandboxd's folders; ansible_privilege_mode_test.go
+    # checks no split task acts as root on a path inside them.
+    sandboxd_shared_ssh_host_key: "{{ ((ssh | default({})).host_key | default('') | length > 0) or (sandboxd_ssh_host_key_src | length > 0) }}"
+    sandboxd_split_ssh_host_key_path: "{{ sandboxd_secrets_dir }}/ssh_host_ed25519_key"
     # The Firecracker guest kernel. In split the root helper links it into
     # every VM's jail and refuses a kernel in a folder sandboxd writes, so
     # split moves the single default where install.sh --privilege-mode split
@@ -97,7 +108,7 @@
       # Shared SSH host key path (UC-22). Always the default location; the
       # host-key tasks below write a shared key there only when one is provided,
       # otherwise sandboxd generates a per-node key at this path on first boot.
-      SB_SSH_HOST_KEY_PATH: "{{ sandboxd_ssh_host_key_path }}"
+      SB_SSH_HOST_KEY_PATH: "{{ sandboxd_split_ssh_host_key_path if (sandboxd_privilege_mode == 'split' and sandboxd_shared_ssh_host_key | bool) else sandboxd_ssh_host_key_path }}"
       SB_AUTO_IMPORT_RETENTION_SUFFIX: "{{ auto_import.retention_suffix }}"
       SB_AUTO_IMPORT_REQUEST_TIMEOUT: "{{ auto_import.request_timeout }}"
       SB_AUTO_IMPORT_RECONCILE_INTERVAL: "{{ auto_import.reconcile_interval }}"
@@ -416,17 +427,21 @@
         - "../../setup/runbooks/containerd-engine-coexistence.md"
         - "../../setup/runbooks/cluster-ingress-topology.md"
 
+    # Root's in both modes. In split sandboxd's group may enter it to read
+    # its files, which are its user's and owner-only, but cannot add, swap or
+    # remove a name in it, so root's writes here go where root means them to.
     - name: Ensure sandboxd secrets directory exists
       when: >-
         (sandboxd_upstream_wrap_key_src | length > 0)
         or (aocr.upstream_wrap_key | length > 0)
         or (sandboxd_auto_import_cluster_pat_src | length > 0)
         or (aocr.cluster_pat | length > 0)
+        or (sandboxd_privilege_mode == 'split' and sandboxd_shared_ssh_host_key | bool)
       ansible.builtin.file:
         path: "{{ sandboxd_secrets_dir }}"
         state: directory
-        mode: "0700"
-        owner: "{{ sandboxd_file_owner }}"
+        mode: "{{ '0750' if sandboxd_privilege_mode == 'split' else '0700' }}"
+        owner: root
         group: "{{ sandboxd_file_owner }}"
 
     # Firecracker host-side install. Runs only when firecracker.enabled is
@@ -538,16 +553,21 @@
         - "{{ sandboxd_firecracker_kernel_path | dirname }}"
         - "{{ firecracker.jailer_chroot_base | default('/srv/jailer') }}"
 
-    # sandboxd writes these two. In split they are its user's: root's would
-    # stop its VM files and templates until its next start gave them back.
+    # sandboxd writes these two. In split they sit in folders sandboxd's user
+    # owns, so root makes nothing there: sandboxd makes them itself when it
+    # first needs them (its MkdirAll before a VM's files and a template's),
+    # and `aerolvm-rootd agent-folders` gives it, at each start and without
+    # following a link, whatever root left in its folders.
     - name: Ensure Firecracker's sandboxd folders exist
-      when: firecracker.enabled | default(false) | bool
+      when:
+        - firecracker.enabled | default(false) | bool
+        - sandboxd_privilege_mode != 'split'
       ansible.builtin.file:
         path: "{{ item }}"
         state: directory
         mode: "0755"
-        owner: "{{ sandboxd_file_owner }}"
-        group: "{{ sandboxd_file_owner }}"
+        owner: root
+        group: root
       loop:
         - "{{ firecracker.run_dir | default('/run/sandboxd/firecracker') }}"
         - "{{ firecracker.templates_dir | default('/var/lib/sandboxd/firecracker/templates') }}"
@@ -744,36 +764,67 @@
     # Shared SSH host key (UC-22). Same two-mode pattern as the secrets above:
     # config/secrets.yml `ssh.host_key` wins over a control-node file. When
     # neither is set the tasks skip and sandboxd generates a per-node key at
-    # sandboxd_ssh_host_key_path on first boot.
+    # sandboxd_ssh_host_key_path on first boot. In split the key goes in the
+    # secrets folder (sandboxd_split_ssh_host_key_path), not in sandboxd's
+    # own folder, and SB_SSH_HOST_KEY_PATH names it there.
     - name: Ensure sandboxd state directory exists (shared SSH host key)
-      when: >-
-        ((ssh | default({})).host_key | default('') | length > 0)
-        or (sandboxd_ssh_host_key_src | length > 0)
+      when:
+        - sandboxd_privilege_mode != 'split'
+        - sandboxd_shared_ssh_host_key | bool
       ansible.builtin.file:
         path: "{{ sandboxd_ssh_host_key_path | dirname }}"
         state: directory
         mode: "0700"
-        owner: "{{ sandboxd_file_owner }}"
-        group: "{{ sandboxd_file_owner }}"
+        owner: root
+        group: root
 
     - name: Install shared SSH host key (from config/secrets.yml)
-      when: (ssh | default({})).host_key | default('') | length > 0
+      when:
+        - sandboxd_privilege_mode != 'split'
+        - (ssh | default({})).host_key | default('') | length > 0
       ansible.builtin.copy:
         content: "{{ (ssh | default({})).host_key }}\n"
         dest: "{{ sandboxd_ssh_host_key_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      no_log: true
+      notify: Apply sandboxd ops config
+
+    - name: Install shared SSH host key (from control-node file)
+      when:
+        - sandboxd_privilege_mode != 'split'
+        - sandboxd_ssh_host_key_src | length > 0
+        - ((ssh | default({})).host_key | default('') | length) == 0
+      ansible.builtin.copy:
+        src: "{{ sandboxd_ssh_host_key_src }}"
+        dest: "{{ sandboxd_ssh_host_key_path }}"
+        mode: "0600"
+        owner: root
+        group: root
+      notify: Apply sandboxd ops config
+
+    - name: Install shared SSH host key in the secrets folder (split, from config/secrets.yml)
+      when:
+        - sandboxd_privilege_mode == 'split'
+        - (ssh | default({})).host_key | default('') | length > 0
+      ansible.builtin.copy:
+        content: "{{ (ssh | default({})).host_key }}\n"
+        dest: "{{ sandboxd_split_ssh_host_key_path }}"
         mode: "0600"
         owner: "{{ sandboxd_file_owner }}"
         group: "{{ sandboxd_file_owner }}"
       no_log: true
       notify: Apply sandboxd ops config
 
-    - name: Install shared SSH host key (from control-node file)
+    - name: Install shared SSH host key in the secrets folder (split, from control-node file)
       when:
+        - sandboxd_privilege_mode == 'split'
         - sandboxd_ssh_host_key_src | length > 0
         - ((ssh | default({})).host_key | default('') | length) == 0
       ansible.builtin.copy:
         src: "{{ sandboxd_ssh_host_key_src }}"
-        dest: "{{ sandboxd_ssh_host_key_path }}"
+        dest: "{{ sandboxd_split_ssh_host_key_path }}"
         mode: "0600"
         owner: "{{ sandboxd_file_owner }}"
         group: "{{ sandboxd_file_owner }}"

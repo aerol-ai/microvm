@@ -487,9 +487,10 @@ variable "firecracker" {
 
     With privilege_mode: split in config/cluster.yml, the default kernel_path
     becomes /usr/local/lib/aerolvm-firecracker/vmlinux (a folder only root
-    writes), and an unset jailer_uid and jailer_gid leave the VMs to the
-    sandboxd-jailer user install.sh makes. In single they are uid and gid
-    1000, as before. See Terraform/README.md, "Privilege mode split".
+    writes), and when jailer_uid and jailer_gid are unset split runs the VMs
+    as a user of their own, sandboxd-jailer, which install.sh makes. Unset in
+    single is uid and gid 1000, as before. See Terraform/README.md,
+    "Privilege mode split".
   EOT
   type = object({
     binary_url                   = optional(string, "")

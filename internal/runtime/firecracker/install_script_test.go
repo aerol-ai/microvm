@@ -405,6 +405,10 @@ func TestInstallShInstallsFirecracker(t *testing.T) {
 			},
 			never:   []string{kernelURL("x86_64"), "useradd"},
 			wantErr: "has no build config", wantRelease: true, keepsKernel: true},
+		{name: "split makes no folder of sandboxd's", arch: "x86_64",
+			env:         map[string]string{"PRIVILEGE_MODE": "split"},
+			want:        []string{releaseURL("x86_64"), kernelURL("x86_64"), useradd},
+			wantRelease: true, wantKernel: true},
 		{name: "a failed download stops the install", arch: "x86_64",
 			env:     map[string]string{"FAKE_DOWNLOAD_OK": "0"},
 			want:    []string{releaseURL("x86_64")},
@@ -483,7 +487,17 @@ func TestInstallShInstallsFirecracker(t *testing.T) {
 				t.Errorf("kernel installed by a failed run: %q, %v", kernel, kernelErr)
 			}
 			if tc.wantErr == "" {
-				for _, dir := range []string{h.templates, h.chroot} {
+				dirs := []string{h.chroot}
+				if tc.env["PRIVILEGE_MODE"] == "split" {
+					// sandboxd's user owns the templates folder's parent in
+					// split; root makes nothing there.
+					if _, err := os.Stat(h.templates); !os.IsNotExist(err) {
+						t.Errorf("split: root made the templates folder %s: %v", h.templates, err)
+					}
+				} else {
+					dirs = append(dirs, h.templates)
+				}
+				for _, dir := range dirs {
 					if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 						t.Errorf("%s not created: %v", dir, err)
 					}

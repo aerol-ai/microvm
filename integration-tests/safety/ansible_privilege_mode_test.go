@@ -26,6 +26,8 @@ const (
 	aUnknownMode = "Refuse an unknown privilege_mode"
 	aEngine      = "Refuse a split node without the containerd engine or its netns pool"
 	aFirecracker = "Refuse Firecracker settings privilege mode split cannot run"
+	aClean       = "Refuse paths privilege mode split cannot check"
+	aRootFiles   = "Refuse root-run Firecracker files in sandboxd's folders"
 	aFolders     = "Refuse runtime folders a split sandboxd cannot write"
 	aUnit        = "Refuse Firecracker on a split node install.sh did not set up for it"
 )
@@ -68,7 +70,16 @@ var ansibleCases = map[string]ansibleCase{
 	"split_no_netns":   {set: map[string]any{"privilege_mode": "split", "containerd.native_netns_pool_enabled": false}, wantFailed: aEngine},
 	"split_unjailed":   {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true, "firecracker.use_jailer": false}, unit: splitUnit, wantFailed: aFirecracker},
 	"split_chroot":     {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true, "firecracker.jailer_chroot_base": "/data/jailer"}, unit: splitUnit, wantFailed: aFirecracker},
-	"split_kernel_run": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true, "firecracker.kernel_path": "/run/sandboxd/vmlinux"}, unit: splitUnit, wantFailed: aFirecracker},
+	"split_kernel_run": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true, "firecracker.kernel_path": "/run/sandboxd/vmlinux"}, unit: splitUnit, wantFailed: aRootFiles},
+	"split_kernel_tls": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true, "firecracker.kernel_path": "/etc/sandboxd/tls/vmlinux"}, unit: splitUnit, wantFailed: aRootFiles},
+	"split_jailer_in_data": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
+		"firecracker.jailer_path": "/var/lib/sandboxd/bin/jailer"}, unit: splitUnit, wantFailed: aRootFiles},
+	"split_firecracker_in_procid": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
+		"firecracker.binary_path": "/run/aerolvm-procid/firecracker"}, unit: splitUnit, wantFailed: aRootFiles},
+	"split_kernel_dotdot": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
+		"firecracker.kernel_path": "/usr/local/lib/../../../var/lib/sandboxd/vmlinux"}, unit: splitUnit, wantFailed: aClean},
+	"split_modules_doubleslash": {set: map[string]any{"privilege_mode": "split", "wasm.enabled": true,
+		"wasm.modules_dir": "/var/lib//sandboxd/wasm"}, wantFailed: aClean},
 	"split_templates": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
 		"firecracker.templates_dir": "/data/templates"}, unit: splitUnit, wantFailed: aFolders},
 	"split_wasm_modules": {set: map[string]any{"privilege_mode": "split", "wasm.enabled": true,
@@ -214,11 +225,260 @@ func TestAnsiblePrivilegeWiring(t *testing.T) {
 	if !single {
 		t.Error("the single-mode sandboxd restart also runs in split")
 	}
-	// A split sandboxd writes checkpoints in the WASM modules folder.
-	stage := readRepoFile(t, "Ansible", "playbooks", "stage-wasm-modules.yml")
-	if !strings.Contains(stage, `wasm_modules_owner: "{{ 'sandboxd' if (privilege_mode | default('single')) == 'split' else 'root' }}"`) ||
-		strings.Contains(stage, "owner: root") {
-		t.Error("stage-wasm-modules.yml gives the modules folder to root in split")
+}
+
+// splitPlaybooks are the playbooks that run on a split node and write files.
+var splitPlaybooks = []string{"configure-ops.yml", "stage-wasm-modules.yml"}
+
+// In privilege mode split, sandboxd's user owns its folders and can swap any
+// name in them for a link. Ansible's modules follow links, in every folder of
+// a path (follow: false covers only the last part), so a task that runs as
+// root, or that sets an owner or group (a chown as root), must not act on a
+// path inside them. This walks every task of the playbooks that can run in
+// split and checks each path its arguments name, with the variables they
+// use filled in from group_vars, the play's vars and config/cluster.yml.
+func TestAnsibleSplitRootStaysOutOfAgentFolders(t *testing.T) {
+	bad, handed := splitRootTasksInAgentFolders(t, nil)
+	for _, b := range bad {
+		t.Errorf("acts as root inside a folder sandboxd's user owns in split: %s", b)
+	}
+	if len(handed) != 0 {
+		t.Errorf("tasks hand these folders to sandboxd's user and so make them its own: %q", handed)
+	}
+}
+
+// splitRootTasksInAgentFolders returns the split tasks that act as root on a
+// path inside sandboxd's folders, and the folders a split task hands that
+// user. edit, when set, changes a playbook's text before it is read.
+func splitRootTasksInAgentFolders(t *testing.T, edit func(name, src string) string) (bad, handed []string) {
+	t.Helper()
+	vars := ansibleStringVars(t)
+	var tasks []ansibleTaskView
+	for _, pb := range splitPlaybooks {
+		src := readRepoFile(t, "Ansible", "playbooks", pb)
+		if edit != nil {
+			src = edit(pb, src)
+		}
+		var plays []map[string]any
+		if err := yaml.Unmarshal([]byte(src), &plays); err != nil {
+			t.Fatalf("%s: %v", pb, err)
+		}
+		for _, play := range plays {
+			playVars, _ := play["vars"].(map[string]any)
+			for k, v := range playVars {
+				if sv, ok := v.(string); ok && !strings.Contains(sv, " if ") {
+					vars[k] = sv
+				}
+			}
+			view := ansibleTaskView{become: play["become"] == true, becomeUser: fmt.Sprint(play["become_user"])}
+			for _, list := range []string{"pre_tasks", "tasks", "handlers"} {
+				tasks = append(tasks, walkAnsibleTasks(pb, play[list], view)...)
+			}
+		}
+	}
+	dirs := append([]string{}, splitAgentDirs...)
+	for _, task := range tasks {
+		if task.split() && task.dir != "" && (task.owner == "sandboxd" || strings.Contains(task.owner, "sandboxd_file_owner")) {
+			d := expandAnsible(task.dir, vars)
+			dirs = append(dirs, d)
+			handed = append(handed, d)
+		}
+	}
+	for _, task := range tasks {
+		if !task.split() || !task.asRoot() {
+			continue
+		}
+		text := expandAnsible(task.text, vars)
+		for _, d := range dirs {
+			if strings.Contains(text, d+"/") {
+				bad = append(bad, fmt.Sprintf("%s %q (%s)", task.playbook, task.name, d))
+				break
+			}
+		}
+	}
+	return bad, handed
+}
+
+// ansibleTaskView is what the walk needs of one task.
+type ansibleTaskView struct {
+	playbook, name string
+	when           []string
+	become         bool
+	becomeUser     string
+	text           string // the module's arguments and the loop, as YAML
+	setsOwner      bool   // owner: or group: in the arguments
+	owner, dir     string // owner:, and path: of a state: directory task
+}
+
+// split: not left out of privilege mode split by its when.
+func (v ansibleTaskView) split() bool {
+	for _, w := range v.when {
+		w = strings.Join(strings.Fields(w), " ")
+		if strings.Contains(w, "!= 'split'") || strings.Contains(w, "== 'single'") {
+			return false
+		}
+	}
+	return true
+}
+
+// asRoot: becomes root in split, or chowns.
+func (v ansibleTaskView) asRoot() bool {
+	agent := v.becomeUser == "sandboxd" ||
+		(strings.Contains(v.becomeUser, "'sandboxd' if") && strings.Contains(v.becomeUser, "== 'split'"))
+	return (v.become && !agent) || v.setsOwner
+}
+
+var ansibleKeywords = map[string]bool{"name": true, "when": true, "loop": true, "loop_control": true, "register": true,
+	"notify": true, "listen": true, "no_log": true, "changed_when": true, "failed_when": true, "check_mode": true,
+	"become": true, "become_user": true, "run_once": true, "vars": true, "tags": true, "delegate_to": true,
+	"block": true, "rescue": true, "always": true, "args": true, "environment": true, "ignore_errors": true,
+	"until": true, "retries": true, "delay": true}
+
+func walkAnsibleTasks(playbook string, list any, parent ansibleTaskView) []ansibleTaskView {
+	items, _ := list.([]any)
+	var out []ansibleTaskView
+	for _, it := range items {
+		task, ok := it.(map[string]any)
+		if !ok {
+			continue
+		}
+		v := parent
+		v.playbook, v.name = playbook, fmt.Sprint(task["name"])
+		v.when = append(append([]string{}, parent.when...), whenList(task["when"])...)
+		if b, ok := task["become"].(bool); ok {
+			v.become = b
+		}
+		if u, ok := task["become_user"]; ok {
+			v.becomeUser = fmt.Sprint(u)
+		}
+		if _, ok := task["block"]; ok {
+			for _, k := range []string{"block", "rescue", "always"} {
+				out = append(out, walkAnsibleTasks(playbook, task[k], v)...)
+			}
+			continue
+		}
+		for k, args := range task {
+			if ansibleKeywords[k] {
+				continue
+			}
+			b, _ := yaml.Marshal(map[string]any{k: args, "loop": task["loop"]})
+			v.text = string(b)
+			if m, ok := args.(map[string]any); ok {
+				_, o := m["owner"]
+				_, g := m["group"]
+				v.setsOwner = o || g
+				if m["state"] == "directory" {
+					v.owner, v.dir = fmt.Sprint(m["owner"]), fmt.Sprint(m["path"])
+				}
+			}
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+func whenList(w any) []string {
+	switch w := w.(type) {
+	case string:
+		return []string{w}
+	case []any:
+		var out []string
+		for _, x := range w {
+			out = append(out, fmt.Sprint(x))
+		}
+		return out
+	}
+	return nil
+}
+
+// ansibleStringVars are the string settings a task can name: group_vars'
+// defaults, and config/cluster.yml's, by dotted path (wasm.modules_dir).
+func ansibleStringVars(t *testing.T) map[string]string {
+	t.Helper()
+	vars := map[string]string{}
+	var defaults map[string]any
+	if err := yaml.Unmarshal([]byte(readRepoFile(t, "Ansible", "inventory", "group_vars", "all", "defaults.yml")), &defaults); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range defaults {
+		if sv, ok := v.(string); ok {
+			vars[k] = sv
+		}
+	}
+	var cluster map[string]any
+	if err := yaml.Unmarshal([]byte(readRepoFile(t, "config", "cluster.yml")), &cluster); err != nil {
+		t.Fatal(err)
+	}
+	var walk func(prefix string, m map[string]any)
+	walk = func(prefix string, m map[string]any) {
+		for k, v := range m {
+			switch v := v.(type) {
+			case string:
+				vars[prefix+k] = v
+			case map[string]any:
+				walk(prefix+k+".", v)
+			}
+		}
+	}
+	walk("", cluster)
+	return vars
+}
+
+// expandAnsible fills in the variables a text names, a few rounds deep, and
+// drops Jinja's braces, so "{{ sandboxd_secrets_dir }}/k" reads as a path.
+func expandAnsible(text string, vars map[string]string) string {
+	names := make([]string, 0, len(vars))
+	for k := range vars {
+		names = append(names, k)
+	}
+	sort.Slice(names, func(i, j int) bool { return len(names[i]) > len(names[j]) })
+	for round := 0; round < 4; round++ {
+		for _, k := range names {
+			text = regexp.MustCompile(`(^|[^A-Za-z0-9_.])`+regexp.QuoteMeta(k)+`($|[^A-Za-z0-9_])`).
+				ReplaceAllString(text, "${1}"+strings.ReplaceAll(vars[k], "$", "$$")+"${2}")
+		}
+	}
+	return regexp.MustCompile(`\{\{\s*|\s*\}\}`).ReplaceAllString(text, "")
+}
+
+// The walk finds what this branch fixed, put back one at a time.
+func TestAnsibleSplitRootCheckFindsTheBugs(t *testing.T) {
+	cases := map[string]struct {
+		playbook, from, to string
+	}{
+		"root makes Firecracker's folders": {"configure-ops.yml",
+			"        - firecracker.enabled | default(false) | bool\n        - sandboxd_privilege_mode != 'split'\n      ansible.builtin.file:\n        path: \"{{ item }}\"\n        state: directory\n        mode: \"0755\"\n        owner: root",
+			"        - firecracker.enabled | default(false) | bool\n      ansible.builtin.file:\n        path: \"{{ item }}\"\n        state: directory\n        mode: \"0755\"\n        owner: root"},
+		"root stages the WASM modules": {"stage-wasm-modules.yml",
+			"  become_user: \"{{ 'sandboxd' if (privilege_mode | default('single')) == 'split' else 'root' }}\"\n", ""},
+		"the secrets folder is sandboxd's": {"configure-ops.yml",
+			"        owner: root\n        group: \"{{ sandboxd_file_owner }}\"\n",
+			"        owner: \"{{ sandboxd_file_owner }}\"\n        group: \"{{ sandboxd_file_owner }}\"\n"},
+		"root writes the SSH host key in /var/lib/sandboxd": {"configure-ops.yml",
+			"      when:\n        - sandboxd_privilege_mode != 'split'\n        - (ssh | default({})).host_key | default('') | length > 0\n",
+			"      when:\n        - (ssh | default({})).host_key | default('') | length > 0\n"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			found := false
+			bad, _ := splitRootTasksInAgentFolders(t, func(pb, src string) string {
+				if pb != c.playbook {
+					return src
+				}
+				if strings.Count(src, c.from) != 1 {
+					t.Fatalf("%s: the text to put back is not there once", pb)
+				}
+				found = true
+				return strings.Replace(src, c.from, c.to, 1)
+			})
+			if !found {
+				t.Fatalf("%s not read", c.playbook)
+			}
+			if len(bad) == 0 {
+				t.Error("the walk does not find it")
+			}
+			t.Logf("found: %q", bad)
+		})
 	}
 }
 
