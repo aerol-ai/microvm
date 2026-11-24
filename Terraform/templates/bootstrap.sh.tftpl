@@ -280,6 +280,13 @@ INSTALL_ARGS+=(--buildkit-rootless)
 # only the containerd engine, and builds with rootless BuildKit, which
 # install.sh turns on with it.
 INSTALL_ARGS+=(--with-containerd-engine --privilege-mode split)
+%{ if with_firecracker ~}
+# Firecracker in split: the root helper runs each VM, and install.sh sets
+# the node up for it. It lets sandboxd write the jailer's folder, puts the
+# guest kernel in a folder only root writes, and makes the sandboxd-jailer
+# user. Section 2d below still fetches this cluster's own Firecracker files.
+INSTALL_ARGS+=(--with-firecracker)
+%{ endif ~}
 %{ endif ~}
 %{ endif ~}
 %{ if ingress_proxy_routing == true ~}
@@ -1004,8 +1011,12 @@ SB_FIRECRACKER_RUN_DIR=${firecracker_run_dir}
 SB_FIRECRACKER_TEMPLATES_DIR=${firecracker_templates_dir}
 SB_FIRECRACKER_USE_JAILER=${firecracker_use_jailer}
 SB_JAILER_CHROOT_BASE=${firecracker_jailer_chroot_base}
+%{ if firecracker_jailer_uid != null ~}
 SB_JAILER_UID=${firecracker_jailer_uid}
+%{ endif ~}
+%{ if firecracker_jailer_gid != null ~}
 SB_JAILER_GID=${firecracker_jailer_gid}
+%{ endif ~}
 SB_FIRECRACKER_TAP_BASE_CIDR=${firecracker_tap_base_cidr}
 SB_FIRECRACKER_TAP_POOL_SIZE=${firecracker_tap_pool_size}
 SB_FIRECRACKER_SKOPEO_BIN=${firecracker_skopeo_bin}
@@ -1480,7 +1491,15 @@ UNIT
 %{ endif ~}
 fi
 
+%{ if containerd_cfg.privilege_mode == "split" ~}
+# Privilege mode split: the root helper reads cluster.env too, and it started
+# before the lines above were added (the WASM, Firecracker and volume
+# settings among them). So it restarts with sandboxd. Restarting the helper
+# stops no sandbox.
+sudo systemctl restart aerolvm-rootd sandboxd
+%{ else ~}
 sudo systemctl restart sandboxd
+%{ endif ~}
 
 ${extra_user_data}
 

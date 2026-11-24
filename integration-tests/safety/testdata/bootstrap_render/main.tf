@@ -396,6 +396,70 @@ output "joiner_join_privilege_split" {
   }))
 }
 
+# Split with each runtime (TestBootstrapSplitRunsEveryRuntime). Firecracker
+# takes nodes.tf's split values (Terraform/privilege_mode.tf): the kernel in
+# root's folder and no jailer ids, so install.sh's sandboxd-jailer user runs
+# the VMs. V8 isolates, WASM and the containerd warm pool take nothing new.
+output "joiner_join_privilege_split_firecracker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                 = false
+    role                    = "worker"
+    one_line_join           = true
+    join_token              = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg          = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    with_firecracker        = true
+    firecracker_kernel_path = "/usr/local/lib/aerolvm-firecracker/vmlinux"
+    firecracker_use_jailer  = true
+    firecracker_jailer_uid  = null
+    firecracker_jailer_gid  = null
+  }))
+}
+
+output "joiner_join_privilege_split_isolate" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    one_line_join  = true
+    join_token     = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    with_isolate   = true
+  }))
+}
+
+output "joiner_join_privilege_split_wasm" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed        = false
+    one_line_join  = true
+    join_token     = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    wasm_cfg       = { enabled = "true", cache_dir = "/var/lib/sandboxd/wasm/cache", modules_dir = "/var/lib/sandboxd/wasm/modules", pool_depth_default = "2", pool_enabled = "true", pull_timeout = "60s", push_host = "", registry_allowlist = "", registry_pat_path = "", registry_username = "", standard_modules = "" }
+  }))
+}
+
+output "joiner_join_privilege_split_pool" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed             = false
+    one_line_join       = true
+    join_token          = "aaaaaa.00000000000000000000000000000000"
+    containerd_cfg      = { socket = "x", namespace = "x", cni_plugin_dir = "x", native_netns_pool_enabled = "true", buildkit_rootless = "false", privilege_mode = "split" }
+    containerd_pool_cfg = { enabled = "true", depth = "2", images = "", max_images = "8", idle_ttl = "15m", refill_interval = "5s" }
+  }))
+}
+
+# Single with Firecracker on: Terraform installs it itself, as before, so
+# install.sh gets no --with-firecracker, and the jailer runs as uid 1000.
+output "joiner_join_firecracker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                = false
+    role                   = "worker"
+    one_line_join          = true
+    join_token             = "aaaaaa.00000000000000000000000000000000"
+    with_firecracker       = true
+    firecracker_use_jailer = true
+    firecracker_jailer_uid = 1000
+    firecracker_jailer_gid = 1000
+  }))
+}
+
 # The old join path never passes it, whatever cluster.yml says: Terraform's
 # plan refuses split there (validate_cluster_ops).
 output "joiner_privilege_split_oldpath" {
