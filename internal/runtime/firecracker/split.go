@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
@@ -44,12 +43,13 @@ import (
 //   - In, writable (a start's disk copies, a cold boot): as the jailer's,
 //     through the stage folder, as before.
 //
-// A disk saved as an image is read by an export VM, one more VM of the
-// helper's (M1 PR 18). What split mode does not do yet answers 501 with a
-// reason: the warm VM pool (errSplitWarmPool), whose paused VMs run under
-// their slot's ID until a sandbox claims them. The ownership lease cannot
-// freeze a VM (its group is root's): Freeze answers ErrCannotFreeze, and
-// the lease stops the VM instead.
+// The warm VM pool and disk images run too (M1 PR 18). A warm slot's VM
+// runs under the slot's ID for its whole life, claimed or not: the helper
+// knows it by that name, and the driver reaches it through the jail its run
+// dir is in (splitJailOf), never by the sandbox's ID. A disk saved as an
+// image is read by an export VM, one more VM of the helper's. The ownership
+// lease cannot freeze a VM (its group is root's): Freeze answers
+// ErrCannotFreeze, and the lease stops the VM instead.
 
 // SplitHelper is the root helper's Firecracker calls, as
 // internal/rootclient makes them (pkg/daemon adapts the client).
@@ -94,9 +94,6 @@ type SplitProcess interface {
 	StartTicks() uint64
 }
 
-// What split mode refuses for Firecracker: the warm VM pool.
-var errSplitWarmPool = privmode.NotYet("run the Firecracker warm VM pool", privmode.StepFirecrackerWarmPool)
-
 // SetSplit makes the driver run its VMs through the root helper h:
 // privilege mode split. It replaces the spawner and the TAP host. Call it
 // after the other setters.
@@ -104,14 +101,6 @@ func (d *Driver) SetSplit(h SplitHelper) {
 	d.split = h
 	d.spawn = d.splitSpawn
 	d.tapHost = splitTapHost{h: h}
-}
-
-// splitGap refuses gap in split mode; nil in single.
-func (d *Driver) splitGap(gap error) error {
-	if d.split != nil {
-		return gap
-	}
-	return nil
 }
 
 // splitSpawn is the spawner in split mode: the helper makes the jail
@@ -364,6 +353,17 @@ func (t splitTapHost) Ensure(ctx context.Context, slot TapSlot) error {
 }
 
 func (t splitTapHost) Remove(ctx context.Context, name string) error { return t.h.RemoveTap(ctx, name) }
+
+// splitRecordJail is the jail a VM's record says it runs in, from the
+// record's run dir: the sandbox's own for a cold boot, the warm slot's for a
+// VM claimed from the pool (M1 PR 18). A record whose run dir is no jail
+// names the sandbox's, which the helper then finds empty.
+func (d *Driver) splitRecordJail(rec vmmRecord) string {
+	if id, _, _, err := d.splitJailOf(rec.RunDir); err == nil {
+		return id
+	}
+	return rec.SandboxID
+}
 
 // splitOpenProcess holds a VM a previous sandboxd started, through the
 // helper (adoptVM in split mode).

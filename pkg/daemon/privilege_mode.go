@@ -59,7 +59,6 @@ func checkPrivilegeMode(cfg config.Config) error {
 		return errors.New("SB_PRIVILEGE_MODE=split needs SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED=true: " +
 			"the root helper makes every sandbox's network namespace for the pool")
 	}
-	var gaps []privmode.Step
 	// The host firewall (SB_ENABLE_NETWORK_RULES) and enterprise mode's
 	// IPv6 fence are the helper's from M1 PR 5 (split_firewall.go); the
 	// hostname gateway's host side (SB_EGRESS_FQDN_ENABLED, split_egress.go)
@@ -85,23 +84,21 @@ func checkPrivilegeMode(cfg config.Config) error {
 	}
 	// Firecracker VMs are the helper's from M1 PR 9b (split_firecracker.go):
 	// it runs the jailer, makes each VM's jail, TAP and filesystems, keeps
-	// the guests' firewall (M1 PR 14) and hands a VM's memory and state
-	// files across (M1 PR 14b). It always runs the jailer, and it does not
-	// run the warm VM pool yet.
-	if cfg.EnableFirecracker {
-		if !cfg.UseJailer {
-			return errors.New("SB_PRIVILEGE_MODE=split runs every Firecracker VM through the root helper's jailer: " +
-				"set SB_FIRECRACKER_USE_JAILER=true, or run this node in privilege mode single")
-		}
-		if cfg.FirecrackerVMMPoolEnabled {
-			gaps = append(gaps, privmode.StepFirecrackerWarmPool)
-		}
+	// the guests' firewall (M1 PR 14), hands a VM's memory and state files
+	// across (M1 PR 14b), and runs the warm VM pool's slots and the export
+	// VM that saves a disk as an image (M1 PR 18). It always runs the
+	// jailer.
+	if cfg.EnableFirecracker && !cfg.UseJailer {
+		return errors.New("SB_PRIVILEGE_MODE=split runs every Firecracker VM through the root helper's jailer: " +
+			"set SB_FIRECRACKER_USE_JAILER=true, or run this node in privilege mode single")
 	}
 	// gVisor checkpoint moves (SB_GVISOR_CHECKPOINT_MOVES) are the
 	// helper's from M1 PR 13: it runs runsc checkpoint and keeps both
 	// sides' checkpoints in its own moves folder (containerd
-	// split_moves.go, rootd moves.go).
-	return privmode.NotYet("start sandboxd", gaps...)
+	// split_moves.go, rootd moves.go). With M1 PR 18 no setting is left
+	// that split runs without: a new gap names its privmode step here, and
+	// the chart refuses it too (TestChartRefusalsCoverEveryDaemonGap).
+	return nil
 }
 
 // agentGroups are this process's supplementary groups; tests stand them in.

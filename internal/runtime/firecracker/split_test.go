@@ -287,23 +287,6 @@ func (r fakeResolver) Resolve(context.Context, string) (*TemplateResolution, err
 	return r.res, nil
 }
 
-// TestSplitRefusesWarmPool: what split mode does not run yet answers 501
-// naming its step (M1 PR 14b), and the lease cannot freeze a VM.
-func TestSplitRefusesWarmPool(t *testing.T) {
-	d, _, _, _ := splitDriver(t, newFakeSplit(t))
-	ctx := context.Background()
-	_, err := d.WarmSpawn(ctx, WarmSpawnRequest{})
-	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "warm VM pool") {
-		t.Errorf("WarmSpawn: %v, want a 501 naming the step", err)
-	}
-	if err := d.Freeze(ctx, "sb-1"); !errors.Is(err, sbruntime.ErrCannotFreeze) {
-		t.Fatalf("Freeze: %v", err)
-	}
-	if err := d.Thaw(ctx, "sb-1"); err != nil {
-		t.Fatalf("Thaw: %v", err)
-	}
-}
-
 func TestSplitVMM(t *testing.T) {
 	f := newFakeSplit(t)
 	d, _, _, _ := splitDriver(t, f)

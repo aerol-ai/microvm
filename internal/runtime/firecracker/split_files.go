@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -113,6 +114,34 @@ func sameFileAs(a, b string) bool {
 	}
 	bi, err := os.Lstat(b)
 	return err == nil && bi.Mode().IsRegular() && os.SameFile(ai, bi)
+}
+
+// agentSocket reports whether the socket at path is there with sandboxd's
+// group able to use it, as the helper leaves a VM's sockets it shared
+// (group sandboxd's, 0660). A seam for tests.
+var agentSocket = func(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || fi.Mode()&fs.ModeSocket == 0 || fi.Mode().Perm()&0o060 != 0o060 {
+		return false
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	gid := int64(st.Gid)
+	if gid == int64(os.Getegid()) {
+		return true
+	}
+	groups, err := os.Getgroups()
+	if err != nil {
+		return false
+	}
+	for _, g := range groups {
+		if int64(g) == gid {
+			return true
+		}
+	}
+	return false
 }
 
 // chrootFile is a file to copy out of a VM's chroot: its name there and

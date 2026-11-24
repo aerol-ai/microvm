@@ -96,6 +96,17 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		},
 		// And gVisor checkpoint moves.
 		func(c *config.Config) { c.GvisorCheckpointMoves = true },
+		// M1 PR 18: the Firecracker warm VM pool, alone and beside every
+		// other closed step.
+		func(c *config.Config) {
+			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
+		},
+		func(c *config.Config) {
+			wasmSplit(c)
+			c.WasmResidentHostEnabled, c.WasmPoolEnabled = false, true
+			c.GvisorCheckpointMoves, c.ContainerdPoolEnabled = true, true
+			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
+		},
 	} {
 		cfg := splitConfig()
 		set(&cfg)
@@ -121,18 +132,6 @@ func TestCheckPrivilegeMode(t *testing.T) {
 		// The helper runs every VM through its jailer: an unjailed one is
 		// single mode only.
 		{"Firecracker unjailed", func(c *config.Config) { c.EnableFirecracker = true }, "SB_FIRECRACKER_USE_JAILER=true", nil},
-		{"the warm VM pool", func(c *config.Config) {
-			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
-		},
-			"warm VM pool", []privmode.Step{privmode.StepFirecrackerWarmPool}},
-		// With the closed steps on beside it (the WASM warm pool, gVisor
-		// moves, the containerd warm pool), only the open one is named.
-		{"one gap among closed ones", func(c *config.Config) {
-			wasmSplit(c)
-			c.WasmResidentHostEnabled, c.WasmPoolEnabled = false, true
-			c.GvisorCheckpointMoves, c.ContainerdPoolEnabled = true, true
-			c.EnableFirecracker, c.UseJailer, c.FirecrackerVMMPoolEnabled = true, true, true
-		}, "Firecracker", []privmode.Step{privmode.StepFirecrackerWarmPool}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := splitConfig()
