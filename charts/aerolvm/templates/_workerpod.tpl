@@ -28,7 +28,18 @@ and no shared process namespace. */}}
 {{- $moves := $root.Values.worker.gvisor.checkpointMoves }}
 {{- if kindIs "invalid" $moves }}{{ $moves = not $split }}{{ end }}
 {{- if $split }}{{ $externalStorage = false }}{{ end }}
-{{- if or $externalStorage $root.Values.worker.wasm.enabled $root.Values.worker.isolate.enabled $root.Values.worker.firecracker.enabled }}
+{{- $wasm := $root.Values.worker.wasm.enabled }}
+{{- $isolate := $root.Values.worker.isolate.enabled }}
+{{- /* The V8 jail's chroots. In split the root helper links, mounts and
+removes in them, so they sit outside every folder the agent writes (the
+helper refuses a base inside one): /srv/isolate-jail, the base sandboxd
+and the helper use on a VM. */}}
+{{- $jailBase := "/var/lib/sandboxd/isolate-jail" }}
+{{- if $split }}{{ $jailBase = "/srv/isolate-jail" }}{{ end }}
+{{- /* In split the root helper starts WASM and V8 hosts in the runtime
+container, so they outlive an agent restart with no process namespace
+shared (C14). */}}
+{{- if and (not $split) (or $externalStorage $wasm $isolate $root.Values.worker.firecracker.enabled) }}
 # One process namespace for the pod, only when something needs it: WASM,
 # V8-isolate and Firecracker sandboxes, and external-storage mount helpers,
 # are processes sandboxd starts in the runtime container's group. With the
@@ -48,14 +59,26 @@ securityContext:
   sysctls:
     - { name: net.ipv4.ip_unprivileged_port_start, value: "0" }
 {{- end }}
-{{- if and $split ($root.Values.enterprise | default dict).enabled }}
+{{- $enterprise := ($root.Values.enterprise | default dict).enabled }}
+{{- if and $split (or $enterprise $wasm) }}
 {{- if not $root.Values.edge.enabled }}
 securityContext:
 {{- end }}
-  # Enterprise mode: sandboxd gives the edge its public API socket by group
-  # (SB_PUBLIC_API_SOCKET_GROUP), and a split agent, not root, can hand a
-  # file only to a group it is in.
-  supplementalGroups: [65532]
+  supplementalGroups:
+    {{- if $enterprise }}
+    # Enterprise mode: sandboxd gives the edge its public API socket by
+    # group (SB_PUBLIC_API_SOCKET_GROUP), and a split agent, not root, can
+    # hand a file only to a group it is in.
+    - 65532
+    {{- end }}
+    {{- if $wasm }}
+    # The WASM workers' group (SB_WASM_WORKER_GID): a split agent shares
+    # each WASM sandbox's files with its worker by group, as on a VM, and
+    # refuses to start outside it. The group reaches every container here,
+    # but those files sit only in the agent's own volumes; the workers and
+    # the egress gateway drop every group.
+    - 61000
+    {{- end }}
 {{- end }}
 terminationGracePeriodSeconds: 30
 {{- if $cluster }}
@@ -131,6 +154,10 @@ initContainers:
         chown 0:0 /run/aerolvm-egress
         chmod 0755 /run/aerolvm-egress
         chown 65532:65532 /run/aerolvm-egress
+        {{- if $isolate }}
+        chown 0:0 {{ $jailBase }}
+        chmod 0755 {{ $jailBase }}
+        {{- end }}
     securityContext:
       runAsUser: 0
       runAsNonRoot: false
@@ -150,6 +177,42 @@ initContainers:
       - { name: containerd, mountPath: /var/lib/aerolvm-rootd-moves, subPath: aerolvm-rootd-moves }
       - { name: state, mountPath: /var/lib/sandboxd }
       - { name: run-egress, mountPath: /run/aerolvm-egress }
+      {{- if $isolate }}
+      - { name: isolate-jail, mountPath: {{ $jailBase }} }
+      {{- end }}
+  {{- if $isolate }}
+  # workerd for the V8 jail, from this release's agent image, into a folder
+  # of root's that only the runtime container mounts, read only: the root
+  # helper reads its libraries (ldd) and copies it into each jail's base, so
+  # it must come from no folder the agent can write. As root with no
+  # capability at all: it writes only its own volume, whose top the kubelet
+  # made root's. An agent image swapped in place leaves this copy as it is
+  # until the pod is made again, as the runtime image's tools are.
+  - name: workerd
+    image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
+    imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+    command: ["/bin/sh", "-c"]
+    args:
+      - |
+        set -eu
+        install -m 0755 /usr/local/bin/workerd /opt/aerolvm-workerd/.workerd.new
+        mv -f /opt/aerolvm-workerd/.workerd.new /opt/aerolvm-workerd/workerd
+        chmod 0755 /opt/aerolvm-workerd
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 100m, memory: 128Mi }
+    volumeMounts:
+      - { name: workerd, mountPath: /opt/aerolvm-workerd }
+  {{- end }}
   {{- end }}
 containers:
   - name: runtime
@@ -194,9 +257,9 @@ containers:
       # lease limit instead of after the grace (C19).
       - { name: SB_OWNERSHIP_LEASE_FILE, value: /run/aerolvm/ownership-lease }
       {{- end }}
-      {{- if $root.Values.worker.isolate.enabled }}
+      {{- if $isolate }}
       # The V8 jail's mounts, unmounted when the pod ends (as netns, F8).
-      - { name: SB_ISOLATE_JAIL_DIR, value: /var/lib/sandboxd/isolate-jail }
+      - { name: SB_ISOLATE_JAIL_DIR, value: {{ $jailBase }} }
       {{- end }}
       {{- if $split }}
       # The root helper (privilege mode split; internal/supervisor
@@ -234,6 +297,26 @@ containers:
       # The helper takes gVisor checkpoints for moves only with this on in
       # its own environment (M1 PR 13).
       - { name: SB_GVISOR_CHECKPOINT_MOVES, value: {{ $moves | quote }} }
+      {{- if $wasm }}
+      # WASM hosts (C14), as on a VM: the helper starts each worker and
+      # resident host as the worker user and serves its socket in a folder
+      # of its own on the shared folder, which only root and the agent's
+      # group can enter. The compile cache is the agent's, in the agent's
+      # own folder there (the state volume is not mounted here); the helper
+      # hands each host its cache open.
+      - { name: SB_ENABLE_WASM, value: "true" }
+      - { name: SB_ROOTD_WASM_SOCKET_DIR, value: /run/aerolvm-rootd/shared/wasm }
+      - { name: SB_WASM_COMPILE_CACHE_DIR, value: /run/aerolvm-rootd/shared/agent/wasm-compile }
+      {{- end }}
+      {{- if $isolate }}
+      # V8 groups, as on a VM: the helper builds each group's jail in the
+      # jail base and runs workerd in it, never unjailed. workerd is the copy
+      # the workerd init container made.
+      - { name: SB_ENABLE_ISOLATE, value: "true" }
+      - { name: SB_ISOLATE_USE_JAIL, value: "true" }
+      - { name: SB_ISOLATE_JAIL_CHROOT_BASE, value: {{ $jailBase }} }
+      - { name: SB_ISOLATE_WORKERD_PATH, value: /opt/aerolvm-workerd/workerd }
+      {{- end }}
       {{- if $root.Values.edge.enabled }}
       - { name: SB_ENABLE_CADDY, value: "true" }
       - { name: SB_SANDBOX_NODE_INGRESS, value: "false" }
@@ -292,7 +375,18 @@ containers:
       # keep the pod in Terminating (finding F8).
       - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
       {{- end }}
-      {{- if $root.Values.worker.isolate.enabled }}
+      {{- if and $isolate $split }}
+      # The V8 jail's chroots, which the root helper makes here. Each
+      # group's run folder is a tmpfs the helper mounts; the agent writes
+      # workerd's config and binds its sockets there, so the mount must
+      # reach the agent: two-way, the one such mount of a split pod, from
+      # this container only (the agent's side takes mounts in, never sends
+      # them). That puts the jails' mounts in the machine's mount table,
+      # and the supervisor unmounts them when the pod ends (as netns, F8).
+      - { name: isolate-jail, mountPath: {{ $jailBase }}, mountPropagation: Bidirectional }
+      # workerd, read only: the workerd init container's copy.
+      - { name: workerd, mountPath: /opt/aerolvm-workerd, readOnly: true }
+      {{- else if $isolate }}
       # The V8 jail's chroots, here only to unmount their tmpfs mounts
       # when the pod ends.
       - { name: isolate-jail, mountPath: /var/lib/sandboxd/isolate-jail, mountPropagation: Bidirectional }
@@ -482,18 +576,29 @@ containers:
       {{- if $root.Values.worker.isolate.enabled }}{{ $runtimes = append $runtimes "isolate" }}{{ end }}
       {{- if $root.Values.worker.firecracker.enabled }}{{ $runtimes = append $runtimes "firecracker" }}{{ end }}
       - { name: SB_HOST_RUNTIMES, value: {{ join "," $runtimes | quote }} }
-      {{- if $root.Values.worker.wasm.enabled }}
+      {{- if $wasm }}
       # WASM workers start under the runtime container's sandboxes group
       # (SB_HOST_PROCESS_CGROUP_PARENT defaults to the containerd parent).
       - { name: SB_ENABLE_WASM, value: "true" }
+      {{- if $split }}
+      # Started by the root helper, which serves each one's socket here
+      # (the runtime container's settings say why).
+      - { name: SB_ROOTD_WASM_SOCKET_DIR, value: /run/aerolvm-rootd/shared/wasm }
+      - { name: SB_WASM_COMPILE_CACHE_DIR, value: /run/aerolvm-rootd/shared/agent/wasm-compile }
       {{- end }}
-      {{- if $root.Values.worker.isolate.enabled }}
+      {{- end }}
+      {{- if $isolate }}
       # workerd ships in this image; its group hosts and their jail's
       # cgroups go under the sandboxes group too. The jail's chroots are on
       # their own volume (isolate-jail, below), which outlives an agent
       # restart, so a host the next agent takes over still has its root.
       - { name: SB_ENABLE_ISOLATE, value: "true" }
-      - { name: SB_ISOLATE_JAIL_CHROOT_BASE, value: /var/lib/sandboxd/isolate-jail }
+      {{- if $split }}
+      # In split the root helper builds the jails and runs workerd, always
+      # jailed.
+      - { name: SB_ISOLATE_USE_JAIL, value: "true" }
+      {{- end }}
+      - { name: SB_ISOLATE_JAIL_CHROOT_BASE, value: {{ $jailBase }} }
       {{- end }}
       {{- if $root.Values.worker.firecracker.enabled }}
       # The image's guest kernel; the templates, the jailer's chroots and
@@ -610,7 +715,15 @@ containers:
       # Kubernetes allows Bidirectional only in privileged containers.
       - { name: netns, mountPath: /run/netns, mountPropagation: Bidirectional }
       {{- end }}
-      {{- if $root.Values.worker.isolate.enabled }}
+      {{- if and $isolate $split }}
+      # The V8 jail's chroots, which the root helper makes: read only, and
+      # the top is root's. Each group's run folder is the helper's tmpfs,
+      # owned by this container's user, where it writes workerd's config
+      # and binds the sockets workerd dials. HostToContainer takes those
+      # mounts in from the runtime container, a restarted agent's too, so it
+      # takes a running group over (C14); it sends none out.
+      - { name: isolate-jail, mountPath: {{ $jailBase }}, readOnly: true, mountPropagation: HostToContainer }
+      {{- else if $isolate }}
       # The V8 jail's chroots. Each group's run and tmp folders get a
       # tmpfs; Bidirectional, so a restarted agent finds them and takes
       # the group over (C14) as it would on a VM.
@@ -743,8 +856,11 @@ volumes:
   {{- if $externalStorage }}
   - { name: mounts, emptyDir: {} }
   {{- end }}
-  {{- if $root.Values.worker.isolate.enabled }}
+  {{- if $isolate }}
   - { name: isolate-jail, emptyDir: {} }
+  {{- if $split }}
+  - { name: workerd, emptyDir: {} }
+  {{- end }}
   {{- end }}
   - { name: egress-state, emptyDir: {} }
   {{- if $cluster }}

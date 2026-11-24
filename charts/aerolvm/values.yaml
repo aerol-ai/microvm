@@ -20,9 +20,8 @@ mode: single
 #           aerolvm-rootd, does the root work in the runtime container and
 #           checks every request first. It ships in the agent image, signed;
 #           the runtime container runs it only when a release key signed it.
-#           External storage is on by default. Firecracker, WASM and V8
-#           isolates do not run in split yet: the chart refuses them by
-#           name.
+#           External storage is on by default. Firecracker does not run in
+#           split yet: the chart refuses it by name.
 #   auto    split for a new install, unless a value needs single; an upgrade
 #           keeps the mode the workers have now. helm template cannot see
 #           the cluster and renders auto as a new install, so set the mode
@@ -222,13 +221,24 @@ worker:
   # them. With it, the next agent takes the running ones over. Every
   # container in the pod can then see the others' processes (not their
   # environment or files).
+  # In privilegeMode split none of that applies: the root helper starts
+  # each worker in the runtime container, as the worker user, so it
+  # outlives an agent restart with no process namespace shared. The agent
+  # joins the workers' group (61000), with which it shares each sandbox's
+  # files.
   wasm:
     enabled: false
   # V8-isolate sandboxes on workers (Cloudflare's workerd, in the agent
   # image). Each isolate group runs as a workerd process sandboxd starts,
-  # jailed in a chroot on the state volume, under the runtime container's
-  # sandboxes group; like WASM, turning this on makes the pod share one
-  # process namespace so they outlive an agent restart.
+  # jailed in a chroot on a volume of its own, under the runtime
+  # container's sandboxes group; like WASM, turning this on makes the pod
+  # share one process namespace so they outlive an agent restart.
+  # In privilegeMode split the root helper builds each jail and starts
+  # workerd in the runtime container instead, and no process namespace is
+  # shared. A first container copies workerd from the agent image into a
+  # folder of root's. The jails' folder is the pod's one two-way mount, from
+  # the runtime container; the agent mounts it read only and sees each
+  # jail's run folder there, which the helper makes for it.
   isolate:
     enabled: false
   # Firecracker microVM sandboxes on workers (§8.9): only on machines with
