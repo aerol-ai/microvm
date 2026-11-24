@@ -1,6 +1,9 @@
 package runtime
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // A gVisor sandbox moves to another worker with its memory (C21,
 // plans/kubernetes-v2-architecture.md §10.5) through the service's usual
@@ -36,3 +39,22 @@ func RestoreRequested(ctx context.Context) bool {
 	v, _ := ctx.Value(restoreKey{}).(bool)
 	return v
 }
+
+// ErrNotMovable marks a move refusal that holds for as long as the sandbox
+// lives where it is, such as a warm-pool gVisor sandbox, whose saved state
+// names its pool's park socket and so restores nowhere else. Retrying it
+// changes nothing. The service answers the leader with a refusal for good
+// (cluster.MoveRefusedPrefix): the leader then stops trying, and a
+// decommission treats the sandbox as one that does not move. A refusal that
+// can pass (a stopped sandbox, a busy target) is a plain error instead.
+var ErrNotMovable = errors.New("this sandbox cannot move")
+
+// NotMovable is an error whose whole text is msg and that errors.Is reads
+// as ErrNotMovable.
+func NotMovable(msg string) error { return notMovableError(msg) }
+
+type notMovableError string
+
+func (e notMovableError) Error() string { return string(e) }
+
+func (notMovableError) Is(target error) bool { return target == ErrNotMovable }

@@ -1108,6 +1108,71 @@ func TestEvacuateAnswerAfterTheDeadline(t *testing.T) {
 	}
 }
 
+// The contract the server's half of the m1d-2 fix relies on (a sandbox
+// that cannot move is not counted as movable, and past the deadline one
+// whose last move fails stops with the rest). Before the deadline, a pass
+// that leaves only sandboxes that stay keeps the decommission going: they
+// stop at the deadline. Past it, a pass that still counts a movable
+// sandbox keeps it going too, and the first pass that stopped the rest
+// with nothing movable left ends it, though they are still placed (Done is
+// false): the node is deleted and they are orphaned.
+func TestDecommissionEndsAtTheDeadlineWhenNothingLeftCanMove(t *testing.T) {
+	c := bootstrapped(testCluster())
+	n := node("prod-general-stuck", v1.RoleWorker, "general", "z-a")
+	g := newNodeRig(t, c, n, machine("m1"))
+	decommissioning(t, g, n.Name)
+	var mu sync.Mutex
+	movable := 0
+	var reqs []aerolapi.EvacuateRequest
+	failed := map[string]string{
+		"sb-a": "not moved: worker refuses to move it: a sandbox from the warm pool moves by recreate only",
+		"sb-b": "not moved: no other worker can restore its memory",
+	}
+	g.api.evacuate = func(_ string, req aerolapi.EvacuateRequest) (aerolapi.EvacuateResult, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		reqs = append(reqs, req)
+		if !req.StopRemaining {
+			return aerolapi.EvacuateResult{Failed: failed, Remaining: 2}, nil
+		}
+		return aerolapi.EvacuateResult{Failed: failed, RemainingMovable: movable, Remaining: 3 - movable, Stopped: 3 - movable}, nil
+	}
+	deleted := func() int {
+		g.api.mu.Lock()
+		defer g.api.mu.Unlock()
+		return len(g.api.deleted)
+	}
+	for _, step := range []struct {
+		name        string
+		pastIt      bool
+		movable     int
+		wantDeleted int
+	}{
+		{"before the deadline: they wait for it", false, 0, 0},
+		{"past it, a movable sandbox left", true, 1, 0},
+		{"past it, nothing movable left", true, 0, 1},
+	} {
+		mu.Lock()
+		movable = step.movable
+		mu.Unlock()
+		if step.pastIt && g.now.Before(g.node(n.Name).Status.Decommission.Deadline.Time) {
+			g.now = g.now.Add(defaultDecomDeadline)
+		}
+		g.reconcile(n.Name)
+		if got := deleted(); got != step.wantDeleted {
+			t.Fatalf("%s: node deleted %d times, want %d", step.name, got, step.wantDeleted)
+		}
+	}
+	if got := g.node(n.Name); got.Status.State != v1.StateRemoved || !got.Status.Decommission.NodeDeleted {
+		t.Fatalf("state %s (%s), decommission %+v", got.Status.State, got.Status.Reason, got.Status.Decommission)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) != 3 || reqs[0].StopRemaining || !reqs[1].StopRemaining || !reqs[2].StopRemaining {
+		t.Fatalf("passes %+v", reqs)
+	}
+}
+
 // At most maxEvacuations passes run at once; a node over that waits its
 // turn, and an answer nobody came back for is dropped in time.
 func TestEvacuationsCap(t *testing.T) {

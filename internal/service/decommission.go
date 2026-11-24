@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -166,12 +167,26 @@ func (s *Service) moveFenced(id string) bool {
 	return s.moves.held(id, time.Now())
 }
 
-// Move results, per sandbox.
+// Move results, per sandbox. Anything else is an error: "error: <why>",
+// which the leader retries until the decommission's deadline, or
+// cluster.MoveRefusedPrefix and why, a refusal for good (moveErrorAnswer).
 const (
 	MoveReleased = "released" // stopped and fenced here
 	MoveStopped  = "stopped"  // stopped at the deadline
 	MoveGone     = "gone"     // no such sandbox here
 )
+
+// moveErrorAnswer is a release's answer for err. A sandbox that cannot move
+// from here at all (runtime.ErrNotMovable: a warm-pool gVisor sandbox, a
+// runtime that moves nothing by snapshot) is refused for good, so the
+// leader stops trying and the decommission stops it at its deadline with
+// the others. Anything else may pass, and the leader tries again.
+func moveErrorAnswer(err error) string {
+	if errors.Is(err, runtime.ErrNotMovable) {
+		return cluster.MoveRefusedPrefix + err.Error()
+	}
+	return "error: " + err.Error()
+}
 
 // The stopped row's reason. A release for a move writes one of the two
 // move reasons, which is the fence a restarted sandboxd finds (R11):
@@ -367,7 +382,7 @@ func (s *Service) stopOne(ctx context.Context, id, lifetime string, fence bool) 
 			if fence {
 				s.moves.clear(id)
 			}
-			return "error: " + err.Error()
+			return moveErrorAnswer(err)
 		}
 	case fence:
 		// Already stopped: the row still records the fence, which a

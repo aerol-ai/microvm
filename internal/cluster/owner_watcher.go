@@ -385,6 +385,13 @@ func (c *Cluster) lastKnownZone(nodeID string) string {
 }
 
 func (c *Cluster) selectRecreationTargetAvoiding(p Placement, avoidZone string, exclude ...string) (PlacementTarget, error) {
+	return c.selectRecreationTargetWhere(p, avoidZone, nil, exclude...)
+}
+
+// selectRecreationTargetWhere is selectRecreationTargetAvoiding over only
+// the members accept takes (all, when nil): a snapshot move's target must
+// restore the snapshot, not merely have room.
+func (c *Cluster) selectRecreationTargetWhere(p Placement, avoidZone string, accept func(Member) bool, exclude ...string) (PlacementTarget, error) {
 	spec := p.Spec
 	if spec == nil {
 		return PlacementTarget{}, ErrNoReassignTarget
@@ -401,7 +408,7 @@ func (c *Cluster) selectRecreationTargetAvoiding(p Placement, avoidZone string, 
 	// failover of a sandbox that has no secret row. The full deterministic scan
 	// is needed only when exclusions apply or a small recipient set constrains
 	// the candidates.
-	if !placementHasSecretHandle(p) && len(exclude) == 0 {
+	if !placementHasSecretHandle(p) && len(exclude) == 0 && accept == nil {
 		target, _, err := c.selectPlacement(req, placementOpts{avoidZone: avoidZone})
 		return target, err
 	}
@@ -450,6 +457,9 @@ func (c *Cluster) selectRecreationTargetAvoiding(p Placement, avoidZone string, 
 			continue
 		}
 		if m.APIURL == "" && m.NodeID != c.nodeID {
+			continue
+		}
+		if accept != nil && !accept(m) {
 			continue
 		}
 		extra, extraByRuntime := pending.of(m.NodeID)

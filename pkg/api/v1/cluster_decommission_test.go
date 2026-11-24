@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 )
@@ -17,6 +18,9 @@ type evacStubCluster struct {
 	leader string
 	err    error
 	got    cluster.EvacuateRequest
+	// outlast: the pass runs until its context ends, and cause records why.
+	outlast bool
+	cause   error
 }
 
 func (c *evacStubCluster) Leader() string {
@@ -26,8 +30,12 @@ func (c *evacStubCluster) Leader() string {
 	return c.leader
 }
 
-func (c *evacStubCluster) EvacuateNode(_ context.Context, id string, req cluster.EvacuateRequest) (cluster.EvacuateResult, error) {
+func (c *evacStubCluster) EvacuateNode(ctx context.Context, id string, req cluster.EvacuateRequest) (cluster.EvacuateResult, error) {
 	c.got = req
+	if c.outlast {
+		<-ctx.Done()
+		c.cause = context.Cause(ctx)
+	}
 	if c.err != nil {
 		return cluster.EvacuateResult{}, c.err
 	}
@@ -93,6 +101,23 @@ func TestClusterEvacuateNode(t *testing.T) {
 	(&handlers{}).clusterEvacuateNode(rr, evacRequest("wkr-1", "", false))
 	if rr.Code != http.StatusServiceUnavailable {
 		t.Fatalf("no service: %d", rr.Code)
+	}
+}
+
+// The route's bound is the pass's own time: a pass that runs into it ends
+// with ErrEvacuatePassTimeout as the cause, so a move it cut past the
+// deadline counts as tried and is given up (cluster.EvacuateNode), and is
+// not mistaken for a caller that went away.
+func TestClusterEvacuateNodeBoundIsThePassTime(t *testing.T) {
+	prev := evacuateTimeout
+	evacuateTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { evacuateTimeout = prev })
+	c := &evacStubCluster{staleReadStubCluster: &staleReadStubCluster{Noop: cluster.NewNoop("srv", "", "")}, outlast: true}
+	h := placementChangesHandlers(t, c)
+	rr := httptest.NewRecorder()
+	h.clusterEvacuateNode(rr, evacRequest("wkr-1", `{"stop_remaining":true}`, false))
+	if !errors.Is(c.cause, cluster.ErrEvacuatePassTimeout) {
+		t.Fatalf("the pass ended with cause %v, want ErrEvacuatePassTimeout", c.cause)
 	}
 }
 
