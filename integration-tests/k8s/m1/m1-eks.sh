@@ -890,18 +890,24 @@ kill_tree() {
 # stop_check: on_exit's first act while a check runs: TERM to the check's
 # whole process group at once, so no child of it (a background fill, a
 # curl) outlives it; the check's own TERM trap then runs its exit handler.
-# If the check still runs after 5 s, TERM to its tree; then once more to
-# whatever of the group is left.
+# Then CONT to the group: a check in a background group that touched the
+# terminal (an `aws eks get-token` MFA prompt when its cached credentials
+# expire) is stopped by SIGTTIN or SIGTTOU, a stopped process keeps TERM
+# pending, and the wait below then never ended, so the teardown never ran
+# (review of #1439). If the check still runs after 5 s, TERM to its tree;
+# then once more to whatever of the group is left.
 stop_check() {
   [[ -n "$check_pid" ]] || return 0
   local _
   if kill -0 "$check_pid" 2>/dev/null; then
     kill -TERM -- "-$check_pid" 2>/dev/null || kill -TERM "$check_pid" 2>/dev/null || true
+    kill -CONT -- "-$check_pid" 2>/dev/null || kill -CONT "$check_pid" 2>/dev/null || true
     for _ in $(seq 1 50); do kill -0 "$check_pid" 2>/dev/null || break; sleep 0.1; done
-    if kill -0 "$check_pid" 2>/dev/null; then kill_tree "$check_pid"; fi
+    if kill -0 "$check_pid" 2>/dev/null; then kill_tree "$check_pid"; kill -CONT -- "-$check_pid" 2>/dev/null || true; fi
     wait "$check_pid" 2>/dev/null || true
   fi
   kill -TERM -- "-$check_pid" 2>/dev/null || true
+  kill -CONT -- "-$check_pid" 2>/dev/null || true
   check_pid=""
 }
 
@@ -915,7 +921,8 @@ run_all=0
 torn=0
 stop_teardown=0
 # on_exit: whatever ends the script (a failed command in a step, a step
-# that returns non-zero, the cost limit, Ctrl-C or TERM) tears the run down
+# that returns non-zero, the cost limit, Ctrl-C, TERM, or a closed
+# terminal) tears the run down
 # for `all` (and after stop_run, or with M1_TEARDOWN_ON_EXIT=1), unless
 # M1_KEEP=1. Only a cluster this process made (made_here, set just before
 # cluster.sh up) or passed the gate for: never after a refused estimate,
@@ -930,7 +937,11 @@ on_exit() {
   # it, Terraform included (eks-bank.sh's on_exit). Its stdin is /dev/null:
   # a job outside the terminal's group that read the terminal would stop.
   trap - EXIT
-  trap '' INT TERM
+  trap '' INT TERM HUP
+  # A closed terminal (HUP, exit 129) takes no more writes, and a failed
+  # write must not end this handler (errexit): from here everything goes
+  # to $sd/teardown.log.
+  if [[ "$rc" == 129 ]]; then exec >> "$sd/teardown.log" 2>&1 < /dev/null; fi
   if [[ "$rc" != 0 && ( "$run_all" == 1 || "$stop_teardown" == 1 || "${M1_TEARDOWN_ON_EXIT:-0}" == 1 ) &&
         "${M1_KEEP:-0}" != 1 && "$torn" == 0 && "$dry" != 1 && -f "$sd/terraform.tfstate" ]] &&
      [[ "$made_here" == 1 || ( "$refused" == 0 && "$gated" == 1 ) ]]; then
@@ -940,12 +951,12 @@ on_exit() {
   stop_check
   gw_keeper_stop
   if [[ "$teardown" == 1 ]]; then
-    say "the run stopped (exit $rc): tearing $name down (M1_KEEP=1 keeps it)"
+    say "the run stopped (exit $rc): tearing $name down (M1_KEEP=1 keeps it)" || true
     set -m
     { diag exit || true; step_down || exit 1; } < /dev/null &
     down_pid=$!
     set +m
-    wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL"
+    wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true
   fi
   rm -f "$sd/.teardown-next"
   exit "$rc"
@@ -953,6 +964,9 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# A closed terminal: without this, bash ended on SIGHUP and ran on_exit
+# with status 0, so an `all` run did not tear down.
+trap 'exit 129' HUP
 for s in "${steps[@]}"; do
   case "$s" in
     estimate|up|setup|build|install) "step_$s" ;;

@@ -29,7 +29,9 @@ import (
 // (cordons worker-b in AerolVM and machine-1 in Kubernetes, then a command
 // fails), cordonwait (the same cordons, then sleeps) or spawn (starts
 // three background children that sleep SPAWN_SLEEP seconds, as f10's
-// fills do, and waits). x (what runs cluster.sh up) fails for
+// fills do, and waits) or stopself (logs its pid, then stops itself with
+// SIGSTOP, as a check stopped by SIGTTIN at a terminal prompt is). x (what
+// runs cluster.sh up) fails for
 // FAIL_STEP=up FAIL_HOW=cmd. cost_check returns 4 after the step COST_STOP
 // names. The cordon helpers are m1-lib.sh's own, with api and k stubbed.
 func m1Harness(t *testing.T) string {
@@ -70,6 +72,7 @@ behave() {
       spawn)
         for _ in 1 2 3; do ( command sleep "$SPAWN_SLEEP"; true ) & done
         log "spawned $1"; wait ;;
+      stopself) log "stopping $1 $BASHPID"; kill -STOP "$BASHPID"; log "continued $1" ;;
     esac
   fi
   log "end $1"
@@ -234,6 +237,47 @@ func TestM1CtrlCInAllTearsDownWhole(t *testing.T) {
 				t.Errorf("the step went on after the Ctrl-C:\n%s", log)
 			}
 		})
+	}
+}
+
+// A check that is stopped (SIGTTIN or SIGTTOU: it touched the terminal from
+// its background process group, as an MFA prompt of aws eks get-token
+// does) keeps the TERM stop_check sends pending; the wait for it never
+// ended and the teardown never ran (review of #1439). A Ctrl-C then still
+// tears an `all` run down.
+func TestM1StoppedOnTheTerminalStillTearsDown(t *testing.T) {
+	r := startM1(t, []string{"all"}, "FAIL_STEP=kernel", "FAIL_HOW=stopself")
+	r.waitLog(t, "stopping kernel ")
+	// The stopped check is in a process group of its own, which the
+	// test's cleanup of the run's group would not reach.
+	log := r.log(t)
+	if f := strings.Fields(log[strings.Index(log, "stopping kernel ")+len("stopping kernel "):]); len(f) > 0 {
+		if pid, err := strconv.Atoi(f[0]); err == nil {
+			t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL); _ = syscall.Kill(pid, syscall.SIGKILL) })
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGINT)
+	if code := r.end(t); code != 130 {
+		t.Errorf("exit %d, want 130", code)
+	}
+	if log := r.log(t); !strings.Contains(log, "down-done") {
+		t.Errorf("no teardown after a Ctrl-C while a check was stopped:\n%s", log)
+	}
+}
+
+// A closed terminal (SIGHUP) during a step of an `all` run tears it down
+// and exits 129. Before, bash ended on SIGHUP and ran on_exit with status
+// 0, so it did not tear down.
+func TestM1HangupInAllTearsDown(t *testing.T) {
+	r := startM1(t, []string{"all"}, "FAIL_STEP=setup", "FAIL_HOW=sleep")
+	r.waitLog(t, "start setup")
+	_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGHUP)
+	if code := r.end(t); code != 129 {
+		t.Errorf("exit %d, want 129", code)
+	}
+	if log := r.log(t); !strings.Contains(log, "down-done") {
+		t.Errorf("no teardown after a hangup:\n%s", log)
 	}
 }
 
