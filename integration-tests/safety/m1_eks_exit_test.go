@@ -34,6 +34,8 @@ import (
 // runs cluster.sh up) fails for
 // FAIL_STEP=up FAIL_HOW=cmd. cost_check returns 4 after the step COST_STOP
 // names. The cordon helpers are m1-lib.sh's own, with api and k stubbed.
+// DOWN=real swaps the stubbed step_down for m1-eks.sh's own, whose hm
+// (Helm) stub reads the terminal; refresh_credentials is m1-lib.sh's own.
 func m1Harness(t *testing.T) string {
 	t.Helper()
 	src, err := os.ReadFile(k8sFile(t, "m1/m1-eks.sh"))
@@ -47,6 +49,7 @@ func m1Harness(t *testing.T) string {
 	var b strings.Builder
 	b.WriteString(`set -euo pipefail
 sd="$OUT"; dry=0; name=m1t-1; HERE="$M1_DIR"; K8S=/nonexistent; refused=0; gated=0; made_here=0
+ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm
 log() { echo "$*" >> "$OUT/log"; }
 say() { log "say $*"; }
 result() { log "result $1 $2"; }
@@ -60,6 +63,9 @@ api() { log "api $*"; echo 200; echo '{}'; }
 k() { log "k $*"; }
 x() { log "x $*"; [[ "${FAIL_STEP:-}:${FAIL_HOW:-}" != up:cmd ]]; }
 step_down() { log down-start; command sleep 1; log down-done; }
+same_account() { :; }
+ctx_ok() { :; }
+hm() { log "hm $*"; echo "hm output $*" >&2; if read -r _ < /dev/tty; then log "hm read the terminal"; else log "hm: no terminal"; fi; }
 behave() {
   log "start $1"
   if [[ "${FAIL_STEP:-}" == "$1" ]]; then
@@ -87,9 +93,10 @@ behave() {
 	// shellFuncIf: node_cordon, node_uncordon and forget are newer than
 	// this harness; the code before them runs without (and shows what it
 	// did).
-	for _, fn := range []string{"api_cordon", "api_uncordon", "node_cordon", "node_uncordon", "forget", "lift_cordons"} {
+	for _, fn := range []string{"api_cordon", "api_uncordon", "node_cordon", "node_uncordon", "forget", "lift_cordons", "refresh_credentials"} {
 		b.WriteString(shellFuncIf(t, "m1/m1-lib.sh", fn))
 	}
+	b.WriteString("if [[ \"${DOWN:-}\" == real ]]; then\n" + shellFunc(t, "m1/m1-eks.sh", "step_down") + "fi\n")
 	b.WriteString(string(src[i:]))
 	return b.String()
 }

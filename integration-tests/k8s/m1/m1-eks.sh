@@ -934,14 +934,13 @@ on_exit() {
   # From here no INT or TERM stops this script: a second Ctrl-C used to end
   # the run before down. The teardown runs as a job of its own (set -m), in
   # its own process group, so a Ctrl-C at the terminal reaches no part of
-  # it, Terraform included (eks-bank.sh's on_exit). Its stdin is /dev/null:
-  # a job outside the terminal's group that read the terminal would stop.
+  # it, Terraform included (eks-bank.sh's on_exit).
   trap - EXIT
   trap '' INT TERM HUP
   # A closed terminal (HUP, exit 129) takes no more writes, and a failed
-  # write must not end this handler (errexit): from here everything goes
-  # to $sd/teardown.log.
-  if [[ "$rc" == 129 ]]; then exec >> "$sd/teardown.log" 2>&1 < /dev/null; fi
+  # write must not end this handler (errexit): nothing more goes to it.
+  # The teardown's output still reaches $sd/teardown.log (below).
+  if [[ "$rc" == 129 ]]; then exec > /dev/null 2>&1 < /dev/null || true; fi
   if [[ "$rc" != 0 && ( "$run_all" == 1 || "$stop_teardown" == 1 || "${M1_TEARDOWN_ON_EXIT:-0}" == 1 ) &&
         "${M1_KEEP:-0}" != 1 && "$torn" == 0 && "$dry" != 1 && -f "$sd/terraform.tfstate" ]] &&
      [[ "$made_here" == 1 || ( "$refused" == 0 && "$gated" == 1 ) ]]; then
@@ -952,8 +951,19 @@ on_exit() {
   gw_keeper_stop
   if [[ "$teardown" == 1 ]]; then
     say "the run stopped (exit $rc): tearing $name down (M1_KEEP=1 keeps it)" || true
+    # Credentials first, here in the foreground, where an MFA prompt can
+    # be answered (not after a hangup: no terminal is left).
+    [[ "$rc" == 129 ]] || refresh_credentials || true
+    # The teardown's group is in the background: a process of it that read
+    # the terminal (a prompt that still comes) was stopped by SIGTTIN, and
+    # the run then waited for it forever with the cluster up until AWS's
+    # timer (review of #1439). With TTIN and TTOU ignored, inherited by
+    # every process the teardown starts, such a read fails at once and a
+    # write still goes through. Its stdin is /dev/null; its output goes to
+    # the terminal and to $sd/teardown.log.
+    trap '' TTIN TTOU
     set -m
-    { diag exit || true; step_down || exit 1; } < /dev/null &
+    { diag exit || true; step_down || exit 1; } < /dev/null > >(tee -a "$sd/teardown.log") 2>&1 &
     down_pid=$!
     set +m
     wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true

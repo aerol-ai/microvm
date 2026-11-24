@@ -277,6 +277,21 @@ gate() {
     refuse "this machine's AWS credentials are for account \"$acct\", the cluster is in $(cut -d: -f5 <<<"$ctx")"
   gated=1
 }
+# refresh_credentials: one STS call in the foreground, at most
+# CRED_REFRESH_SECONDS (120) long, just before the teardown starts in a
+# process group of its own. With an MFA assume-role profile whose cached
+# credentials have expired, the AWS CLI prompts on the terminal: here the
+# user can answer, and the teardown's own calls (aws eks get-token under
+# kubectl and Helm, cluster.sh down) then find fresh credentials in the
+# CLI's cache. Best effort: the teardown runs either way. perl's alarm is
+# the time limit because a limit that runs the command in a group of its
+# own (GNU timeout) would take the terminal from it.
+refresh_credentials() {
+  [[ "$dry" == 1 ]] && return 0
+  perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "${CRED_REFRESH_SECONDS:-120}" \
+    aws sts get-caller-identity --query Account --output text >/dev/null ||
+    say "could not refresh the AWS credentials; the teardown tries anyway"
+}
 # same_account: down without a kubeconfig (a run that died early) checks
 # this machine's account against the one cluster.sh up recorded, before any
 # AWS call.
@@ -1373,14 +1388,22 @@ on_exit() {
   stop_check
   if [[ "$teardown" == 1 ]]; then
     say "all: stopped with exit $rc; tearing $name down (EKS_BANK_KEEP=1 keeps it)"
+    # Credentials first, here in the foreground, where an MFA prompt can
+    # be answered.
+    refresh_credentials || true
     # A job of its own (set -m): its own process group, so a Ctrl-C at the
     # terminal, which goes to this script's group, reaches no part of the
-    # teardown, Terraform included. Its stdin is /dev/null: a job outside
-    # the terminal's group that read the terminal would be stopped for
-    # good. Best effort, under ||: down goes on past a part that fails,
-    # and says what is left.
+    # teardown, Terraform included. A process of a background group that
+    # read the terminal (a prompt that still comes) was stopped by SIGTTIN,
+    # and the run then waited for it forever with the cell up (review of
+    # #1439): TTIN and TTOU are ignored, inherited by every process the
+    # teardown starts, so such a read fails at once and a write still goes
+    # through. Its stdin is /dev/null; its output goes to the terminal and
+    # to $sd/teardown.log. Best effort, under ||: down goes on past a part
+    # that fails, and says what is left.
+    trap '' TTIN TTOU
     set -m
-    { step_down || exit 1; } < /dev/null &
+    { step_down || exit 1; } < /dev/null > >(tee -a "$sd/teardown.log") 2>&1 &
     down_pid=$!
     set +m
     wait "$down_pid" || say "all: down did not finish; run ./eks-bank.sh $name down, or reap.sh"
