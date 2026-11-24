@@ -10,6 +10,13 @@ func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: WriteError}, local)
 }
 
+// clusterDestroyForwardWrap is clusterForwardWrap for the sandbox kill: a
+// sandbox left on a deleted node is deleted by a server instead of
+// forwarded (clusterroute abandoned.go).
+func (h *handlers) clusterDestroyForwardWrap(local http.Handler) http.Handler {
+	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: WriteError, Destroy: true}, local)
+}
+
 // snapshotForwardWrap routes a template(snapshot)-by-id DELETE to the node
 // holding the snapshot's image (B6). The E2B id is a reversible encoding of the
 // snapshot name for snapshots without a custom alias; those route. An id that is
