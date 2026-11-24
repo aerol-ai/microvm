@@ -557,13 +557,27 @@ func TestAnsibleSplitRemovesTheOldSSHHostKeyCopy(t *testing.T) {
 	}
 	tasks, _ := plays[0]["tasks"].([]any)
 	found := false
-	for _, it := range tasks {
+	lastSetting, flush := -1, -1
+	for i, it := range tasks {
 		task, _ := it.(map[string]any)
+		if task["notify"] == "Apply sandboxd ops config" {
+			lastSetting = i
+		}
+		if task["ansible.builtin.meta"] == "flush_handlers" {
+			flush = i
+		}
 		args, _ := task["ansible.builtin.file"].(map[string]any)
 		if args == nil || args["path"] != "{{ sandboxd_ssh_host_key_path }}" || args["state"] != "absent" {
 			continue
 		}
 		found = true
+		// After every task that changes a setting, and after the handlers
+		// have restarted sandboxd on them: a restart in between must never
+		// find the copy gone while the env still names it.
+		if !(lastSetting < flush && flush < i) {
+			t.Errorf("%q runs at task %d; the last setting is task %d and the handlers flush at %d: want settings, flush, removal",
+				task["name"], i, lastSetting, flush)
+		}
 		if task["become_user"] != "sandboxd" {
 			t.Errorf("%q removes the copy as %v, want sandboxd's user", task["name"], task["become_user"])
 		}

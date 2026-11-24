@@ -57,7 +57,13 @@ In privilege mode split, `sandboxd` runs as the `sandboxd` user, which owns
 root, because it reads root's env files. It reads that user's folders without
 following any symbolic link out of them. A link is stored as a link. The
 backup also refuses a `state.db` that is a link, or that SQLite opens as
-another file.
+another file, and a file that changes between its check and its read.
+
+A Raft log on a disk of its own is taken only from `SB_RAFT_WAL_DIR` in the
+env files. The record in the Raft folder that names the log's folder is
+written by the `sandboxd` user, so the backup, `sandboxd recover-quorum
+--rejoin` and `sandboxd reset` refuse a record that names any other folder.
+Set `SB_RAFT_WAL_DIR` to the log's folder if they refuse yours.
 
 ## Pre-Restore Checklist
 
