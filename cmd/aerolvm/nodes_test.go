@@ -44,9 +44,12 @@ type fakeCluster struct {
 	busy          map[string]bool
 	migrated      []string
 	movable       map[string][]string // node -> recreate-policy sandboxes evacuate moves
-	evacuations   int
-	badMember     bool
-	badNode       bool
+	// held is, per node, a sandbox the leader holds back ("not moved") for
+	// this many passes before it moves it: no worker could take it yet.
+	held        map[string]map[string]int
+	evacuations int
+	badMember   bool
+	badNode     bool
 }
 
 func newFakeCluster(t *testing.T) *fakeCluster {
@@ -215,6 +218,23 @@ func (f *fakeCluster) serveNode(w http.ResponseWriter, r *http.Request, rest str
 		// One pass moves one sandbox, so drain must call until none is left.
 		f.evacuations++
 		res := map[string]any{"node_id": id}
+		if held := f.held[id]; len(held) > 0 {
+			failed := map[string]string{}
+			var moved []string
+			for sb, n := range held {
+				if n > 0 {
+					held[sb] = n - 1
+					failed[sb] = "not moved: no other worker can restore its memory"
+					continue
+				}
+				delete(held, sb)
+				f.owned[id] = without(f.owned[id], sb)
+				moved = append(moved, sb)
+			}
+			res["moved"], res["failed"], res["remaining_movable"] = moved, failed, 0
+			writeFakeJSON(w, http.StatusOK, res)
+			return
+		}
 		if left := f.movable[id]; len(left) > 0 {
 			moved := left[0]
 			f.movable[id] = left[1:]
@@ -873,5 +893,28 @@ func TestDrainEvacuate(t *testing.T) {
 	f.fail["POST /v1/cluster/nodes/wkr-1/evacuate"] = 1
 	if code := h.run("drain", "wkr-1", "--evacuate"); code != exitError {
 		t.Fatalf("refused pass = %d", code)
+	}
+}
+
+// A sandbox the leader holds back for now (not moved: no worker can take
+// it yet) is no failed try: drain says it stays, once, not "(retrying)",
+// and keeps asking, so it moves on the pass after a worker can take it.
+// Before, drain stopped asking once nothing counted as movable.
+func TestDrainEvacuateRechecksAHeldBackSandbox(t *testing.T) {
+	h, f := standardFleet(t)
+	f.owned["wkr-1"] = []string{"sb-g"}
+	f.held = map[string]map[string]int{"wkr-1": {"sb-g": 3}}
+	if code := h.run("drain", "wkr-1", "--evacuate", "--timeout", "1m"); code != exitOK {
+		t.Fatalf("drain = %d %q", code, h.stderr.String())
+	}
+	out := h.stderr.String()
+	if n := strings.Count(out, "sandbox sb-g stays on wkr-1: no other worker can restore its memory"); n != 1 {
+		t.Fatalf("the reason shown %d times, want once: %q", n, out)
+	}
+	if strings.Contains(out, "retrying") || !strings.Contains(out, "moved sandbox sb-g off wkr-1") {
+		t.Fatalf("output %q", out)
+	}
+	if f.evacuations != 4 {
+		t.Fatalf("evacuate passes = %d, want 4 (3 held back, then the move)", f.evacuations)
 	}
 }
