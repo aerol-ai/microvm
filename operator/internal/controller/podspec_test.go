@@ -3,6 +3,7 @@ package controller
 import (
 	"encoding/base64"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -340,6 +341,88 @@ func TestSetupMountsAndSecurity(t *testing.T) {
 	}
 	if sc := setupSecurity(nil); *sc.Privileged || sc.Capabilities.Drop[0] != "ALL" {
 		t.Fatalf("nil agent context: %+v", sc)
+	}
+}
+
+// A split worker's containers run as different users (root, 65531, 65532)
+// and its pod has no fsGroup, so the kubelet makes a projected token or a
+// Secret's files root's, in root's group, with the volume's mode. Setup,
+// as uid 65531, must still read its join token, and the agent and setup
+// their external-CA certificate: those volumes get the read bit for
+// others, and only those readers mount them. A root agent (single mode)
+// and a pod with fsGroup (servers, gateways) keep the modes they had.
+func TestStampSplitReadersCanReadTheirFiles(t *testing.T) {
+	split := func() corev1.PodTemplateSpec {
+		tm := mustTemplate(t, TemplateWorker)
+		for i := range tm.Spec.Containers {
+			switch tm.Spec.Containers[i].Name {
+			case AgentContainer:
+				tm.Spec.Containers[i].SecurityContext = &corev1.SecurityContext{RunAsUser: ptr[int64](65531), RunAsNonRoot: ptr(true)}
+			case RuntimeContainer:
+				tm.Spec.Containers[i].SecurityContext = &corev1.SecurityContext{Privileged: ptr(true)}
+			default:
+				tm.Spec.Containers[i].SecurityContext = &corev1.SecurityContext{RunAsUser: ptr[int64](65532)}
+			}
+		}
+		return tm
+	}
+	fsGroup := func() corev1.PodTemplateSpec {
+		tm := split()
+		tm.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: ptr[int64](65531)}
+		return tm
+	}
+	podUser := func() corev1.PodTemplateSpec {
+		tm := mustTemplate(t, TemplateWorker)
+		tm.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsUser: ptr[int64](65531)}
+		return tm
+	}
+	modeOf := func(v *corev1.Volume) int32 {
+		switch {
+		case v == nil:
+			return -1
+		case v.Projected != nil && v.Projected.DefaultMode != nil:
+			return *v.Projected.DefaultMode
+		case v.Secret != nil && v.Secret.DefaultMode != nil:
+			return *v.Secret.DefaultMode
+		}
+		return -1
+	}
+	for _, tc := range []struct {
+		name    string
+		tm      corev1.PodTemplateSpec
+		c       *v1.AerolCluster
+		vol     string
+		want    int32
+		readers []string
+	}{
+		{"split, join token", split(), testCluster(), JoinIdentityVolume, 0o444, []string{SetupContainer}},
+		{"split, external-CA certificate", split(), bootstrapped(externalCACluster()), TLSVolume, 0o404, []string{AgentContainer, SetupContainer}},
+		{"pod-level user, join token", podUser(), testCluster(), JoinIdentityVolume, 0o444, []string{SetupContainer}},
+		{"root agent, join token", mustTemplate(t, TemplateWorker), testCluster(), JoinIdentityVolume, 0o440, []string{SetupContainer}},
+		{"root agent, external-CA certificate", mustTemplate(t, TemplateWorker), bootstrapped(externalCACluster()), TLSVolume, 0o400, []string{AgentContainer, SetupContainer}},
+		{"fsGroup, join token", fsGroup(), testCluster(), JoinIdentityVolume, 0o440, []string{SetupContainer}},
+		{"fsGroup, external-CA certificate", fsGroup(), bootstrapped(externalCACluster()), TLSVolume, 0o400, []string{AgentContainer, SetupContainer}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := Stamp(tc.tm, StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: tc.c, Node: node("prod-general-abcde", v1.RoleWorker, "general", "z-a"),
+				Namespace: testWorkerNS, Version: "v0.7.2", Pool: &tc.c.Spec.WorkerPools[0]})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := modeOf(volumeNamed(p.Spec.Volumes, tc.vol)); got != tc.want {
+				t.Errorf("%s mode %#o, want %#o", tc.vol, got, tc.want)
+			}
+			var mounted []string
+			for _, c := range append(append([]corev1.Container{}, p.Spec.InitContainers...), p.Spec.Containers...) {
+				if mountNamed(c.VolumeMounts, tc.vol) != nil {
+					mounted = append(mounted, c.Name)
+				}
+			}
+			slices.Sort(mounted)
+			if !slices.Equal(mounted, tc.readers) {
+				t.Errorf("%s mounted in %v, want %v alone", tc.vol, mounted, tc.readers)
+			}
+		})
 	}
 }
 

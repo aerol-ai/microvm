@@ -45,6 +45,11 @@ func TestRenderedChartTemplates(t *testing.T) {
 		if i := containerIndex(pod.Spec.Containers, AgentContainer); i < 0 || pod.Spec.Containers[i].Image != "registry.example/aerol/aerolvm:v0.7.2" {
 			t.Fatalf("%s: agent image not stamped", role)
 		}
+		// Setup reads its join token as root (a single-mode worker) or in
+		// the pod's fsGroup (servers, gateways): the token stays 0440.
+		if v := volumeNamed(pod.Spec.Volumes, JoinIdentityVolume); v == nil || v.Projected == nil || v.Projected.DefaultMode == nil || *v.Projected.DefaultMode != 0o440 {
+			t.Fatalf("%s: join token volume %+v", role, v)
+		}
 		if role == v1.RoleWorker {
 			if containerIndex(pod.Spec.Containers, RuntimeContainer) < 0 || pod.Spec.PriorityClassName == "" {
 				t.Fatalf("worker template lacks the runtime container or its priority class")
@@ -162,6 +167,25 @@ func TestRenderedSplitWorkerTemplate(t *testing.T) {
 	runtime := pod.Spec.Containers[containerIndex(pod.Spec.Containers, RuntimeContainer)]
 	if envValue(runtime.Env, "SB_ROOTD_STAGE_DIR") == "" || envValue(runtime.Env, "SB_ROOTD_AGENT_UID") != "65531" {
 		t.Error("the runtime container does not run the root helper for uid 65531")
+	}
+	// The pod has no fsGroup, and its containers run as different users,
+	// so the kubelet makes the join token root's: setup, uid 65531, reads
+	// it through the bit for others (EKS drill m1d-1, where it could not).
+	// So does an external-CA certificate, which the agent reads too.
+	if psc := pod.Spec.SecurityContext; psc != nil && psc.FSGroup != nil {
+		t.Errorf("a split worker pod sets fsGroup %d: it would regroup the folders split-folders closes", *psc.FSGroup)
+	}
+	if v := volumeNamed(pod.Spec.Volumes, JoinIdentityVolume); v == nil || v.Projected == nil || v.Projected.DefaultMode == nil || *v.Projected.DefaultMode != 0o444 {
+		t.Errorf("split join token volume %+v: setup (uid 65531) cannot read a root-owned 0440 token", v)
+	}
+	ext := bootstrapped(externalCACluster())
+	pod, err = Stamp(tm, StampInput{JoinURL: testJoinURL, JoinCA: testJoinCA, Cluster: ext, Node: node("prod-worker-1", TemplateWorker, "general", "z-a"),
+		Namespace: testNS, Version: "v0.7.2", Pool: &ext.Spec.WorkerPools[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := volumeNamed(pod.Spec.Volumes, TLSVolume); v == nil || v.Secret == nil || v.Secret.DefaultMode == nil || *v.Secret.DefaultMode != 0o404 {
+		t.Errorf("split external-CA certificate volume %+v: the agent (uid 65531) cannot read a root-owned 0400 key", v)
 	}
 }
 

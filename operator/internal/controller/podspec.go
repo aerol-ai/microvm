@@ -383,7 +383,7 @@ func addSetup(spec *corev1.PodSpec, in StampInput) error {
 		cmd = fmt.Sprintf(`exec sandboxd join --from-operator %s --operator-ca "$%s" --identity-token %s/token --role %s --node-id %s --advertise "%s" --files-only`,
 			in.JoinURL, JoinCAEnv, joinIdentityMount, role, n.Name, advertise(in))
 		spec.Volumes = append(spec.Volumes, corev1.Volume{Name: JoinIdentityVolume, VolumeSource: corev1.VolumeSource{
-			Projected: &corev1.ProjectedVolumeSource{DefaultMode: ptr[int32](0o440), Sources: []corev1.VolumeProjection{{
+			Projected: &corev1.ProjectedVolumeSource{DefaultMode: ptr(readMode(spec, setupSecurity(agent.SecurityContext), 0o440)), Sources: []corev1.VolumeProjection{{
 				ServiceAccountToken: &corev1.ServiceAccountTokenProjection{Audience: JoinAudience, ExpirationSeconds: ptr[int64](joinIdentityLife), Path: "token"},
 			}}},
 		}})
@@ -460,6 +460,35 @@ func setupSecurity(agent *corev1.SecurityContext) *corev1.SecurityContext {
 	sc.ReadOnlyRootFilesystem = ptr(true)
 	sc.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}}
 	return sc
+}
+
+// readMode is the mode for a Secret or projected token volume read only
+// by containers that run with sc: rootMode, plus the read bit for others
+// when that reader is not root and the pod has no fsGroup. The kubelet
+// then makes the files root's, in root's group: it gives a Secret's files
+// to fsGroup alone, and a projected token to a user only when every
+// container in the pod runs as that user. A split worker has neither: its
+// containers run as root, 65531 and 65532, and a pod fsGroup would also
+// change the group of the folders split-folders closes. So its setup
+// (65531) could not read its join token (EKS drill m1d-1), nor the agent
+// an external-CA certificate. The volume is mounted in its readers alone,
+// so the bit opens the files to no other container. A root reader (single
+// mode) and a pod with fsGroup (servers, gateways) keep rootMode.
+func readMode(spec *corev1.PodSpec, sc *corev1.SecurityContext, rootMode int32) int32 {
+	var uid *int64
+	if pod := spec.SecurityContext; pod != nil {
+		if pod.FSGroup != nil {
+			return rootMode
+		}
+		uid = pod.RunAsUser
+	}
+	if sc != nil && sc.RunAsUser != nil {
+		uid = sc.RunAsUser
+	}
+	if uid == nil || *uid == 0 {
+		return rootMode
+	}
+	return rootMode | 0o004
 }
 
 // setupEnv is the agent's settings with POD_IP first, which the setup
