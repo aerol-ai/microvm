@@ -165,6 +165,17 @@ func (d *Driver) ownPath(p string) (string, error) {
 			return clean, nil
 		}
 	}
+	// A VM's stage folder is sandboxd's own too: a running sandbox's disk
+	// is copied into the export VM's (M1 PR 18). Only a file right in a
+	// stage folder, as the helper lays one out: never the chroot beside it.
+	if base := strings.TrimSpace(d.cfg.JailerChrootBase); d.split != nil && base != "" {
+		base = filepath.Clean(base)
+		if strings.HasPrefix(clean, base+string(filepath.Separator)) {
+			if _, _, err := d.splitJailID(clean); err == nil {
+				return clean, nil
+			}
+		}
+	}
 	return "", fmt.Errorf("firecracker runtime: %s is not in sandboxd's own folders", p)
 }
 
@@ -239,21 +250,30 @@ func (d *Driver) SplitTemplateDisk(ctx context.Context, templateID, out string, 
 	if d.split == nil {
 		return errors.New("firecracker runtime: SplitTemplateDisk outside privilege mode split")
 	}
-	id := snapshotVMMIDPrefix + templateID
+	return d.splitBuildInJail(ctx, snapshotVMMIDPrefix+templateID, "template disk", out, build)
+}
+
+// splitBuildInJail builds a disk in privilege mode split: in the stage
+// folder of jail id, made for it, where the helper makes filesystems
+// (SplitMkfs, MakeFilesystem). build writes the disk at the stage path it
+// is given; the disk then moves to out, sandboxd's own file in its own
+// folders (ownPath), and the jail goes either way. A template's disk and
+// the export VM's image are built this way.
+func (d *Driver) splitBuildInJail(ctx context.Context, id, what, out string, build func(stageOut string) error) error {
 	if err := validateSandboxID(id); err != nil {
-		return fmt.Errorf("firecracker template disk: %w", err)
+		return fmt.Errorf("firecracker %s: %w", what, err)
 	}
 	out, err := d.ownPath(out)
 	if err != nil {
-		return fmt.Errorf("firecracker template disk: %w", err)
+		return fmt.Errorf("firecracker %s: %w", what, err)
 	}
 	_, stage, err := d.split.PrepareFirecracker(ctx, id)
 	if err != nil {
-		return fmt.Errorf("root helper: template %s jail: %w", templateID, err)
+		return fmt.Errorf("root helper: %s jail %s: %w", what, id, err)
 	}
 	defer func() {
 		if sErr := d.split.StopFirecracker(context.WithoutCancel(ctx), id); sErr != nil {
-			d.logger.Warn("firecracker template disk: remove the build's jail failed", "template_id", templateID, "error", sErr)
+			d.logger.Warn("firecracker: remove a build's jail failed", "what", what, "jail", id, "error", sErr)
 		}
 	}()
 	disk := filepath.Join(stage, rootfsFileName)
@@ -263,9 +283,9 @@ func (d *Driver) SplitTemplateDisk(ctx context.Context, templateID, out string, 
 	if err := os.Rename(disk, out); err == nil {
 		return nil
 	} else if !errors.Is(err, syscall.EXDEV) {
-		return fmt.Errorf("firecracker template disk: move to %s: %w", out, err)
+		return fmt.Errorf("firecracker %s: move to %s: %w", what, out, err)
 	}
-	// The templates folder is on another filesystem than the jails.
+	// sandboxd's folders are on another filesystem than the jails.
 	return copyRootfsPrivate(disk, out)
 }
 

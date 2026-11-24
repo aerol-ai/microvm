@@ -44,10 +44,10 @@ import (
 //   - In, writable (a start's disk copies, a cold boot): as the jailer's,
 //     through the stage folder, as before.
 //
-// What split mode does not do yet answers 501 with a reason: the warm VM
-// pool (errSplitWarmPool), whose paused VMs run under their slot's ID until
-// a sandbox claims them, and a disk saved as a container image
-// (errSplitImages), which a second VM reads. The ownership lease cannot
+// A disk saved as an image is read by an export VM, one more VM of the
+// helper's (M1 PR 18). What split mode does not do yet answers 501 with a
+// reason: the warm VM pool (errSplitWarmPool), whose paused VMs run under
+// their slot's ID until a sandbox claims them. The ownership lease cannot
 // freeze a VM (its group is root's): Freeze answers ErrCannotFreeze, and
 // the lease stops the VM instead.
 
@@ -94,12 +94,8 @@ type SplitProcess interface {
 	StartTicks() uint64
 }
 
-// What split mode refuses for Firecracker: the warm VM pool, and a disk
-// saved as a container image.
-var (
-	errSplitWarmPool = privmode.NotYet("run the Firecracker warm VM pool", privmode.StepFirecrackerWarmPool)
-	errSplitImages   = privmode.NotYet("save a Firecracker sandbox's disk as an image", privmode.StepFirecrackerImages)
-)
+// What split mode refuses for Firecracker: the warm VM pool.
+var errSplitWarmPool = privmode.NotYet("run the Firecracker warm VM pool", privmode.StepFirecrackerWarmPool)
 
 // SetSplit makes the driver run its VMs through the root helper h:
 // privilege mode split. It replaces the spawner and the TAP host. Call it

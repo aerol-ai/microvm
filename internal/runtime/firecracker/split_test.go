@@ -287,17 +287,12 @@ func (r fakeResolver) Resolve(context.Context, string) (*TemplateResolution, err
 	return r.res, nil
 }
 
-// TestSplitRefusesWarmPoolAndImages: what split mode does not run yet
-// answers 501 naming its step (M1 PR 14b), and the lease cannot freeze a
-// VM.
-func TestSplitRefusesWarmPoolAndImages(t *testing.T) {
+// TestSplitRefusesWarmPool: what split mode does not run yet answers 501
+// naming its step (M1 PR 14b), and the lease cannot freeze a VM.
+func TestSplitRefusesWarmPool(t *testing.T) {
 	d, _, _, _ := splitDriver(t, newFakeSplit(t))
 	ctx := context.Background()
-	_, err := d.CreateSnapshot(ctx, "sb-1", "img")
-	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "container image") {
-		t.Errorf("CreateSnapshot: %v, want a 501 naming the step", err)
-	}
-	_, err = d.WarmSpawn(ctx, WarmSpawnRequest{})
+	_, err := d.WarmSpawn(ctx, WarmSpawnRequest{})
 	if !errors.Is(err, models.ErrRuntimeNotImplemented) || !strings.Contains(err.Error(), "warm VM pool") {
 		t.Errorf("WarmSpawn: %v, want a 501 naming the step", err)
 	}

@@ -53,7 +53,6 @@ const (
 	StepImageUser           Step = "image_user"
 	StepDiskQuota           Step = "disk_quota"
 	StepFirecrackerWarmPool Step = "firecracker_warm_pool"
-	StepFirecrackerImages   Step = "firecracker_images"
 	StepContainerFile       Step = "container_files"
 )
 
@@ -63,8 +62,7 @@ var steps = map[Step]string{
 	StepDiskQuota: "the disk quota on a sandbox's writable layer",
 	StepFirecrackerWarmPool: "the Firecracker warm VM pool (SB_FIRECRACKER_VMM_POOL_ENABLED), whose paused VMs run under their slot's ID " +
 		"until a sandbox claims them",
-	StepFirecrackerImages: "a Firecracker sandbox's disk saved as a container image, which a second VM reads",
-	StepContainerFile:     "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
+	StepContainerFile: "the files root opens for a container (host files, ready socket, task output, runsc config) and the containerd gate",
 }
 
 // Gap is root work this build's split mode cannot do yet. It matches

@@ -92,9 +92,6 @@ func (d *Driver) SetImageStore(s ImageStore) { d.images = s }
 // copy of its disk taken while the guest's root filesystem is frozen. Either
 // way a sparse copy is what the helper VM mounts, never the saved disk.
 func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, imageRef string) (string, error) {
-	if err := d.splitGap(errSplitImages); err != nil {
-		return "", fmt.Errorf("firecracker runtime: snapshot %s: %w", sandboxID, err)
-	}
 	if err := validateSandboxID(sandboxID); err != nil {
 		return "", fmt.Errorf("firecracker runtime: snapshot: %w", err)
 	}
@@ -194,7 +191,15 @@ func (d *Driver) copyRunningDisk(ctx context.Context, sandboxID, diskCopy string
 		return err
 	}
 	frozenAt := time.Now()
-	copyErr := copyFile(filepath.Join(handle.RunDir(), rootfsFileName), diskCopy)
+	var copyErr error
+	if d.split != nil {
+		// The VM's disk is the jailer's user's: the helper lets sandboxd's
+		// group read it, and sandboxd copies it into the export VM's stage
+		// folder (M1 PR 18).
+		copyErr = d.splitCopyOut(ctx, handle.RunDir(), chrootFile{rootfsFileName, diskCopy})
+	} else {
+		copyErr = copyFile(filepath.Join(handle.RunDir(), rootfsFileName), diskCopy)
+	}
 	paused := time.Since(frozenAt)
 	d.thawGuest(sandboxID, vsockPath, guestCID)
 	if copyErr != nil {
@@ -272,13 +277,28 @@ func (d *Driver) SweepSnapshotExports() {
 	if d.cfg.UseJailer {
 		pattern = filepath.Join(d.cfg.JailerChrootBase, "*", exportHelperIDPrefix+"*")
 	}
+	var jails []string
 	if d.cfg.RunDir != "" || d.cfg.UseJailer {
 		matches, _ := filepath.Glob(pattern)
-		leftovers = append(leftovers, matches...)
+		if d.split != nil {
+			jails = matches
+		} else {
+			leftovers = append(leftovers, matches...)
+		}
 	}
 	for _, path := range leftovers {
 		if err := os.RemoveAll(path); err != nil {
 			d.logger.Warn("firecracker snapshot: stale export not removed", "path", path, "error", err)
+		}
+	}
+	// In privilege mode split an export VM's jail is the root helper's,
+	// and it goes by its ID (M1 PR 18).
+	for _, path := range jails {
+		ctx, cancel := context.WithTimeout(context.Background(), splitCallWait)
+		err := d.split.StopFirecracker(ctx, filepath.Base(path))
+		cancel()
+		if err != nil {
+			d.logger.Warn("firecracker snapshot: stale export VM's jail not removed", "path", path, "error", err)
 		}
 	}
 }
