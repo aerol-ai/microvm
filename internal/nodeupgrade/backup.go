@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,19 +31,72 @@ func VacuumInto(ctx context.Context, dbPath, dest string) error {
 	return sqliteBackup(ctx, dbPath, dest)
 }
 
+// VacuumIntoNoFollow is VacuumInto for a database whose folder another user
+// owns (privilege mode split: sandboxd's user owns its data folder, and
+// could swap state.db for a link). It refuses a database that is not a
+// regular file, and, because SQLite resolves links in a path itself before
+// it opens the file, asks SQLite which file it opened before it copies a
+// byte: anything but dbPath in its folder (that folder's own links, such as
+// /var on macOS, resolved) is refused.
+func VacuumIntoNoFollow(ctx context.Context, dbPath, dest string) error {
+	fi, err := os.Lstat(dbPath)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (%v): the database is copied only from its own file", dbPath, fi.Mode().Type())
+	}
+	return vacuumIntoChecked(ctx, dbPath, dest)
+}
+
+// vacuumIntoChecked is the open-and-ask half of VacuumIntoNoFollow.
+func vacuumIntoChecked(ctx context.Context, dbPath, dest string) error {
+	dir, err := filepath.EvalSymlinks(filepath.Dir(dbPath))
+	if err != nil {
+		return err
+	}
+	want := filepath.Join(dir, filepath.Base(dbPath))
+	// Read-only (mode=ro): a link swapped in after the look must not make
+	// SQLite create a file where it points (its default mode is rwc).
+	// VACUUM INTO reads the database and writes only dest.
+	dsn := "file:" + (&url.URL{Path: dbPath}).EscapedPath() + "?mode=ro&_busy_timeout=10000"
+	return vacuumInto(ctx, dsn, dest, func(opened string) error {
+		if opened != want {
+			return fmt.Errorf("the database %s opened as %s: a link in its place is refused", dbPath, opened)
+		}
+		return nil
+	})
+}
+
 // sqliteBackup copies the database to dest with VACUUM INTO: a consistent
 // snapshot that folds in the WAL. sandboxd is stopped when it runs, so the
 // one-writer rule of the store holds (internal/store: MaxOpenConns=1).
 func sqliteBackup(ctx context.Context, dbPath, dest string) error {
+	return vacuumInto(ctx, dbPath+"?_busy_timeout=10000", dest, nil)
+}
+
+// vacuumInto is sqliteBackup from a data source name. check, when set, sees
+// the file SQLite opened (PRAGMA database_list) before anything is copied.
+func vacuumInto(ctx context.Context, dsn, dest string, check func(opened string) error) error {
 	if err := os.Remove(dest); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	db, err := sql.Open("sqlite3", dbPath+"?_busy_timeout=10000")
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
+	if check != nil {
+		var seq int
+		var name, file string
+		if err := db.QueryRowContext(ctx, "PRAGMA database_list").Scan(&seq, &name, &file); err != nil {
+			return err
+		}
+		if err := check(file); err != nil {
+			return err
+		}
+	}
 	if _, err := db.ExecContext(ctx, "VACUUM INTO ?", dest); err != nil {
 		_ = os.Remove(dest)
 		return fmt.Errorf("VACUUM INTO %s: %w", dest, err)

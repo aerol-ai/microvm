@@ -365,3 +365,29 @@ func TestRecoverQuorumRejoinMovesALogOnItsOwnDisk(t *testing.T) {
 		}
 	})
 }
+
+// In split, recover-quorum moves aside only the log folder SB_RAFT_WAL_DIR
+// names: a record (sandboxd's user's to write) naming another folder stops
+// it before anything moves.
+func TestRecoverQuorumRejoinInSplitTakesTheLogOnlyFromTheEnv(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "root-only")
+	write(t, filepath.Join(outside, "keep"), "root's")
+	n := survivor(t, "SB_PRIVILEGE_MODE=split\n")
+	write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), outside+"\n")
+	if _, out, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true}); err == nil || !strings.Contains(err.Error(), "SB_RAFT_WAL_DIR") {
+		t.Fatalf("rejoin with the agent's record: %v, want a refusal\n%s", err, out)
+	}
+	if read(t, filepath.Join(outside, "keep")) != "root's" || !exists(filepath.Join(n.lib, "raft", "raft-stable.bolt")) {
+		t.Fatal("a refused rejoin moved something")
+	}
+
+	// The folder SB_RAFT_WAL_DIR names is moved aside, as in single.
+	own := filepath.Join(t.TempDir(), "disk", "raft-wal")
+	n = survivor(t, "SB_PRIVILEGE_MODE=split\nSB_RAFT_WAL_DIR="+own+"\n")
+	write(t, filepath.Join(n.lib, "raft", raftlogdir.LocationFile), own+"\n")
+	write(t, filepath.Join(own, "wal-meta.db"), "meta")
+	res, out, err := recoverQuorum(t, n, QuorumOptions{Rejoin: true})
+	if err != nil || res.MovedAsideLog != own+".pre-rejoin.1762500000" {
+		t.Fatalf("rejoin with the configured log: %+v %v\n%s", res, err, out)
+	}
+}
