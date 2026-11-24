@@ -86,6 +86,7 @@ type readyNote struct {
 // pendingHarness is a pool on a fake clock with a failing engine, recording
 // releases and readiness notices.
 type pendingHarness struct {
+	t        *testing.T
 	p        *Pool
 	sp       *flakySpawner
 	now      time.Time
@@ -95,7 +96,7 @@ type pendingHarness struct {
 
 func newPendingHarness(t *testing.T, fail int) *pendingHarness {
 	t.Helper()
-	h := &pendingHarness{p: New(nil), sp: &flakySpawner{fail: fail}, now: time.Unix(1_000_000, 0)}
+	h := &pendingHarness{t: t, p: New(nil), sp: &flakySpawner{fail: fail}, now: time.Unix(1_000_000, 0)}
 	h.p.now = func() time.Time { return h.now }
 	h.p.SetSpawner(h.sp)
 	h.p.SetParkReleaser(func(id string) { h.released = append(h.released, id) })
@@ -160,6 +161,17 @@ func TestFailedTeardownIsKeptChargedAndRetriedUntilGone(t *testing.T) {
 			h.p.NoteTarget(key)
 			parkSlot(h.p, "park-a", key)
 			h.p.Close() // its own retry fails too (fail=2)
+		}},
+		{"a failed claim whose own teardown failed", func(h *pendingHarness, key Key) {
+			// The driver's claim acquired the slot, failed, and could not
+			// remove the container; it hands the slot back for retry.
+			h.p.NoteTarget(key)
+			parkSlot(h.p, "park-a", key)
+			slot, err := h.p.Acquire(context.Background(), key, "")
+			if err != nil || slot.ID != "park-a" {
+				h.t.Fatalf("acquire = %v, %v", slot, err)
+			}
+			h.p.RetainFailedDestroy(slot, errors.New("engine busy"))
 		}},
 	}
 	for _, tc := range cases {
@@ -350,6 +362,31 @@ func TestRetainFailedDestroyTwiceKeepsAgeAndRelease(t *testing.T) {
 	h.p.retryPendingDestroys(context.Background(), true)
 	if !h.wasReleased("park-a") {
 		t.Fatal("the release recorded by the first failure was lost")
+	}
+}
+
+// RetainFailedDestroy keeps the slot under the pool's own release, so the
+// reservation goes once the retry confirms the container is gone; a nil
+// pool or slot is no slot, and a missing error still records one.
+func TestRetainFailedDestroyKeepsTheReservationUntilGone(t *testing.T) {
+	h := newPendingHarness(t, 0)
+	h.p.RetainFailedDestroy(&ParkedSlot{ID: "park-a", Key: testKey()}, nil)
+	h.p.RetainFailedDestroy(nil, errors.New("no slot"))
+	var nilPool *Pool
+	nilPool.RetainFailedDestroy(&ParkedSlot{ID: "park-b"}, errors.New("no pool"))
+	h.p.mu.Lock()
+	e := h.p.pending["park-a"]
+	n := len(h.p.pending)
+	h.p.mu.Unlock()
+	if n != 1 || e == nil || e.lastErr != "teardown failed" || e.release == nil {
+		t.Fatalf("pending = %d, entry %+v", n, e)
+	}
+	if h.wasReleased("park-a") {
+		t.Fatal("released before the retry confirmed the container gone")
+	}
+	h.p.retryPendingDestroys(context.Background(), true)
+	if !h.wasReleased("park-a") || len(h.released) != 1 {
+		t.Fatalf("released = %v, want park-a once", h.released)
 	}
 }
 

@@ -2,6 +2,7 @@ package dockerpool
 
 import (
 	"context"
+	"errors"
 	"expvar"
 	"sort"
 	"sync"
@@ -99,6 +100,24 @@ func (p *Pool) destroySlot(ctx context.Context, spawner Spawner, slot *ParkedSlo
 	if release != nil {
 		release(slot.ID)
 	}
+}
+
+// RetainFailedDestroy takes back a slot that left the pool through Acquire
+// and whose teardown its caller could not finish: a warm claim that failed,
+// and then failed to remove the container. The slot joins this pool's own
+// failed teardowns: still charged, retried on the refill tick until the
+// engine confirms the container is gone, and only then is its park
+// reservation released. Before, the caller released the reservation of a
+// container that might still run, and nothing removed it but a restart's
+// boot purge.
+func (p *Pool) RetainFailedDestroy(slot *ParkedSlot, err error) {
+	if p == nil || slot == nil {
+		return
+	}
+	if err == nil {
+		err = errors.New("teardown failed")
+	}
+	p.retainFailedDestroy(slot, p.releasePark, err)
 }
 
 // retainFailedDestroy records a teardown that failed.
