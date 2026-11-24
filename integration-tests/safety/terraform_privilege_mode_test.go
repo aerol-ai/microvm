@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/aerol-ai/microvm/internal/rootd"
 )
 
 // Terraform/privilege_mode.tf decides what privilege_mode: split in
@@ -43,6 +45,8 @@ type splitCase struct {
 	wantKernel string
 	// wantJailer is SB_JAILER_UID and SB_JAILER_GID: "null" writes none.
 	wantJailer string
+	// wantMkfs is SB_FIRECRACKER_MKFS_BIN, when not "".
+	wantMkfs string
 }
 
 const (
@@ -53,30 +57,35 @@ const (
 	pChroot   = "firecracker.jailer_chroot_base must be /srv/jailer"
 	pClean    = "firecracker and wasm paths must be clean absolute paths"
 	pKernel   = "firecracker.kernel_path, binary_path, jailer_path, mkfs_bin and ip_binary must not be in a folder sandboxd owns"
+	pLink     = "firecracker.kernel_path, binary_path, jailer_path, mkfs_bin and ip_binary must not be under /bin, /sbin"
 	pAgentDir = "firecracker.run_dir, firecracker.templates_dir, wasm.modules_dir and wasm.cache_dir must be in /var/lib/sandboxd or /run/sandboxd"
 
 	singleKernel = "/var/lib/sandboxd/firecracker/vmlinux"
 	splitKernel  = "/usr/local/lib/aerolvm-firecracker/vmlinux"
+	singleMkfs   = "/sbin/mkfs.ext4"
+	splitMkfs    = "/usr/sbin/mkfs.ext4"
 )
 
 var splitCases = map[string]splitCase{
 	// Single is untouched: whatever it ran before, it runs.
 	"single_every_runtime": {mode: "single", firecracker: true, isolate: true, wasm: true,
 		fc:         map[string]string{"use_jailer": "false", "jailer_chroot_base": `"/data/jailer"`},
-		wantKernel: singleKernel, wantJailer: "1000"},
+		wantKernel: singleKernel, wantJailer: "1000", wantMkfs: singleMkfs},
 	"single_docker_old_join": {mode: "single", docker: true, oldJoin: true, noNetnsPool: true},
 
 	// Split runs every runtime with the defaults and the shipped cluster.yml.
-	"split_firecracker": {mode: "split", firecracker: true, wantKernel: splitKernel, wantJailer: "null"},
+	"split_firecracker": {mode: "split", firecracker: true, wantKernel: splitKernel, wantJailer: "null", wantMkfs: splitMkfs},
 	"split_isolate":     {mode: "split", isolate: true},
 	"split_wasm":        {mode: "split", wasm: true},
 	"split_every_runtime": {mode: "split", firecracker: true, isolate: true, wasm: true,
-		wantKernel: splitKernel, wantJailer: "null"},
+		wantKernel: splitKernel, wantJailer: "null", wantMkfs: splitMkfs},
 	// What the operator set is kept.
 	"split_own_kernel": {mode: "split", firecracker: true,
 		fc: map[string]string{"kernel_path": `"/opt/aerolvm/vmlinux"`}, wantKernel: "/opt/aerolvm/vmlinux"},
 	"split_own_jailer_ids": {mode: "split", firecracker: true,
 		fc: map[string]string{"jailer_uid": "2000", "jailer_gid": "2000"}, wantJailer: "2000"},
+	"split_own_mkfs": {mode: "split", firecracker: true,
+		fc: map[string]string{"mkfs_bin": `"/usr/local/sbin/mkfs.ext4"`}, wantMkfs: "/usr/local/sbin/mkfs.ext4"},
 	// Firecracker settings with no Firecracker node change nothing.
 	"split_firecracker_settings_no_node": {mode: "split",
 		fc: map[string]string{"use_jailer": "false", "jailer_chroot_base": `"/data/jailer"`, "kernel_path": `"/run/sandboxd/vmlinux"`}},
@@ -109,6 +118,15 @@ var splitCases = map[string]splitCase{
 		fc: map[string]string{"mkfs_bin": `"/var/lib/sandboxd/mkfs.ext4"`}, want: []string{pKernel}},
 	"split_ip_in_data": {mode: "split", firecracker: true,
 		fc: map[string]string{"ip_binary": `"/var/lib/sandboxd/ip"`}, want: []string{pKernel}},
+	// Nor through a merged /usr's link: the helper refuses each at start.
+	"split_mkfs_under_bin": {mode: "split", firecracker: true,
+		fc: map[string]string{"mkfs_bin": `"/bin/mkfs.ext4"`}, want: []string{pLink}},
+	"split_ip_under_sbin": {mode: "split", firecracker: true,
+		fc: map[string]string{"ip_binary": `"/sbin/ip"`}, want: []string{pLink}},
+	"split_jailer_under_lib": {mode: "split", firecracker: true,
+		fc: map[string]string{"jailer_path": `"/lib/firecracker/jailer"`}, want: []string{pLink}},
+	"split_kernel_under_lib64": {mode: "split", firecracker: true,
+		fc: map[string]string{"kernel_path": `"/lib64/vmlinux"`}, want: []string{pLink}},
 	// A ".." would hide a folder of sandboxd's from the checks.
 	"split_kernel_dotdot": {mode: "split", firecracker: true,
 		fc: map[string]string{"kernel_path": `"/usr/local/lib/../../../var/lib/sandboxd/vmlinux"`}, want: []string{pClean}},
@@ -122,8 +140,8 @@ var splitCases = map[string]splitCase{
 	"split_wasm_modules_outside": {mode: "split", wasm: true, wasmModules: "/srv/wasm/modules", want: []string{pAgentDir}},
 	"split_every_problem": {mode: "split", docker: true, oldJoin: true, noNetnsPool: true, firecracker: true, wasm: true,
 		fc: map[string]string{"use_jailer": "false", "jailer_chroot_base": `"/data/jailer"`,
-			"kernel_path": `"/var/lib/sandboxd/kernels/vmlinux"`, "run_dir": `"/var/run/fc"`},
-		want: []string{pEngine, pJoin, pNetns, pJailer, pChroot, pKernel, pAgentDir}},
+			"kernel_path": `"/var/lib/sandboxd/kernels/vmlinux"`, "run_dir": `"/var/run/fc"`, "ip_binary": `"/sbin/ip"`},
+		want: []string{pEngine, pJoin, pNetns, pJailer, pChroot, pKernel, pLink, pAgentDir}},
 }
 
 func TestSplitRunsEveryRuntimeAndRefusesOnlyWhatItCannotRun(t *testing.T) {
@@ -141,6 +159,9 @@ func TestSplitRunsEveryRuntimeAndRefusesOnlyWhatItCannotRun(t *testing.T) {
 			KernelPath string          `json:"kernel_path"`
 			JailerUID  json.RawMessage `json:"jailer_uid"`
 			JailerGID  json.RawMessage `json:"jailer_gid"`
+			MkfsBin    string          `json:"mkfs_bin"`
+			RootFiles  []string        `json:"root_files"`
+			AgentDirs  []string        `json:"agent_dirs"`
 		} `json:"value"`
 	}
 	if err := json.Unmarshal([]byte(raw), &outputs); err != nil {
@@ -167,7 +188,38 @@ func TestSplitRunsEveryRuntimeAndRefusesOnlyWhatItCannotRun(t *testing.T) {
 					}
 				}
 			}
+			if c.wantMkfs != "" && got.MkfsBin != c.wantMkfs {
+				t.Errorf("SB_FIRECRACKER_MKFS_BIN = %q, want %q", got.MkfsBin, c.wantMkfs)
+			}
+			if c.mode == "split" {
+				splitRootFilesMatchTheHelper(t, got.RootFiles, got.AgentDirs, got.Problems)
+			}
 		})
+	}
+}
+
+// splitRootFilesMatchTheHelper holds Terraform's refusals of the files root
+// runs or links to the root helper's own path rule
+// (rootd.CheckRootProgramPath), on the same files and agent folders: the
+// plan refuses exactly when the helper would. Terraform cannot see the
+// node, so the rule is the part a path alone shows; the helper checks the
+// rest on the node at start.
+func splitRootFilesMatchTheHelper(t *testing.T, files, agentDirs, problems []string) {
+	t.Helper()
+	var refused []string
+	for _, f := range files {
+		if err := rootd.CheckRootProgramPath(f, agentDirs); err != nil {
+			refused = append(refused, err.Error())
+		}
+	}
+	has := func(w string) bool {
+		return slices.ContainsFunc(problems, func(p string) bool { return strings.HasPrefix(p, w) })
+	}
+	switch {
+	case len(refused) > 0 && !has(pKernel) && !has(pLink) && !has(pClean):
+		t.Errorf("the helper refuses %q, but the plan passes them (split_problems %q)", refused, problems)
+	case len(refused) == 0 && (has(pKernel) || has(pLink)):
+		t.Errorf("the plan refuses root files %q that the helper takes (split_problems %q)", files, problems)
 	}
 }
 
@@ -256,6 +308,9 @@ output "problems" { value = local.split_problems }
 output "kernel_path" { value = local.firecracker_kernel_path }
 output "jailer_uid" { value = local.firecracker_jailer_uid }
 output "jailer_gid" { value = local.firecracker_jailer_gid }
+output "mkfs_bin" { value = local.firecracker_mkfs_bin }
+output "root_files" { value = local.split_root_files }
+output "agent_dirs" { value = local.split_agent_dirs }
 `
 	if check {
 		pre := splitPrecondition(t)

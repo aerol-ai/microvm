@@ -31,6 +31,18 @@ locals {
     : var.firecracker.kernel_path
   )
 
+  # mkfs.ext4, which the root helper runs. Single keeps its default,
+  # /sbin/mkfs.ext4. On Ubuntu 22.04 and 24.04 and Amazon Linux 2023 /sbin is
+  # a link to /usr/sbin, and the helper runs nothing through a link
+  # (internal/rootd CheckRootProgramPath), so split names the file itself.
+  # A path the operator chose stays as it is; split_problems refuses one
+  # under such a link.
+  firecracker_mkfs_bin = (
+    local.split_mode && var.firecracker.mkfs_bin == "/sbin/mkfs.ext4"
+    ? "/usr/sbin/mkfs.ext4"
+    : var.firecracker.mkfs_bin
+  )
+
   # The jailer's user. Unset is uid and gid 1000 in single, as before. In
   # split the bootstrap writes no SB_JAILER_UID or SB_JAILER_GID, so the VMs
   # run as a user of their own, sandboxd-jailer, which install.sh
@@ -58,8 +70,13 @@ locals {
   # mkfs.ext4 and, when set, ip (the helper runs both).
   split_root_files = local.any_firecracker ? compact([
     var.firecracker.jailer_path, var.firecracker.binary_path, local.firecracker_kernel_path,
-    var.firecracker.mkfs_bin, var.firecracker.ip_binary,
+    local.firecracker_mkfs_bin, var.firecracker.ip_binary,
   ]) : []
+  # The top folders a merged /usr makes links into /usr. Terraform cannot see
+  # the node, so it refuses these by name, as the helper's own path rule does
+  # (internal/rootd CheckRootProgramPath); the helper also checks each file
+  # on the node at start.
+  split_merged_usr_links = ["/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32"]
   # Folders sandboxd writes for the runtimes this cluster turns on. Its split
   # unit lets it write in /var/lib/sandboxd and /run/sandboxd for data
   # (install.sh split_sandboxd_unit), and nowhere else.
@@ -83,6 +100,7 @@ locals {
     (!local.any_firecracker || var.firecracker.use_jailer) ? "" : "firecracker.use_jailer must be true: the root helper runs every VM through the jailer.",
     (!local.any_firecracker || var.firecracker.jailer_chroot_base == "/srv/jailer") ? "" : "firecracker.jailer_chroot_base must be /srv/jailer: install.sh --privilege-mode split lets sandboxd write there and in no other jailer folder.",
     alltrue([for f in local.split_root_files : !anytrue([for a in local.split_agent_dirs : startswith(f, "${a}/")])]) ? "" : "firecracker.kernel_path, binary_path, jailer_path, mkfs_bin and ip_binary must not be in a folder sandboxd owns (${join(", ", local.split_agent_dirs)}): root runs or links them, and sandboxd could swap them.",
+    alltrue([for f in local.split_root_files : !anytrue([for l in local.split_merged_usr_links : startswith(f, "${l}/")])]) ? "" : "firecracker.kernel_path, binary_path, jailer_path, mkfs_bin and ip_binary must not be under ${join(", ", local.split_merged_usr_links)}: on Ubuntu 22.04 and 24.04 and Amazon Linux 2023 those are links into /usr, and the root helper runs nothing through a link. Name the file under /usr, such as /usr/sbin/mkfs.ext4.",
     alltrue([for d in local.split_runtime_dirs : anytrue([for a in ["/var/lib/sandboxd", "/run/sandboxd"] : d == a || startswith(d, "${a}/")])]) ? "" : "firecracker.run_dir, firecracker.templates_dir, wasm.modules_dir and wasm.cache_dir must be in /var/lib/sandboxd or /run/sandboxd: sandboxd writes them, and in split it may write nowhere else.",
   ]) : []
 }
