@@ -1,6 +1,7 @@
 package safety
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,9 +25,15 @@ import (
 // check_exit, stop_check, on_exit, the traps and the step loop), around
 // stubs that log to $OUT/log. Each stubbed step logs "start <step>"; the
 // one FAIL_STEP names then fails the way FAIL_HOW says: cmd (a command
-// that fails), return (return 1) or sleep (sleeps, for a signal). x (what
-// runs cluster.sh up) fails for FAIL_STEP=up FAIL_HOW=cmd. cost_check
-// returns 4 after the step COST_STOP names.
+// that fails), return (return 1), sleep (sleeps, for a signal), cordon
+// (cordons worker-b in AerolVM and machine-1 in Kubernetes, then a command
+// fails), cordonwait (the same cordons, then sleeps) or spawn (starts
+// three background children that sleep SPAWN_SLEEP seconds, as f10's
+// fills do, and waits) or stopself (logs its pid, then stops itself with
+// SIGSTOP, as a check stopped by SIGTTIN at a terminal prompt is). x (what
+// runs cluster.sh up) fails for
+// FAIL_STEP=up FAIL_HOW=cmd. cost_check returns 4 after the step COST_STOP
+// names. The cordon helpers are m1-lib.sh's own, with api and k stubbed.
 func m1Harness(t *testing.T) string {
 	t.Helper()
 	src, err := os.ReadFile(k8sFile(t, "m1/m1-eks.sh"))
@@ -49,7 +56,8 @@ gw_keeper_stop() { log keeper-stop; }
 gate() { gated=1; }
 cost_check() { [[ "${COST_STOP:-}" != "$1" ]] || return 4; }
 workers_in() { echo worker-a; }
-lift_cordons() { log lift-cordons; }
+api() { log "api $*"; echo 200; echo '{}'; }
+k() { log "k $*"; }
 x() { log "x $*"; [[ "${FAIL_STEP:-}:${FAIL_HOW:-}" != up:cmd ]]; }
 step_down() { log down-start; command sleep 1; log down-done; }
 behave() {
@@ -59,6 +67,12 @@ behave() {
       cmd) false; log "after-false $1" ;;
       return) return 1 ;;
       sleep) command sleep 20 ;;
+      cordon) api_cordon worker-b; node_cordon machine-1; false; log "after-false $1" ;;
+      cordonwait) api_cordon worker-b; node_cordon machine-1; log "cordoned $1"; command sleep 20 ;;
+      spawn)
+        for _ in 1 2 3; do ( command sleep "$SPAWN_SLEEP"; true ) & done
+        log "spawned $1"; wait ;;
+      stopself) log "stopping $1 $BASHPID"; kill -STOP "$BASHPID"; log "continued $1" ;;
     esac
   fi
   log "end $1"
@@ -69,6 +83,12 @@ behave() {
 	}
 	for _, fn := range []string{"step_estimate", "step_up", "stop_run"} {
 		b.WriteString(shellFunc(t, "m1/m1-eks.sh", fn))
+	}
+	// shellFuncIf: node_cordon, node_uncordon and forget are newer than
+	// this harness; the code before them runs without (and shows what it
+	// did).
+	for _, fn := range []string{"api_cordon", "api_uncordon", "node_cordon", "node_uncordon", "forget", "lift_cordons"} {
+		b.WriteString(shellFuncIf(t, "m1/m1-lib.sh", fn))
 	}
 	b.WriteString(string(src[i:]))
 	return b.String()
@@ -220,15 +240,57 @@ func TestM1CtrlCInAllTearsDownWhole(t *testing.T) {
 	}
 }
 
+// A check that is stopped (SIGTTIN or SIGTTOU: it touched the terminal from
+// its background process group, as an MFA prompt of aws eks get-token
+// does) keeps the TERM stop_check sends pending; the wait for it never
+// ended and the teardown never ran (review of #1439). A Ctrl-C then still
+// tears an `all` run down.
+func TestM1StoppedOnTheTerminalStillTearsDown(t *testing.T) {
+	r := startM1(t, []string{"all"}, "FAIL_STEP=kernel", "FAIL_HOW=stopself")
+	r.waitLog(t, "stopping kernel ")
+	// The stopped check is in a process group of its own, which the
+	// test's cleanup of the run's group would not reach.
+	log := r.log(t)
+	if f := strings.Fields(log[strings.Index(log, "stopping kernel ")+len("stopping kernel "):]); len(f) > 0 {
+		if pid, err := strconv.Atoi(f[0]); err == nil {
+			t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL); _ = syscall.Kill(pid, syscall.SIGKILL) })
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGINT)
+	if code := r.end(t); code != 130 {
+		t.Errorf("exit %d, want 130", code)
+	}
+	if log := r.log(t); !strings.Contains(log, "down-done") {
+		t.Errorf("no teardown after a Ctrl-C while a check was stopped:\n%s", log)
+	}
+}
+
+// A closed terminal (SIGHUP) during a step of an `all` run tears it down
+// and exits 129. Before, bash ended on SIGHUP and ran on_exit with status
+// 0, so it did not tear down.
+func TestM1HangupInAllTearsDown(t *testing.T) {
+	r := startM1(t, []string{"all"}, "FAIL_STEP=setup", "FAIL_HOW=sleep")
+	r.waitLog(t, "start setup")
+	_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGHUP)
+	if code := r.end(t); code != 129 {
+		t.Errorf("exit %d, want 129", code)
+	}
+	if log := r.log(t); !strings.Contains(log, "down-done") {
+		t.Errorf("no teardown after a hangup:\n%s", log)
+	}
+}
+
 // A command that fails inside a check ends that check (a FAIL line), lifts
-// the cordons it left, and the run goes on to the next check.
+// the cordons it left (AerolVM's and the machine's), and the run goes on
+// to the next check.
 func TestM1CheckStopsAtAFailedCommand(t *testing.T) {
-	r := startM1(t, []string{"kernel", "shape"}, "FAIL_STEP=kernel", "FAIL_HOW=cmd")
+	r := startM1(t, []string{"kernel", "shape"}, "FAIL_STEP=kernel", "FAIL_HOW=cordon")
 	if code := r.end(t); code != 0 {
 		t.Errorf("exit %d, want 0 (a failed check is a FAIL line, not the end of the run)", code)
 	}
 	log := r.log(t)
-	for _, want := range []string{"result FAIL kernel", "lift-cordons", "start shape", "end shape"} {
+	for _, want := range []string{"result FAIL kernel", "api POST /v1/cluster/nodes/worker-b/uncordon", "k uncordon machine-1", "start shape", "end shape"} {
 		if !strings.Contains(log, want) {
 			t.Errorf("no %q:\n%s", want, log)
 		}
@@ -236,6 +298,58 @@ func TestM1CheckStopsAtAFailedCommand(t *testing.T) {
 	if strings.Contains(log, "after-false kernel") || strings.Contains(log, "down-start") {
 		t.Errorf("the check went on past the failed command, or the run tore down:\n%s", log)
 	}
+}
+
+// A check stopped by a Ctrl-C in a run that is not `all` leaves nothing
+// behind: no child process (f10's background fills outlived it by up to a
+// minute), and neither its AerolVM cordon nor a switch's Kubernetes cordon
+// of the machine (review of #1434).
+func TestM1StoppedCheckLeavesNothing(t *testing.T) {
+	needTools(t, "pgrep")
+	t.Run("background children", func(t *testing.T) {
+		// A sleep length no other process uses, to find the children by.
+		marker := fmt.Sprintf("%d.%03d", 40+os.Getpid()%50, time.Now().Nanosecond()/1e6)
+		r := startM1(t, []string{"f10"}, "FAIL_STEP=f10", "FAIL_HOW=spawn", "SPAWN_SLEEP="+marker)
+		r.waitLog(t, "spawned f10")
+		if out, _ := exec.Command("pgrep", "-f", "sleep "+marker).Output(); len(strings.Fields(string(out))) < 3 {
+			t.Fatalf("the children did not start: %q", out)
+		}
+		_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGINT)
+		if code := r.end(t); code != 130 {
+			t.Errorf("exit %d, want 130", code)
+		}
+		var left []byte
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+			if left, _ = exec.Command("pgrep", "-f", "sleep "+marker).Output(); len(strings.TrimSpace(string(left))) == 0 {
+				break
+			}
+		}
+		if len(strings.TrimSpace(string(left))) != 0 {
+			for _, pid := range strings.Fields(string(left)) {
+				if n, err := strconv.Atoi(pid); err == nil {
+					_ = syscall.Kill(n, syscall.SIGKILL)
+				}
+			}
+			t.Errorf("children of the stopped check still run: pids %s", strings.Fields(string(left)))
+		}
+	})
+	t.Run("cordons", func(t *testing.T) {
+		r := startM1(t, []string{"switch1"}, "FAIL_STEP=switch1", "FAIL_HOW=cordonwait")
+		r.waitLog(t, "cordoned switch1")
+		_ = syscall.Kill(-r.cmd.Process.Pid, syscall.SIGINT)
+		if code := r.end(t); code != 130 {
+			t.Errorf("exit %d, want 130", code)
+		}
+		log := r.log(t)
+		for _, want := range []string{"api POST /v1/cluster/nodes/worker-b/uncordon", "k uncordon machine-1"} {
+			if !strings.Contains(log, want) {
+				t.Errorf("no %q after the stop:\n%s", want, log)
+			}
+		}
+		if strings.Contains(log, "down-start") {
+			t.Errorf("a single-step run tore down:\n%s", log)
+		}
+	})
 }
 
 // gw_keeper_stop signals only what this run started: a pid in its files
