@@ -123,6 +123,8 @@ fi
 # file in $sd; ME is the folder this file is in.
 ME="$(cd "$(dirname "$0")" && pwd)"
 if declare -F keep_copy >/dev/null; then keep_copy; fi
+# KEEP_ONLY: a run that only makes its copy (a second run of the name).
+if [[ -n "${KEEP_ONLY:-}" ]]; then exit 0; fi
 `)
 	b.WriteString(string(src[i:]))
 	return b.String()

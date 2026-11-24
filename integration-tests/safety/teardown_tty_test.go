@@ -519,3 +519,119 @@ func TestTeardownRunsTheCopyNotTheCheckout(t *testing.T) {
 		})
 	}
 }
+
+// ticksExtra is the bank harness's extra for a teardown that takes
+// TD_TICKS seconds, behind a check that sleeps.
+const ticksExtra = `
+sleepy() { log sleepy-start; command sleep 20; }
+step_down() {
+  log down-start
+  local i
+  for i in $(seq 1 "$TD_TICKS"); do echo "teardown tick $i"; log "tick $i"; command sleep 1; done
+  echo "teardown output last line"
+  log down-done
+}
+`
+
+// tickingRun starts one script's `all` run with a teardown of `ticks`
+// seconds, stops it (SIGINT; TERM for the bank run, as its harness waits in
+// a check), and returns once the teardown has logged tick 2. It returns the
+// run, the harness file in the checkout, and the env a second run of the
+// same harness needs.
+func tickingRun(t *testing.T, script string, ticks int) (m1Run, string, []string) {
+	t.Helper()
+	tk := fmt.Sprintf("TD_TICKS=%d", ticks)
+	var r m1Run
+	var harness string
+	var env []string
+	switch script {
+	case "m1-eks.sh":
+		r = startM1(t, []string{"all"}, "FAIL_STEP=kernel", "FAIL_HOW=sleep", tk)
+		harness = filepath.Join(r.dir, "checkout", "m1-eks.sh")
+		env = []string{"M1_DIR=" + k8sFile(t, "m1")}
+		r.waitLog(t, "start kernel")
+		_ = syscall.Kill(r.cmd.Process.Pid, syscall.SIGINT)
+	default:
+		u := startUndoWith(t, ticksExtra, "sleepy sleepy", "12 0 12", "RUN_ALL=1", tk)
+		r = m1Run{dir: u.dir, cmd: u.cmd}
+		harness = filepath.Join(r.dir, "checkout", "harness.sh")
+		env = []string{"RUN_ALL=0"}
+		r.waitLog(t, "sleepy-start")
+		_ = syscall.Kill(r.cmd.Process.Pid, syscall.SIGTERM)
+	}
+	r.waitLog(t, "tick 2")
+	// The detached teardown is in a session of its own, out of reach of the
+	// run's group: ended by the copy's path once the test is done.
+	t.Cleanup(func() {
+		out, _ := exec.Command("pgrep", "-f", filepath.Join(r.dir, filepath.Base(harness))).Output()
+		for _, pid := range strings.Fields(string(out)) {
+			if n, err := strconv.Atoi(pid); err == nil {
+				_ = syscall.Kill(n, syscall.SIGKILL)
+			}
+		}
+	})
+	return r, harness, env
+}
+
+// The viewer ends with the run: a run SIGKILLed during its teardown left
+// the viewer polling teardown.log forever (review of #1445).
+func TestViewerEndsWithTheRun(t *testing.T) {
+	needTools(t, "pgrep", "perl")
+	for _, script := range []string{"m1-eks.sh", "eks-bank.sh"} {
+		t.Run(script, func(t *testing.T) {
+			r, _, _ := tickingRun(t, script, 20)
+			viewer := filepath.Join(r.dir, "teardown.log")
+			if out, _ := exec.Command("pgrep", "-f", viewer).Output(); len(strings.Fields(string(out))) == 0 {
+				t.Fatalf("no viewer of %s while the teardown ran", viewer)
+			}
+			_ = syscall.Kill(r.cmd.Process.Pid, syscall.SIGKILL)
+			_ = r.cmd.Wait()
+			var left []string
+			for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+				out, _ := exec.Command("pgrep", "-f", viewer).Output()
+				if left = strings.Fields(string(out)); len(left) == 0 {
+					return
+				}
+			}
+			t.Errorf("the viewer outlived the killed run by 5 s: pids %v", left)
+		})
+	}
+}
+
+// A second run of the same name (`down` by hand) while a teardown runs from
+// the copy: keep_copy used to copy over the file the teardown's bash was
+// reading, which then ran the new file's lines from where it was. Here the
+// new file is the old one with a line added at its end.
+func TestSecondCopyLeavesTheRunningTeardownAlone(t *testing.T) {
+	needTools(t, "pgrep", "perl")
+	for _, script := range []string{"m1-eks.sh", "eks-bank.sh"} {
+		t.Run(script, func(t *testing.T) {
+			r, harness, env := tickingRun(t, script, 5)
+			src, err := os.ReadFile(harness)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The checkout's new file (a new file, as a branch switch
+			// writes one: the run's own bash still reads the old one).
+			if err := os.WriteFile(harness+".new", append(src, []byte("\nlog \"the second copy ran\"\n")...), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(harness+".new", harness); err != nil {
+				t.Fatal(err)
+			}
+			second := exec.Command("bash", harness, "estimate")
+			second.Env = append(append(cleanEnviron(), "OUT="+r.dir, "KEEP_ONLY=1"), env...)
+			if out, err := second.CombinedOutput(); err != nil {
+				t.Fatalf("the second run: %v\n%s", err, out)
+			}
+			r.end(t)
+			log := r.log(t)
+			if !strings.Contains(log, "down-done") {
+				t.Errorf("the teardown did not finish:\n%s", log)
+			}
+			if strings.Contains(log, "the second copy ran") {
+				t.Errorf("the running teardown read the second copy:\n%s", log)
+			}
+		})
+	}
+}

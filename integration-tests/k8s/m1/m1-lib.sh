@@ -122,8 +122,9 @@ refresh_credentials() {
 # half way. A tee on this side did: when the terminal closed, it died and
 # the teardown with it (review of #1445). A viewer shows the log's new
 # lines on this terminal while cmd runs, and stops after cmd ends (KILL if
-# it is stuck: it inherits INT and TERM ignored). Returns cmd's own exit
-# status, so "down did not finish" means the teardown failed, not the
+# it is stuck: it inherits INT and TERM ignored), or as soon as this shell
+# is gone (a SIGKILL of the run left it polling forever). Returns cmd's own
+# exit status, so "down did not finish" means the teardown failed, not the
 # viewer.
 teardown_detached() {
   local log="$sd/teardown.log" mark="$sd/.teardown-done.$$" from viewer rc=0 _
@@ -131,18 +132,18 @@ teardown_detached() {
   from="$(wc -c < "$log" | tr -d ' ')"
   rm -f "$mark"
   perl -e '
-    my ($f, $from, $mark) = @ARGV;
+    my ($f, $from, $mark, $parent) = @ARGV;
     open(my $fh, "<", $f) or exit 0;
     seek($fh, $from, 0);
     $| = 1;
     my $buf;
     while (1) {
-      my $done = -e $mark;
+      my $done = -e $mark || getppid() != $parent;
       while (read($fh, $buf, 65536)) { print $buf }
       last if $done;
       select(undef, undef, undef, 0.2);
       seek($fh, 0, 1);
-    }' "$log" "$from" "$mark" &
+    }' "$log" "$from" "$mark" "$$" &
   viewer=$!
   detach "$@" < /dev/null >> "$log" 2>&1 || rc=$?
   : > "$mark"

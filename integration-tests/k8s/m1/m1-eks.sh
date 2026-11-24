@@ -102,12 +102,17 @@ mkdir -p "$sd/evidence"
 # the copy, which on_exit's teardown runs. The teardown reads the script
 # from disk, and a run takes hours: a branch switched in the checkout
 # meanwhile must not change what tears the run down. The copy itself (ME
-# is $sd) copies nothing.
+# is $sd) copies nothing. Each copy is a new file moved into place, never a
+# copy over the old one: a teardown still running from it (a second run of
+# the same name, `down` by hand, starts while it runs) keeps reading the
+# file it opened, as bash reads its script while it runs.
 keep_copy() {
   SELF="$sd/$(basename "${BASH_SOURCE[0]}")"
   [[ "$ME" != "$sd" ]] || return 0
-  cp "${BASH_SOURCE[0]}" "$SELF"
-  cp "$ME/m1-lib.sh" "$sd/m1-lib.sh"
+  cp "${BASH_SOURCE[0]}" "$SELF.new.$$"
+  mv -f "$SELF.new.$$" "$SELF"
+  cp "$ME/m1-lib.sh" "$sd/m1-lib.sh.new.$$"
+  mv -f "$sd/m1-lib.sh.new.$$" "$sd/m1-lib.sh"
 }
 keep_copy
 sha="$(git -C "$REPO" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"

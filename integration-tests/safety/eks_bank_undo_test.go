@@ -106,16 +106,22 @@ drills() {
 # file in $sd; ME is the folder this file is in.
 ME="$(cd "$(dirname "$0")" && pwd)"
 if declare -F keep_copy >/dev/null; then keep_copy; fi
-# on_exit's teardown runs this file again with step down (eks-bank.sh's
-# main loop: step_down alone).
-if [[ "${2:-}" == down ]]; then step_down; exit; fi
+# KEEP_ONLY: a run that only makes its copy (a second run of the name).
+if [[ -n "${KEEP_ONLY:-}" ]]; then exit 0; fi
 # The scale step's normal end alone: scale_back, as step_scale calls it.
 scale_ending() { in_scale=1; scaled_back=0; scale_back; in_scale=""; }
-trap on_exit EXIT
-trap 'exit 130' INT TERM
-echo $$ > "$OUT/run.pid"
-run_check ` + check + `
-log "after the check"
+# on_exit's teardown runs this file again with step down: step_down alone,
+# as eks-bank.sh's main loop does; then bash reads on to the file's end,
+# as after the real script's main loop.
+if [[ "${2:-}" == down ]]; then
+  step_down
+else
+  trap on_exit EXIT
+  trap 'exit 130' INT TERM
+  echo $$ > "$OUT/run.pid"
+  run_check ` + check + `
+  log "after the check"
+fi
 `)
 	return b.String()
 }
