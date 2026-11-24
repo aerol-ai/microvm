@@ -714,12 +714,16 @@
     #   * shared SoT      -> aocr.upstream_wrap_key in config/secrets.yml
     #   * control-node file -> sandboxd_upstream_wrap_key_src (fleet / Vault rendering)
     # If both are set, the secrets.yml value wins (it runs first).
+    # Mode 0400: sandboxd never rewrites the wrap key, and its loader
+    # (pkg/secrets LoadUpstreamWrapKeyRing) refuses a key file with any write
+    # or group/other bit. With 0600 it was refused, and private pulls through
+    # the mirror got 401. secret_file_modes_test.go ties this to the loader.
     - name: Install upstream wrap key (from config/secrets.yml)
       when: aocr.upstream_wrap_key | length > 0
       ansible.builtin.copy:
         content: "{{ aocr.upstream_wrap_key }}\n"
         dest: "{{ sandboxd_upstream_wrap_key_path }}"
-        mode: "0600"
+        mode: "0400"
         owner: "{{ sandboxd_file_owner }}"
         group: "{{ sandboxd_file_owner }}"
       no_log: true
@@ -732,7 +736,7 @@
       ansible.builtin.copy:
         src: "{{ sandboxd_upstream_wrap_key_src }}"
         dest: "{{ sandboxd_upstream_wrap_key_path }}"
-        mode: "0600"
+        mode: "0400"
         owner: "{{ sandboxd_file_owner }}"
         group: "{{ sandboxd_file_owner }}"
       notify: Apply sandboxd ops config

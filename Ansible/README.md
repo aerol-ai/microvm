@@ -370,8 +370,8 @@ ansible-playbook playbooks/configure-ops.yml
 
 For each host the play:
 
-1. Creates `/etc/sandboxd/secrets/` at `0700`.
-2. Copies `upstream_wrap_key` → `/etc/sandboxd/secrets/upstream-wrap.key` (`0600`).
+1. Creates `/etc/sandboxd/secrets/` at `0700` (`0750` with group `sandboxd` in privilege mode split).
+2. Copies `upstream_wrap_key` → `/etc/sandboxd/secrets/upstream-wrap.key` (`0400`: sandboxd refuses a wrap key file it could write).
 3. Copies `cluster_pat` → `/etc/sandboxd/secrets/cluster-pat` (`0600`).
 4. Re-renders `/etc/sandboxd/cluster.env` with the `SB_MIRROR_*` / `SB_AUTO_IMPORT_*` lines.
 5. Restarts `sandboxd` (gated by `sandboxd_restart_after_ops_config`, default true).
