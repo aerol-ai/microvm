@@ -836,6 +836,62 @@ Each is small and stands alone. Together they shrink the root surface now.
       sandboxes, and `aerolvm k8s verify` reports `general: split 1`;
       with the operator from before the fix the same worker fails as it
       did on EKS.
+    - **The second EKS drill (m1d-2, 2026-11-24) ran the whole list.** It
+      ran on `main` at `782fa35fe` (with the fix above), on three
+      m7i.xlarge workers with Linux 6.18. Each worker switched from
+      single to split in turn, and `aerolvm k8s verify` passed at every
+      stage: all single, one split, two split, all split. What passed:
+      the split pod's shape; the same image user in split as in single;
+      a gVisor move from one split worker to another with its memory; the
+      refusal of a gVisor move from single to split, before anything was
+      saved, with the sandbox still running; S2 (a version rollout swapped
+      every agent in place, every sandbox kept running, and the newer
+      signed helper took over); OV-E2 (an rclone mount reached its
+      sandbox and kept writing across the rollout and a helper restart);
+      the restarted helper alone in its group, which has `cgroup.kill`;
+      the refusal of a helper signed by another key, an older one and an
+      unsigned one; F8 (a split worker pod deleted with sandboxes running
+      left nothing on its machine); and F10 (five gVisor sandboxes, each
+      holding 3 GB on a 16 GB machine, all stopped whole; the kernel
+      killed only gVisor's own processes, never the worker's). It cost
+      $2.11, and the leak check found nothing left.
+      N1, the time the worker reports for each create, split against
+      single (95% range by bootstrap):
+      - Cold: split p50 143.3 ms, single p50 152.0 ms. Median difference
+        -0.15 ms (95% range -36.00 to +20.70). Budget +3 ms.
+      - Warm (containerd pool): split p50 18.0 ms, single p50 16.7 ms.
+        Median difference +0.80 ms (95% range +0.40 to +1.60). Budget
+        +1 ms. The median is inside the budget, but the top of the range
+        is above it.
+      - A burst of 20 at once (no budget): split p50 976 ms, single p50
+        2,210 ms. The first create after the split helper started took
+        17.7 ms.
+      - WASM and V8, on one VM in the first drill (m1d-1-vm; single,
+        split, single, split on the same machine): WASM warm +0.05 ms
+        (95% -0.05 to +0.20), WASM busy mix +0.15 ms (95% -2.75 to
+        +0.40), V8 warm -0.10 ms (95% -0.15 to -0.05). Budget +1 ms; all
+        three meet it.
+      It found two product bugs. Fixes are in progress.
+      - **B1: a decommission that never ended at its deadline.** A worker
+        held a sandbox that counted as movable but could never move: a
+        gVisor sandbox from the warm pool (which moves only by recreate),
+        or a gVisor sandbox in single when only split workers were left.
+        After the deadline each pass tried the move again and failed, and
+        the operator ends a decommission only when nothing is left to
+        move, so it never ended. Seen twice. It is not about split: a
+        warm-pool sandbox cannot move with its memory in single mode
+        either. Deleting the test sandboxes let the switch finish.
+      - **B2: a sandbox on a removed node that could not be deleted.** A
+        delete marked such a sandbox as being deleted; the operator then
+        found nothing to move and removed the node. Every delete after
+        that failed, because the sandbox's placement still named the
+        removed node.
+      Not proven: a gVisor move between two single workers (its test
+      sandbox came from the warm pool). The drill's own scripts had five
+      bugs (H1-H5), so F10 and the unsigned-helper check were judged by
+      hand in this run; all five are fixed in `integration-tests/k8s/m1/`,
+      where the kit now lives. With this run, D10's live proof (S2,
+      OV-E2, F8, F10, N1) is done.
 12. Docs, `EVIDENCE.md` and the capability matrix.
 
 ### 3.6 Tests
