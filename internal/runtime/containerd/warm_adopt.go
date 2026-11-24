@@ -171,18 +171,57 @@ func (d *Driver) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 			}
 			return nil, err
 		}
-		_ = d.destroyParked(ctx, slot)
-		if d.netns != nil {
-			// adoptParked may have already reassigned the netns slot from the park
-			// id to sandboxID before failing (ReassignOwner runs before the network
-			// policy apply). destroyParked only releases the park id, so release
-			// under sandboxID too or the slot is stranded adopted with no container.
-			_ = d.netns.Release(ctx, sandboxID)
-		}
-		d.warmPool.ReleasePark(slot.ID)
+		d.discardClaimedSlot(ctx, slot, sandboxID)
 		return nil, fmt.Errorf("warm adopt failed: %w", err)
 	}
 	return state, nil
+}
+
+// discardClaimedSlot tears down a slot whose claim failed. The slot left
+// the pool at Acquire, so this is the only path that removes it.
+//
+// It runs on undoContext, not on ctx: a client that hangs up mid-claim
+// cancels ctx, and a teardown on it failed at its first containerd call
+// and left the container behind, as a failed cold create's undo once did
+// (UC-450).
+//
+// A claim moves the slot's netns owner from the park id to the sandbox
+// once the relabel is in: in single mode before the rules, in split mode
+// while the rules trip is in flight (splitClaimFinish). So the owner may
+// or may not have moved, whichever step failed. It is moved back first:
+// then the slot is wholly the park's again, destroyParked (and the
+// pool's retries of it) frees it under the park id once the container is
+// gone, and the cold create this one falls back to gets a namespace of
+// its own instead of being handed the park's under the sandbox id. The
+// store moves a row only while the park id holds none, so this is a
+// no-op when the claim never moved it.
+//
+// A teardown that fails goes to the pool's retry list, still charged
+// (RetainFailedDestroy logs and counts it): the container keeps its
+// netns slot and its block until it is confirmed gone. Releasing the
+// reservation here would leave it with nothing to remove it but a
+// restart's boot purge.
+func (d *Driver) discardClaimedSlot(ctx context.Context, slot *containerdpool.ParkedSlot, sandboxID string) {
+	uctx, cancel := undoContext(ctx)
+	defer cancel()
+	var ownerErr error
+	if d.netns != nil && slot.ID != "" && slot.ID != sandboxID {
+		ownerErr = d.netns.ReassignOwner(uctx, sandboxID, slot.ID)
+	}
+	if err := d.destroyParked(uctx, slot); err != nil {
+		if ownerErr != nil {
+			d.logger.Warn("containerd warm claim: the failed claim's slot could not be torn down, and its network namespace may still be under the sandbox id",
+				"sandbox_id", sandboxID, "slot_id", slot.ID, "error", err, "owner_error", ownerErr)
+		}
+		d.warmPool.RetainFailedDestroy(slot, err)
+		return
+	}
+	if d.netns != nil {
+		// The container is gone, so a slot the sandbox id still holds
+		// (the park's, when moving the owner back failed) goes too.
+		_ = d.netns.Release(uctx, sandboxID)
+	}
+	d.warmPool.ReleasePark(slot.ID)
 }
 
 // adoptParked binds a parked container to sandboxID without renaming the
