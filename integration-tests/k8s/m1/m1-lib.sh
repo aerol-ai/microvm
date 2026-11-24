@@ -69,19 +69,62 @@ refused=0
 gated=0
 refuse() { echo "m1-eks.sh: refusing to run: $*" >&2; refused=1; exit 2; }
 # refresh_credentials: one STS call in the foreground, at most
-# CRED_REFRESH_SECONDS (120) long, just before the teardown starts in a
-# process group of its own. With an MFA assume-role profile whose cached
+# CRED_REFRESH_SECONDS (120) long, just before the teardown starts with no
+# terminal (detach). With an MFA assume-role profile whose cached
 # credentials have expired, the AWS CLI prompts on the terminal: here the
 # user can answer, and the teardown's own calls (aws eks get-token under
 # kubectl and Helm, cluster.sh down) then find fresh credentials in the
-# CLI's cache. Best effort: the teardown runs either way. perl's alarm is
-# the time limit because a limit that runs the command in a group of its
-# own (GNU timeout) would take the terminal from it.
+# CLI's cache. Best effort: the teardown runs either way. The limit is
+# perl's, with aws its child in this (the terminal's) process group: GNU
+# timeout would put it in a group of its own, away from the terminal. Out
+# of time, aws's whole tree goes, a credential_process helper that prompts
+# included (an alarm used to end aws alone, and the helper read on). The
+# terminal's settings are saved before and put back after: a prompt killed
+# half way left echo off.
 refresh_credentials() {
   [[ "$dry" == 1 ]] && return 0
-  perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "${CRED_REFRESH_SECONDS:-120}" \
-    aws sts get-caller-identity --query Account --output text >/dev/null ||
-    say "could not refresh the AWS credentials; the teardown tries anyway"
+  local saved="" rc=0
+  [[ -t 0 ]] && saved="$(stty -g 2>/dev/null || true)"
+  perl -e '
+    my $secs = shift @ARGV;
+    my $pid = fork;
+    exit 127 unless defined $pid;
+    if ($pid == 0) { exec @ARGV; exit 127 }
+    my $end = time + $secs;
+    while (time < $end) {
+      if (waitpid($pid, 1) == $pid) { exit($? & 127 ? 128 + ($? & 127) : $? >> 8) }
+      select(undef, undef, undef, 0.1);
+    }
+    # Out of time: the whole tree, found while aws still lives (its
+    # children would go to init once it is gone), then all of it at once.
+    my %tree;
+    my @todo = ($pid);
+    my @ps = `ps -axo pid=,ppid=`;
+    while (defined(my $p = shift @todo)) {
+      for (@ps) { my ($c, $pp) = split; push @todo, $c if $pp == $p && !$tree{$c}++ }
+    }
+    kill "KILL", $pid, keys %tree;
+    waitpid($pid, 0);
+    exit 124' "${CRED_REFRESH_SECONDS:-120}" aws sts get-caller-identity --query Account --output text >/dev/null || rc=$?
+  # A prompt that was killed leaves the terminal as it set it (echo off).
+  [[ -z "$saved" ]] || stty "$saved" 2>/dev/null || true
+  [[ "$rc" == 0 ]] || say "could not refresh the AWS credentials (exit $rc); the teardown tries anyway" || true
+  return 0
+}
+# detach <cmd...>: cmd in a session of its own, with no controlling
+# terminal, waited for; its exit status (128 + n when signal n ended it).
+# Anything in it that opens /dev/tty (an MFA prompt in aws eks get-token, a
+# helper that resets SIGTTIN, ssh's readpassphrase) fails at once instead of
+# stopping or spinning. Not a process group of the terminal's either, so a
+# Ctrl-C there reaches no part of it. The fork first: setsid fails for a
+# process group leader.
+detach() {
+  perl -MPOSIX -e '
+    my $pid = fork;
+    die "detach: fork: $!\n" unless defined $pid;
+    if ($pid) { waitpid($pid, 0); exit($? & 127 ? 128 + ($? & 127) : $? >> 8) }
+    POSIX::setsid() or die "detach: setsid: $!\n";
+    exec @ARGV or die "detach: $ARGV[0]: $!\n"' "$@"
 }
 # caller_account: this machine's AWS account, or "" when STS does not
 # answer. Asked up to three times: one STS blip right after up must not

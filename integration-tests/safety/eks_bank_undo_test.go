@@ -33,6 +33,7 @@ func undoHarnessWith(t *testing.T, extra, check string) string {
 	t.Helper()
 	var b strings.Builder
 	b.WriteString(`set -euo pipefail
+SELF="$0"
 sd="$OUT"; dry=0; name=bank-1; ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm; cname=aerolvm; HELM=true
 base_workers=6; peak_workers=60; scale_minutes=60; back_minutes=20; gateways_peak=11
 run_all="$RUN_ALL"; refused=0; downed=0; made_here=1; gated=1
@@ -60,6 +61,8 @@ kr() { :; }
 serving() { echo 11; }
 gateways_back() { log gateways_back; }
 step_down() { log down-start; command sleep 2; log down-done; }
+# Never the real aws: a test that needs eks-bank.sh's own puts it in extra.
+refresh_credentials() { log refresh-credentials; }
 workers_now() {
   local v; v="$(cat "$OUT/workers")"
   if [[ "$v" == fail ]]; then cat "$OUT/workers-after-fail" 2>/dev/null > "$OUT/workers" || echo "12 0 12" > "$OUT/workers"; log "workers_now failed"; return 1; fi
@@ -83,6 +86,8 @@ drills() {
   [[ "$1" == unfill ]] || { command sleep "${DRILL_SLEEP:-0}" & echo $! >> "$OUT/drill-sleeps"; wait; }
 }
 `)
+	// detach: on_exit's teardown runs this file again through it.
+	b.WriteString(shellFuncIf(t, "eks-bank.sh", "detach"))
 	for _, fn := range []string{"kill_tree", "run_check", "check_exit", "stop_check", "on_exit",
 		"stop_scale_drills", "scale_back", "read_workers", "step_scale", "step_gateways11"} {
 		b.WriteString(shellFunc(t, "eks-bank.sh", fn))
@@ -94,6 +99,9 @@ drills() {
 	}
 	b.WriteString(extra)
 	b.WriteString(`
+# on_exit's teardown runs this file again with step down (eks-bank.sh's
+# main loop: step_down alone).
+if [[ "${2:-}" == down ]]; then step_down; exit; fi
 # The scale step's normal end alone: scale_back, as step_scale calls it.
 scale_ending() { in_scale=1; scaled_back=0; scale_back; in_scale=""; }
 trap on_exit EXIT
@@ -135,7 +143,12 @@ func startUndoWith(t *testing.T, extra, check, workers string, env ...string) un
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { out.Close() })
-	cmd := exec.Command("bash", "-c", undoHarnessWith(t, extra, check))
+	// From a file: on_exit's teardown runs it again ($0, step down).
+	harness := filepath.Join(dir, "harness.sh")
+	if err := os.WriteFile(harness, []byte(undoHarnessWith(t, extra, check)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", harness)
 	cmd.Env = append(append(cleanEnviron(), "OUT="+dir), env...)
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

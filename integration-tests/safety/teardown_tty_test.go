@@ -6,7 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -19,8 +22,13 @@ import (
 // realistic trigger: an MFA assume-role profile, whose `aws eks get-token`
 // (under kubectl and Helm) prompts on the terminal once its cached
 // credentials expire. Now the credentials are refreshed in the foreground
-// first (a prompt there can be answered), and the teardown ignores TTIN
-// and TTOU, so a prompt that still comes fails at once.
+// first (a prompt there can be answered), and the teardown runs with no
+// controlling terminal (detach: a session of its own), so a prompt that
+// still comes fails at once. Ignoring TTIN and TTOU (#1443) was not
+// enough: macOS's bash 3.2 gives a script's children the default back,
+// and a program may install its own (review of #1443). The refresh's time
+// limit ends aws's whole tree, a prompting credential helper included, and
+// puts the terminal's settings back (a killed prompt left echo off).
 //
 // These run the scripts' real exit paths under a pseudo-terminal (Python's
 // pty module), type Ctrl-C, answer the foreground prompt, and check that
@@ -79,6 +87,20 @@ res["screen"] = screen.decode("utf-8", "replace")[-8000:]
 print(json.dumps(res))
 `
 
+// ttyOpts: what runUnderTTY runs and how. awsMode picks the fake aws's
+// behaviour for `sts get-caller-identity`: "" reads an answer from the
+// terminal (answered with 246810), "helper" starts a credential helper
+// that prompts (getpass) and waits for it, "getpass" prompts itself
+// (getpass, echo off); neither of the last two is answered. after, when
+// set, is shell that a wrapper runs once the run has ended, while the
+// wrapper still holds the terminal (when the terminal's session leader
+// ends, its foreground group gets SIGHUP, which would end a left-over
+// prompt and hide it).
+type ttyOpts struct {
+	args, env             []string
+	ready, awsMode, after string
+}
+
 type ttyResult struct {
 	Ready, Answered, Ended bool
 	Code                   *int
@@ -87,10 +109,11 @@ type ttyResult struct {
 }
 
 // runUnderTTY writes script to dir/<marker>.sh and runs it under the
-// driver, with a fake aws first on PATH: it logs its arguments, and for
-// `sts get-caller-identity` logs "aws-prompt" and reads a line from the
-// terminal, as an MFA prompt does.
-func runUnderTTY(t *testing.T, dir, script string, args, env []string, ready string) ttyResult {
+// driver, with a fake aws first on PATH (see ttyOpts). It returns the
+// marker too: every process of the run, the credential helper's
+// ($marker-helper) and the teardown child's included, carries it in its
+// command line.
+func runUnderTTY(t *testing.T, dir, script string, o ttyOpts) (ttyResult, string) {
 	t.Helper()
 	needTools(t, "python3", "ps")
 	marker := fmt.Sprintf("ttyrun-%d-%d", os.Getpid(), time.Now().UnixNano())
@@ -106,8 +129,18 @@ func runUnderTTY(t *testing.T, dir, script string, args, env []string, ready str
 echo "aws $*" >> "$OUT/log"
 case "$*" in
   *"sts get-caller-identity"*)
-    echo aws-prompt >> "$OUT/log"
-    if IFS= read -r code < /dev/tty; then echo "aws-read $code" >> "$OUT/log"; else echo aws-read-failed >> "$OUT/log"; fi
+    case "${AWS_MODE:-}" in
+      helper)
+        echo aws-helper >> "$OUT/log"
+        python3 -I -c 'import getpass; getpass.getpass("helper code: ")' "$HELPER_MARK"
+        echo "aws-helper-ended $?" >> "$OUT/log" ;;
+      getpass)
+        echo aws-getpass >> "$OUT/log"
+        exec python3 -I -c 'import getpass; getpass.getpass("Enter MFA code: ")' ;;
+      *)
+        echo aws-prompt >> "$OUT/log"
+        if IFS= read -r code < /dev/tty; then echo "aws-read $code" >> "$OUT/log"; else echo aws-read-failed >> "$OUT/log"; fi ;;
+    esac
     echo 111122223333 ;;
 esac
 exit 0
@@ -122,13 +155,23 @@ exit 0
 		}
 	}
 	envMap := map[string]string{}
-	for _, e := range append(append(clean, "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "OUT="+dir), env...) {
+	base := append(clean, "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "OUT="+dir,
+		"AWS_MODE="+o.awsMode, "HELPER_MARK="+marker+"-helper")
+	for _, e := range append(base, o.env...) {
 		k, v, _ := strings.Cut(e, "=")
 		envMap[k] = v
 	}
+	argv := append([]string{"bash", path}, o.args...)
+	if o.after != "" {
+		argv = append([]string{"bash", "-c", `bash "$0" "$@"; rc=$?; ` + o.after + `; exit $rc`, path}, o.args...)
+	}
+	prompt := ""
+	if o.awsMode == "" {
+		prompt = "aws-prompt"
+	}
 	cfg, _ := json.Marshal(map[string]any{
-		"argv": append([]string{"bash", path}, args...), "env": envMap, "log": filepath.Join(dir, "log"),
-		"ready": ready, "prompt": "aws-prompt", "answer": "246810", "marker": marker, "timeout": 20,
+		"argv": argv, "env": envMap, "log": filepath.Join(dir, "log"),
+		"ready": o.ready, "prompt": prompt, "answer": "246810", "marker": marker, "timeout": 25,
 	})
 	cfgPath := filepath.Join(dir, "driver.json")
 	if err := os.WriteFile(cfgPath, cfg, 0o644); err != nil {
@@ -147,9 +190,9 @@ exit 0
 		t.Fatalf("the pty driver said %q", out)
 	}
 	if !r.Ready {
-		t.Fatalf("the run never reached %q:\n%s", ready, readLog(t, filepath.Join(dir, "log")))
+		t.Fatalf("the run never reached %q:\n%s", o.ready, readLog(t, filepath.Join(dir, "log")))
 	}
-	return r
+	return r, marker
 }
 
 // checkTTYTeardown: the run ended with exit 130 after the Ctrl-C, the
@@ -182,40 +225,162 @@ func checkTTYTeardown(t *testing.T, r ttyResult, dir, down string) {
 	}
 }
 
-// m1-eks.sh: Ctrl-C during a check of an `all` run; the real step_down,
-// whose `helm uninstall` reads the terminal.
-func TestM1TeardownThatReadsTheTerminalFinishes(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte("{}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	r := runUnderTTY(t, dir, m1Harness(t), []string{"all"},
-		[]string{"M1_DIR=" + k8sFile(t, "m1"), "FAIL_STEP=kernel", "FAIL_HOW=sleep", "DOWN=real"}, "start kernel")
-	checkTTYTeardown(t, r, dir, "x /nonexistent/cluster.sh down m1t-1")
+// teardownRun is one script's exit path under the pty: its harness, the
+// env and log line it needs, and the line its teardown writes when it
+// reaches down.
+type teardownRun struct {
+	name, ready, down string
+	harness           func(t *testing.T, dir string) (string, []string, []string)
 }
 
-// eks-bank.sh: the same, with a check that sleeps, and its real step_down,
-// whose `helm uninstall` reads the terminal before cell.sh down.
-func TestEKSBankTeardownThatReadsTheTerminalFinishes(t *testing.T) {
-	dir := t.TempDir()
-	for f, body := range map[string]string{
-		"run.tfvars.json":   `{"name": "bank-1", "ttl": "2099-01-01T00:00:00Z"}`,
-		"terraform.tfstate": `{"resources": [{"type": "aws_vpc"}]}`,
-		"workers":           "12 0 12",
-		"kubeconfig":        "apiVersion: v1",
-	} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte(body+"\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	extra := `
+func teardownRuns() []teardownRun {
+	return []teardownRun{
+		// m1-eks.sh: Ctrl-C during a check of an `all` run; the real
+		// step_down, whose Helm call reads the terminal.
+		{name: "m1-eks.sh", ready: "start kernel", down: "x /nonexistent/cluster.sh down m1t-1",
+			harness: func(t *testing.T, dir string) (string, []string, []string) {
+				if err := os.WriteFile(filepath.Join(dir, "terraform.tfstate"), []byte("{}\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				return m1Harness(t), []string{"all"},
+					[]string{"M1_DIR=" + k8sFile(t, "m1"), "FAIL_STEP=kernel", "FAIL_HOW=sleep", "DOWN=real"}
+			}},
+		// eks-bank.sh: a check that sleeps; the real step_down, whose Helm
+		// call reads the terminal before cell.sh down.
+		{name: "eks-bank.sh", ready: "sleepy-start", down: "x /eksbank-test/cell.sh bank-1 down",
+			harness: func(t *testing.T, dir string) (string, []string, []string) {
+				for f, body := range map[string]string{
+					"run.tfvars.json":   `{"name": "bank-1", "ttl": "2099-01-01T00:00:00Z"}`,
+					"terraform.tfstate": `{"resources": [{"type": "aws_vpc"}]}`,
+					"workers":           "12 0 12",
+					"kubeconfig":        "apiVersion: v1",
+				} {
+					if err := os.WriteFile(filepath.Join(dir, f), []byte(body+"\n"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				extra := `
 HERE=/eksbank-test
 k() { log "k $*"; }
 same_account() { :; }
 left_after_down() { :; }
-hm() { log "hm $*"; echo "hm output $*" >&2; if read -r _ < /dev/tty; then log "hm read the terminal"; else log "hm: no terminal"; fi; }
+hm() {
+  log "hm $*"; echo "hm output $*" >&2
+  if [[ -n "${HM_CHILD:-}" ]]; then
+    if /bin/bash "$HM_CHILD"; then log "child read the terminal"; else log "child: no terminal"; fi
+  fi
+  if read -r _ < /dev/tty; then log "hm read the terminal"; else log "hm: no terminal"; fi
+}
 sleepy() { log sleepy-start; command sleep 20; }
-` + shellFunc(t, "eks-bank.sh", "step_down") + shellFuncIf(t, "eks-bank.sh", "refresh_credentials")
-	r := runUnderTTY(t, dir, undoHarnessWith(t, extra, "sleepy sleepy"), nil, []string{"RUN_ALL=1"}, "sleepy-start")
-	checkTTYTeardown(t, r, dir, "x /eksbank-test/cell.sh bank-1 down")
+` + shellFunc(t, "eks-bank.sh", "step_down") + shellFuncIf(t, "eks-bank.sh", "refresh_credentials") + shellFuncIf(t, "eks-bank.sh", "detach")
+				return undoHarnessWith(t, extra, "sleepy sleepy"), nil, []string{"RUN_ALL=1"}
+			}},
+	}
+}
+
+// The teardown's Helm call reads the terminal: with the credentials
+// prompt answered in the foreground, the run ends with 130 and reaches
+// down. Before #1443 the teardown stopped on the terminal for good.
+func TestTeardownThatReadsTheTerminalFinishes(t *testing.T) {
+	for _, tr := range teardownRuns() {
+		t.Run(tr.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script, args, env := tr.harness(t, dir)
+			r, _ := runUnderTTY(t, dir, script, ttyOpts{args: args, env: env, ready: tr.ready})
+			checkTTYTeardown(t, r, dir, tr.down)
+		})
+	}
+}
+
+// A program in the teardown that puts SIGTTIN back to the default (as
+// macOS's bash 3.2 does for the children of a script it runs, such as
+// cluster.sh or cell.sh) and reads the terminal: run here by /bin/bash
+// from a script file. With TTIN ignored (#1443) it was stopped and the run
+// never ended; with no controlling terminal its open of /dev/tty fails.
+func TestTeardownChildThatResetsTTINFinishes(t *testing.T) {
+	for _, tr := range teardownRuns() {
+		t.Run(tr.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script, args, env := tr.harness(t, dir)
+			// It puts TTIN and TTOU back to the default and reads the
+			// terminal; its command line names the file, to find it by.
+			child := filepath.Join(dir, "child-of-teardown.sh")
+			body := `python3 -I -c 'import signal
+signal.signal(signal.SIGTTIN, signal.SIG_DFL); signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+open("/dev/tty").readline()' "$0"
+`
+			if err := os.WriteFile(child, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			r, _ := runUnderTTY(t, dir, script, ttyOpts{args: args, ready: tr.ready, env: append(env, "HM_CHILD="+child)})
+			if left, _ := exec.Command("pgrep", "-f", child).Output(); len(strings.Fields(string(left))) > 0 {
+				for _, pid := range strings.Fields(string(left)) {
+					if n, err := strconv.Atoi(pid); err == nil {
+						_ = syscall.Kill(n, syscall.SIGKILL)
+					}
+				}
+			}
+			checkTTYTeardown(t, r, dir, tr.down)
+			if log := readLog(t, filepath.Join(dir, "log")); !strings.Contains(log, "child: no terminal") {
+				t.Errorf("the child did not fail at once:\n%s", log)
+			}
+		})
+	}
+}
+
+// A credential helper (credential_process) that prompts and is never
+// answered: the refresh's time limit ends it with aws, and the run goes on
+// to down. Before, only aws ended, and the helper read the terminal on
+// after the run.
+func TestRefreshEndsAPromptingCredentialHelper(t *testing.T) {
+	for _, tr := range teardownRuns() {
+		t.Run(tr.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script, args, env := tr.harness(t, dir)
+			r, marker := runUnderTTY(t, dir, script, ttyOpts{args: args, ready: tr.ready, awsMode: "helper",
+				env:   append(env, "CRED_REFRESH_SECONDS=2"),
+				after: `sleep 1; pgrep -f "$HELPER_MARK" > "$OUT/helper-after.txt"`})
+			left, _ := exec.Command("pgrep", "-f", marker+"-helper").Output()
+			for _, pid := range strings.Fields(string(left)) {
+				if n, err := strconv.Atoi(pid); err == nil {
+					_ = syscall.Kill(n, syscall.SIGKILL)
+				}
+			}
+			log := readLog(t, filepath.Join(dir, "log"))
+			if !r.Ended || r.Code == nil || *r.Code != 130 {
+				t.Fatalf("ended %v, exit %v; want exit 130 (processes %v):\n%s", r.Ended, r.Code, r.Stuck, log)
+			}
+			if after := strings.Fields(readLog(t, filepath.Join(dir, "helper-after.txt"))); len(after) > 0 {
+				t.Errorf("the credential helper outlived the refresh's time limit and the run: pids %s", after)
+			}
+			if !strings.Contains(log, tr.down) {
+				t.Errorf("no %q:\n%s", tr.down, log)
+			}
+		})
+	}
+}
+
+// A prompt (getpass: echo off) ended by the refresh's time limit leaves
+// the terminal's echo on.
+func TestRefreshPutsTheTerminalBack(t *testing.T) {
+	for _, tr := range teardownRuns() {
+		t.Run(tr.name, func(t *testing.T) {
+			dir := t.TempDir()
+			script, args, env := tr.harness(t, dir)
+			r, _ := runUnderTTY(t, dir, script, ttyOpts{args: args, ready: tr.ready, awsMode: "getpass",
+				env:   append(env, "CRED_REFRESH_SECONDS=2"),
+				after: `stty -a > "$OUT/stty-after.txt" 2>&1`})
+			log := readLog(t, filepath.Join(dir, "log"))
+			if !r.Ended || r.Code == nil || *r.Code != 130 {
+				t.Fatalf("ended %v, exit %v; want exit 130 (processes %v):\n%s", r.Ended, r.Code, r.Stuck, log)
+			}
+			st := readLog(t, filepath.Join(dir, "stty-after.txt"))
+			if !regexp.MustCompile(`(^|\s)echo(\s|;|$)`).MatchString(st) || regexp.MustCompile(`(^|\s)-echo(\s|;|$)`).MatchString(st) {
+				t.Errorf("echo is off after the run:\n%s", st)
+			}
+			if !strings.Contains(log, tr.down) {
+				t.Errorf("no %q:\n%s", tr.down, log)
+			}
+		})
+	}
 }

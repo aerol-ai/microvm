@@ -86,13 +86,14 @@ The cost guards:
   price in `cost.py` is refused unless `M1_PRICE_VM` gives one.
 - **A teardown on any stop.** A run started with `all` tears itself down
   whatever stops it: a step that fails, the spend limit, Ctrl-C or a kill.
-  The teardown runs in a process group of its own, so a second Ctrl-C does
-  not stop it half way. It tears down only a cluster this run made (or
-  passed the account check for): a refused estimate never takes down an
-  older cluster that used the same name. Before it starts, it refreshes
-  the AWS credentials at the terminal, so an MFA prompt comes where you
-  can answer it. A prompt that still comes inside the teardown fails at
-  once instead of stopping it. Its output goes to the terminal and to
+  The teardown runs detached from the terminal (a session of its own), so a
+  second Ctrl-C does not stop it half way. It tears down only a cluster this
+  run made (or passed the account check for): a refused estimate never takes
+  down an older cluster that used the same name. Before it starts, it
+  refreshes the AWS credentials at the terminal (at most
+  `CRED_REFRESH_SECONDS`, 120 s), so an MFA prompt comes where you can
+  answer it. A prompt that still comes inside the teardown fails at once
+  instead of stopping it. Its output goes to the terminal and to
   `.state/<name>/teardown.log`.
 - **Teardown by name.** `down` removes the chart and its volumes, then runs
   `cluster.sh down <name>`, which works from the run's own Terraform state.

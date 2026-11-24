@@ -55,7 +55,8 @@
 #   final     verify, evidence
 #   down      the chart and its volumes, cluster.sh down, leak-check.sh
 # Not in `all`: verifynow (aerolvm k8s verify on its own, labelled
-# M1_VERIFY_LABEL), for a run resumed by hand.
+# M1_VERIFY_LABEL), for a run resumed by hand; teardown (diag, then down:
+# what on_exit runs, with no terminal).
 #
 # up, setup, build and install are what the rest needs: one that fails ends
 # the run (and `all` tears it down unless M1_KEEP=1). Every later step is a
@@ -82,6 +83,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 K8S="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$K8S/../.." && pwd)"
+# This script, which on_exit runs again (step teardown) to tear down.
+SELF="$HERE/$(basename "${BASH_SOURCE[0]}")"
 usage() { sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
 name="${1:-}"; [[ -n "$name" ]] || usage
 shift
@@ -930,11 +933,10 @@ stop_teardown=0
 # refuses after this run's own up (an STS blip) does not keep it up:
 # cluster.sh down checks the account itself.
 on_exit() {
-  local rc=$? teardown=0 down_pid
+  local rc=$? teardown=0
   # From here no INT or TERM stops this script: a second Ctrl-C used to end
-  # the run before down. The teardown runs as a job of its own (set -m), in
-  # its own process group, so a Ctrl-C at the terminal reaches no part of
-  # it, Terraform included (eks-bank.sh's on_exit).
+  # the run before down. The teardown runs with no terminal (detach), so a
+  # Ctrl-C there reaches no part of it, Terraform included.
   trap - EXIT
   trap '' INT TERM HUP
   # A closed terminal (HUP, exit 129) takes no more writes, and a failed
@@ -954,19 +956,19 @@ on_exit() {
     # Credentials first, here in the foreground, where an MFA prompt can
     # be answered (not after a hangup: no terminal is left).
     [[ "$rc" == 129 ]] || refresh_credentials || true
-    # The teardown's group is in the background: a process of it that read
-    # the terminal (a prompt that still comes) was stopped by SIGTTIN, and
-    # the run then waited for it forever with the cluster up until AWS's
-    # timer (review of #1439). With TTIN and TTOU ignored, inherited by
-    # every process the teardown starts, such a read fails at once and a
-    # write still goes through. Its stdin is /dev/null; its output goes to
-    # the terminal and to $sd/teardown.log.
-    trap '' TTIN TTOU
-    set -m
-    { diag exit || true; step_down || exit 1; } < /dev/null > >(tee -a "$sd/teardown.log") 2>&1 &
-    down_pid=$!
-    set +m
-    wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true
+    # The teardown: this script again, step teardown (diag, then down), in
+    # a session of its own with no controlling terminal (detach). A
+    # background process group that read the terminal (a prompt that still
+    # comes) was stopped by SIGTTIN, and the run waited for it forever with
+    # the cluster up until AWS's timer (review of #1439). Ignoring TTIN and
+    # TTOU was not enough: macOS's bash 3.2, running a script, gives its
+    # children the default back, and ssh-style prompts install their own
+    # handler and spin (review of #1443). With no terminal, /dev/tty fails
+    # at once. Its output reaches the terminal and $sd/teardown.log through
+    # tee, here in this (the terminal's) process group.
+    if ! detach env M1_TEARDOWN_ON_EXIT=0 "$BASH" "$SELF" "$name" teardown < /dev/null 2>&1 | tee -a "$sd/teardown.log"; then
+      say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true
+    fi
   fi
   rm -f "$sd/.teardown-next"
   exit "$rc"
@@ -981,6 +983,7 @@ for s in "${steps[@]}"; do
   case "$s" in
     estimate|up|setup|build|install) "step_$s" ;;
     down) step_down; torn=1 ;;
+    teardown) diag exit || true; step_down; torn=1 ;;
     # The API's port-forward keeper, from this (the main) shell: each check
     # runs in a subshell, which must never own the forward (m1-lib.sh). It
     # starts only once the gate passes: a kubeconfig the gate refuses may
@@ -990,7 +993,7 @@ for s in "${steps[@]}"; do
       run_check "$s" ;;
     *) echo "m1-eks.sh: unknown step $s" >&2; exit 2 ;;
   esac
-  if [[ "$s" != down && "$s" != estimate ]]; then
+  if [[ "$s" != down && "$s" != teardown && "$s" != estimate ]]; then
     cost_check "$s" || [[ "$dry" == 1 ]] || stop_run "the projected cost passed \$${M1_COST_LIMIT:-6.15} after $s"
   fi
   # A blocker: with no split worker after the first switch, nothing after
