@@ -212,11 +212,15 @@ mkdir -p "$sd"
 # on_exit's teardown runs. The teardown reads the script from disk, and a
 # run takes hours: a branch switched in the checkout meanwhile must not
 # change what tears the run down. The copy itself (ME is $sd) copies
-# nothing.
+# nothing. The copy is a new file moved into place, never a copy over the
+# old one: a teardown still running from it (a second run of the same
+# name, `down` by hand, starts while it runs) keeps reading the file it
+# opened, as bash reads its script while it runs.
 keep_copy() {
   SELF="$sd/$(basename "${BASH_SOURCE[0]}")"
   [[ "$ME" != "$sd" ]] || return 0
-  cp "${BASH_SOURCE[0]}" "$SELF"
+  cp "${BASH_SOURCE[0]}" "$SELF.new.$$"
+  mv -f "$SELF.new.$$" "$SELF"
 }
 keep_copy
 # on_exit's mark that a teardown follows (check_exit reads it): never one an
@@ -346,8 +350,9 @@ refresh_credentials() {
 # half way. A tee on this side did: when the terminal closed, it died and
 # the teardown with it (review of #1445). A viewer shows the log's new
 # lines on this terminal while cmd runs, and stops after cmd ends (KILL if
-# it is stuck: it inherits INT and TERM ignored). Returns cmd's own exit
-# status, so "down did not finish" means the teardown failed, not the
+# it is stuck: it inherits INT and TERM ignored), or as soon as this shell
+# is gone (a SIGKILL of the run left it polling forever). Returns cmd's own
+# exit status, so "down did not finish" means the teardown failed, not the
 # viewer.
 teardown_detached() {
   local log="$sd/teardown.log" mark="$sd/.teardown-done.$$" from viewer rc=0 _
@@ -355,18 +360,18 @@ teardown_detached() {
   from="$(wc -c < "$log" | tr -d ' ')"
   rm -f "$mark"
   perl -e '
-    my ($f, $from, $mark) = @ARGV;
+    my ($f, $from, $mark, $parent) = @ARGV;
     open(my $fh, "<", $f) or exit 0;
     seek($fh, $from, 0);
     $| = 1;
     my $buf;
     while (1) {
-      my $done = -e $mark;
+      my $done = -e $mark || getppid() != $parent;
       while (read($fh, $buf, 65536)) { print $buf }
       last if $done;
       select(undef, undef, undef, 0.2);
       seek($fh, 0, 1);
-    }' "$log" "$from" "$mark" &
+    }' "$log" "$from" "$mark" "$$" &
   viewer=$!
   detach "$@" < /dev/null >> "$log" 2>&1 || rc=$?
   : > "$mark"
