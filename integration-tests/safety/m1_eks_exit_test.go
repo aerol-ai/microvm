@@ -48,8 +48,11 @@ func m1Harness(t *testing.T) string {
 	}
 	var b strings.Builder
 	b.WriteString(`set -euo pipefail
+SELF="$0"
 sd="$OUT"; dry=0; name=m1t-1; HERE="$M1_DIR"; K8S=/nonexistent; refused=0; gated=0; made_here=0
 ns=aerolvm-system; workers=aerolvm-workers; release=aerolvm
+# on_exit's teardown runs this file again as m1-eks.sh does: <name> <step>.
+if [[ "${1:-}" == "$name" ]]; then shift; fi
 log() { echo "$*" >> "$OUT/log"; }
 say() { log "say $*"; }
 result() { log "result $1 $2"; }
@@ -65,7 +68,13 @@ x() { log "x $*"; [[ "${FAIL_STEP:-}:${FAIL_HOW:-}" != up:cmd ]]; }
 step_down() { log down-start; command sleep 1; log down-done; }
 same_account() { :; }
 ctx_ok() { :; }
-hm() { log "hm $*"; echo "hm output $*" >&2; if read -r _ < /dev/tty; then log "hm read the terminal"; else log "hm: no terminal"; fi; }
+hm() {
+  log "hm $*"; echo "hm output $*" >&2
+  if [[ -n "${HM_CHILD:-}" ]]; then
+    if /bin/bash "$HM_CHILD"; then log "child read the terminal"; else log "child: no terminal"; fi
+  fi
+  if read -r _ < /dev/tty; then log "hm read the terminal"; else log "hm: no terminal"; fi
+}
 behave() {
   log "start $1"
   if [[ "${FAIL_STEP:-}" == "$1" ]]; then
@@ -93,10 +102,28 @@ behave() {
 	// shellFuncIf: node_cordon, node_uncordon and forget are newer than
 	// this harness; the code before them runs without (and shows what it
 	// did).
-	for _, fn := range []string{"api_cordon", "api_uncordon", "node_cordon", "node_uncordon", "forget", "lift_cordons", "refresh_credentials"} {
+	for _, fn := range []string{"api_cordon", "api_uncordon", "node_cordon", "node_uncordon", "forget", "lift_cordons", "refresh_credentials", "detach"} {
 		b.WriteString(shellFuncIf(t, "m1/m1-lib.sh", fn))
 	}
 	b.WriteString("if [[ \"${DOWN:-}\" == real ]]; then\n" + shellFunc(t, "m1/m1-eks.sh", "step_down") + "fi\n")
+	b.WriteString(`# TD_TICKS: a teardown that takes TD_TICKS seconds, a line a second, then
+# a last line (for a terminal or a viewer that goes away half way).
+if [[ -n "${TD_TICKS:-}" ]]; then
+  step_down() {
+    log down-start
+    local i
+    for i in $(seq 1 "$TD_TICKS"); do echo "teardown tick $i"; log "tick $i"; command sleep 1; done
+    echo "teardown output last line"
+    log down-done
+  }
+fi
+`)
+	b.WriteString(shellFuncIf(t, "m1/m1-lib.sh", "teardown_detached") + shellFuncIf(t, "m1/m1-eks.sh", "keep_copy"))
+	b.WriteString(`# keep_copy (when the script has it): the teardown runs a copy of this
+# file in $sd; ME is the folder this file is in.
+ME="$(cd "$(dirname "$0")" && pwd)"
+if declare -F keep_copy >/dev/null; then keep_copy; fi
+`)
 	b.WriteString(string(src[i:]))
 	return b.String()
 }
@@ -121,14 +148,31 @@ func startM1(t *testing.T, steps []string, env ...string) m1Run {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { out.Close() })
-	cmd := exec.Command("bash", append([]string{"-c", m1Harness(t), "m1-eks.sh"}, steps...)...)
+	// From a file: on_exit's teardown runs it again ($0, step teardown).
+	harness := writeHarness(t, dir, "m1-eks.sh", m1Harness(t))
+	cmd := exec.Command("bash", append([]string{harness}, steps...)...)
 	var clean []string
 	for _, e := range cleanEnviron() {
 		if !strings.HasPrefix(e, "M1_") {
 			clean = append(clean, e)
 		}
 	}
-	cmd.Env = append(append(clean, "OUT="+dir, "M1_DIR="+k8sFile(t, "m1")), env...)
+	// A fake aws first on PATH: refresh_credentials is m1-lib.sh's own,
+	// and the real aws CLI must never run here.
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "aws"), []byte("#!/bin/sh\necho \"aws $*\" >> \"$OUT/log\"\necho 111122223333\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var noPath []string
+	for _, e := range clean {
+		if !strings.HasPrefix(e, "PATH=") {
+			noPath = append(noPath, e)
+		}
+	}
+	cmd.Env = append(append(noPath, "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "OUT="+dir, "M1_DIR="+k8sFile(t, "m1")), env...)
 	cmd.Stdout, cmd.Stderr = out, out
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {

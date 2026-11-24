@@ -100,7 +100,11 @@
 # needs that state. If it is lost, reap.sh still finds every part of the run
 # by its tags once its TTL has passed.
 set -euo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ME: the folder this file is in: the checkout's integration-tests/k8s,
+# or .state/<name>/ for the copy on_exit runs (keep_copy). HERE: the
+# harness's folder, which that copy is told (EKS_BANK_KIT_DIR).
+ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="${EKS_BANK_KIT_DIR:-$ME}"
 ROOT="$(cd "$HERE/../.." && pwd)"
 name="${1:?usage: eks-bank.sh <name> <step> [step...] (estimate up build install enterprise nlb gvisor verify drills gateways11 scale down all)}"
 shift
@@ -204,6 +208,17 @@ if [[ "$dry" == 1 ]]; then
   sd="${EKS_BANK_DRY_DIR:-$(mktemp -d)}"
 fi
 mkdir -p "$sd"
+# keep_copy: this script copied into $sd, and SELF set to the copy, which
+# on_exit's teardown runs. The teardown reads the script from disk, and a
+# run takes hours: a branch switched in the checkout meanwhile must not
+# change what tears the run down. The copy itself (ME is $sd) copies
+# nothing.
+keep_copy() {
+  SELF="$sd/$(basename "${BASH_SOURCE[0]}")"
+  [[ "$ME" != "$sd" ]] || return 0
+  cp "${BASH_SOURCE[0]}" "$SELF"
+}
+keep_copy
 # on_exit's mark that a teardown follows (check_exit reads it): never one an
 # earlier run left.
 rm -f "$sd/.teardown-next"
@@ -278,19 +293,103 @@ gate() {
   gated=1
 }
 # refresh_credentials: one STS call in the foreground, at most
-# CRED_REFRESH_SECONDS (120) long, just before the teardown starts in a
-# process group of its own. With an MFA assume-role profile whose cached
+# CRED_REFRESH_SECONDS (120) long, just before the teardown starts with no
+# terminal (detach). With an MFA assume-role profile whose cached
 # credentials have expired, the AWS CLI prompts on the terminal: here the
 # user can answer, and the teardown's own calls (aws eks get-token under
 # kubectl and Helm, cluster.sh down) then find fresh credentials in the
-# CLI's cache. Best effort: the teardown runs either way. perl's alarm is
-# the time limit because a limit that runs the command in a group of its
-# own (GNU timeout) would take the terminal from it.
+# CLI's cache. Best effort: the teardown runs either way. The limit is
+# perl's, with aws its child in this (the terminal's) process group: GNU
+# timeout would put it in a group of its own, away from the terminal. Out
+# of time, aws's whole tree goes, a credential_process helper that prompts
+# included (an alarm used to end aws alone, and the helper read on). The
+# terminal's settings are saved before and put back after: a prompt killed
+# half way left echo off.
 refresh_credentials() {
   [[ "$dry" == 1 ]] && return 0
-  perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "${CRED_REFRESH_SECONDS:-120}" \
-    aws sts get-caller-identity --query Account --output text >/dev/null ||
-    say "could not refresh the AWS credentials; the teardown tries anyway"
+  local saved="" rc=0
+  [[ -t 0 ]] && saved="$(stty -g 2>/dev/null || true)"
+  perl -e '
+    my $secs = shift @ARGV;
+    my $pid = fork;
+    exit 127 unless defined $pid;
+    if ($pid == 0) { exec @ARGV; exit 127 }
+    my $end = time + $secs;
+    while (time < $end) {
+      if (waitpid($pid, 1) == $pid) { exit($? & 127 ? 128 + ($? & 127) : $? >> 8) }
+      select(undef, undef, undef, 0.1);
+    }
+    # Out of time: the whole tree, found while aws still lives (its
+    # children would go to init once it is gone). Frozen first (STOP), then
+    # walked again until a walk finds no new process: one forked between a
+    # walk and the kill cannot get away. Then all of it at once.
+    my %tree = ($pid => 1);
+    for (my $grew = 1; $grew;) {
+      kill "STOP", keys %tree;
+      $grew = 0;
+      for (`ps -axo pid=,ppid=`) {
+        my ($c, $pp) = split;
+        if ($tree{$pp} && !$tree{$c}) { $tree{$c} = 1; $grew = 1 }
+      }
+    }
+    kill "KILL", keys %tree;
+    waitpid($pid, 0);
+    exit 124' "${CRED_REFRESH_SECONDS:-120}" aws sts get-caller-identity --query Account --output text >/dev/null || rc=$?
+  # A prompt that was killed leaves the terminal as it set it (echo off).
+  [[ -z "$saved" ]] || stty "$saved" 2>/dev/null || true
+  [[ "$rc" == 0 ]] || say "could not refresh the AWS credentials (exit $rc); the teardown tries anyway" || true
+  return 0
+}
+# teardown_detached <cmd...>: cmd run by detach (no terminal), writing
+# straight to $sd/teardown.log, with no pipe in between: nothing that dies
+# on this side (the terminal closing, a killed viewer) can send it SIGPIPE
+# half way. A tee on this side did: when the terminal closed, it died and
+# the teardown with it (review of #1445). A viewer shows the log's new
+# lines on this terminal while cmd runs, and stops after cmd ends (KILL if
+# it is stuck: it inherits INT and TERM ignored). Returns cmd's own exit
+# status, so "down did not finish" means the teardown failed, not the
+# viewer.
+teardown_detached() {
+  local log="$sd/teardown.log" mark="$sd/.teardown-done.$$" from viewer rc=0 _
+  touch "$log"
+  from="$(wc -c < "$log" | tr -d ' ')"
+  rm -f "$mark"
+  perl -e '
+    my ($f, $from, $mark) = @ARGV;
+    open(my $fh, "<", $f) or exit 0;
+    seek($fh, $from, 0);
+    $| = 1;
+    my $buf;
+    while (1) {
+      my $done = -e $mark;
+      while (read($fh, $buf, 65536)) { print $buf }
+      last if $done;
+      select(undef, undef, undef, 0.2);
+      seek($fh, 0, 1);
+    }' "$log" "$from" "$mark" &
+  viewer=$!
+  detach "$@" < /dev/null >> "$log" 2>&1 || rc=$?
+  : > "$mark"
+  for _ in $(seq 1 30); do kill -0 "$viewer" 2>/dev/null || break; sleep 0.1; done
+  kill -KILL "$viewer" 2>/dev/null || true
+  wait "$viewer" 2>/dev/null || true
+  rm -f "$mark"
+  return "$rc"
+}
+# detach <cmd...>: cmd in a session of its own, with no controlling
+# terminal, waited for; its exit status (128 + n when signal n ended it).
+# Anything in it that opens /dev/tty (an MFA prompt in aws eks get-token, a
+# helper that resets SIGTTIN, ssh's readpassphrase) fails at once instead of
+# stopping or spinning. Not a process group of the terminal's either, so a
+# Ctrl-C there reaches no part of it. The fork first: setsid fails for a
+# process group leader.
+detach() {
+  perl -MPOSIX -e '
+    my $pid = fork;
+    die "detach: fork: $!\n" unless defined $pid;
+    if ($pid) { waitpid($pid, 0); exit($? & 127 ? 128 + ($? & 127) : $? >> 8) }
+    POSIX::setsid() or die "detach: setsid: $!\n";
+    exec @ARGV or die "detach: $ARGV[0]: $!\n"' "$@"
 }
 # same_account: down without a kubeconfig (a run that died early) checks
 # this machine's account against the one cluster.sh up recorded, before any
@@ -1371,15 +1470,19 @@ downed=0
 made_here=0
 gated=0
 on_exit() {
-  local rc=$? teardown=0 down_pid
+  local rc=$? teardown=0
   # From here no INT or TERM stops this script: a second Ctrl-C used to end
   # the run before down. Its children inherit INT and TERM ignored, but a
   # program may turn them back on: Terraform does, so a second Ctrl-C could
-  # still stop its destroy. The teardown therefore runs as a job of its own
+  # still stop its destroy. The teardown therefore runs with no terminal
   # (below). Everything the teardown starts ends by itself; nothing in it
   # loops.
   trap - EXIT
-  trap '' INT TERM
+  trap '' INT TERM HUP
+  # A closed terminal (HUP, exit 129) takes no more writes, and a failed
+  # write must not end this handler (errexit): nothing more goes to it.
+  # The teardown's output still reaches $sd/teardown.log (below).
+  if [[ "$rc" == 129 ]]; then exec > /dev/null 2>&1 < /dev/null || true; fi
   if [[ "$rc" != 0 && "$run_all" == 1 && "$refused" != 1 && "$downed" != 1 && "${EKS_BANK_KEEP:-0}" != 1 && -f "$sd/terraform.tfstate" ]] &&
      [[ "$made_here" == 1 || "$gated" == 1 ]]; then
     teardown=1
@@ -1387,32 +1490,34 @@ on_exit() {
   fi
   stop_check
   if [[ "$teardown" == 1 ]]; then
-    say "all: stopped with exit $rc; tearing $name down (EKS_BANK_KEEP=1 keeps it)"
+    say "all: stopped with exit $rc; tearing $name down (EKS_BANK_KEEP=1 keeps it)" || true
     # Credentials first, here in the foreground, where an MFA prompt can
-    # be answered.
-    refresh_credentials || true
-    # A job of its own (set -m): its own process group, so a Ctrl-C at the
-    # terminal, which goes to this script's group, reaches no part of the
-    # teardown, Terraform included. A process of a background group that
-    # read the terminal (a prompt that still comes) was stopped by SIGTTIN,
-    # and the run then waited for it forever with the cell up (review of
-    # #1439): TTIN and TTOU are ignored, inherited by every process the
-    # teardown starts, so such a read fails at once and a write still goes
-    # through. Its stdin is /dev/null; its output goes to the terminal and
-    # to $sd/teardown.log. Best effort, under ||: down goes on past a part
-    # that fails, and says what is left.
-    trap '' TTIN TTOU
-    set -m
-    { step_down || exit 1; } < /dev/null > >(tee -a "$sd/teardown.log") 2>&1 &
-    down_pid=$!
-    set +m
-    wait "$down_pid" || say "all: down did not finish; run ./eks-bank.sh $name down, or reap.sh"
+    # be answered (not after a hangup: no terminal is left).
+    [[ "$rc" == 129 ]] || refresh_credentials || true
+    # The teardown: this script again, step down, in a session of its own
+    # with no controlling terminal (detach), so a Ctrl-C at the terminal
+    # reaches no part of it, Terraform included. A background process group
+    # that read the terminal (a prompt that still comes) was stopped by
+    # SIGTTIN, and the run waited for it forever with the cell up (review
+    # of #1439). Ignoring TTIN and TTOU was not enough: macOS's bash 3.2,
+    # running a script (cell.sh), gives its children the default back, and
+    # ssh-style prompts install their own handler and spin (review of
+    # #1443). With no terminal, /dev/tty fails at once. teardown_detached:
+    # straight to $sd/teardown.log, shown here by a viewer. It is the copy
+    # keep_copy made (SELF), told where the harness's folder is. Best
+    # effort: down goes on past a part that fails, and says what is left.
+    if ! teardown_detached env EKS_BANK_KIT_DIR="$HERE" "$BASH" "$SELF" "$name" down; then
+      say "all: down did not finish; run ./eks-bank.sh $name down, or reap.sh" || true
+    fi
   fi
   rm -f "$sd/.teardown-next"
   exit "$rc"
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
+# A closed terminal: without this, bash ended on SIGHUP and ran on_exit
+# with status 0, so an `all` run did not tear down (as m1-eks.sh).
+trap 'exit 129' HUP
 steps=("$@")
 if [[ "$1" == all ]]; then
   run_all=1
