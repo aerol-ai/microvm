@@ -8,11 +8,13 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -276,11 +278,12 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 				IsolateUseJail:                   boolOr("SB_ISOLATE_USE_JAIL", true),
 				WasmWorkerDropPrivs:              boolOr("SB_WASM_WORKER_DROP_PRIVS", true),
 				WasmWorkerUID:                    config.DefaultWasmWorkerID, WasmWorkerGID: config.DefaultWasmWorkerID}
-			// sandboxd's groups are the ones the pod gives the agent: its
-			// own and the pod's supplemental groups. A WASM worker needs it
-			// in the workers' group (checkSplitWasm).
+			// sandboxd's groups are the ones the container runtime gives
+			// the agent: its own, the groups its image lists for its user,
+			// and the pod's supplemental groups. A WASM worker needs it in
+			// the workers' group (checkSplitWasm).
 			spec := workerSpec(t, out)
-			groups := []int{65531}
+			groups := append([]int{65531}, agentImageGroups(t, 65531)...)
 			sup, _ := dig(spec, "securityContext")["supplementalGroups"].([]any)
 			for _, g := range sup {
 				if n, ok := g.(int); ok {
@@ -316,6 +319,98 @@ func TestChartSplitWorkerStarts(t *testing.T) {
 				groups, _ := dig(workerSpec(t, out), "securityContext")["supplementalGroups"].([]any)
 				if !slices.ContainsFunc(groups, func(v any) bool { return fmt.Sprint(v) == g }) {
 					t.Errorf("SB_PUBLIC_API_SOCKET_GROUP=%s, but the pod's supplementalGroups are %v", g, groups)
+				}
+			}
+		})
+	}
+}
+
+// splitProgramsFor is one tool's lines in internal/rootd's list of the
+// programs the deploy tools give the root helper for split: setting -> path.
+func splitProgramsFor(t *testing.T, tool string) map[string]string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "internal", "rootd", "testdata", "split_programs.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]string{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if f := strings.Fields(line); len(f) == 3 && f[0] == tool {
+			out[f[1]] = f[2]
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("internal/rootd/testdata/split_programs.txt lists nothing for %s", tool)
+	}
+	return out
+}
+
+// agentImageGroups are the groups the agent image's /etc/group lists for
+// the user its /etc/passwd names uid: the groups a container running the
+// image as uid gets besides its own (containerd and CRI-O read them from
+// the image). Read from the lines packaging/images/aerolvm.Dockerfile
+// writes.
+func agentImageGroups(t *testing.T, uid int) []int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "packaging", "images", "aerolvm.Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := ""
+	for _, m := range regexp.MustCompile(`'([a-z][a-z0-9-]*):x:(\d+):\d+:[^':]*:[^':]*:[^':]*'`).FindAllStringSubmatch(string(raw), -1) {
+		if m[2] == strconv.Itoa(uid) {
+			name = m[1]
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	var out []int
+	for _, m := range regexp.MustCompile(`'[a-z][a-z0-9-]*:x:(\d+):([a-z0-9,-]*)'`).FindAllStringSubmatch(string(raw), -1) {
+		if slices.Contains(strings.Split(m[2], ","), name) {
+			n, _ := strconv.Atoi(m[1])
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// The WASM workers' group reaches the split agent alone (review of PR
+// 1441): the agent image lists the agent's uid in it, and the pod gives it
+// to no container. No other container runs the agent's uid, so none gets
+// the image's groups for it.
+func TestChartSplitWasmGroupIsTheAgentsAlone(t *testing.T) {
+	helm := chartHelm(t)
+	if g := agentImageGroups(t, 65531); !slices.Contains(g, config.DefaultWasmWorkerID) {
+		t.Fatalf("the agent image lists uid 65531 in groups %v, want the WASM workers' %d", g, config.DefaultWasmWorkerID)
+	}
+	for _, uid := range []int{0, 65532} {
+		if g := agentImageGroups(t, uid); len(g) != 0 {
+			t.Errorf("the agent image lists uid %d in groups %v", uid, g)
+		}
+	}
+	wasm := []string{"--set", "privilegeMode=split", "--set", "worker.wasm.enabled=true"}
+	for name, flags := range map[string][]string{"single": wasm, "cluster": append(slices.Clone(chartClusterFlags), wasm...)} {
+		t.Run(name, func(t *testing.T) {
+			out, err := renderChart(helm, flags...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := workerSpec(t, out)
+			if sup, ok := dig(spec, "securityContext")["supplementalGroups"]; ok {
+				t.Errorf("the pod gives every container groups %v", sup)
+			}
+			for _, list := range []string{"initContainers", "containers"} {
+				cs, _ := spec[list].([]any)
+				for _, c := range cs {
+					m, _ := c.(map[string]any)
+					sc, _ := m["securityContext"].(map[string]any)
+					if uid := fmt.Sprint(sc["runAsUser"]); (uid == "65531") != (m["name"] == "agent") {
+						t.Errorf("container %s runs as uid %s; only the agent runs as 65531", m["name"], uid)
+					}
+					if _, ok := sc["supplementalGroups"]; ok {
+						t.Errorf("container %s sets its own groups", m["name"])
+					}
 				}
 			}
 		})
@@ -407,7 +502,10 @@ func TestChartSplitMoves(t *testing.T) {
 // with both host kinds on.
 func TestChartSplitHosts(t *testing.T) {
 	helm := chartHelm(t)
-	hosts := []string{"--set", "privilegeMode=split", "--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true"}
+	// gVisor moves too, so the helper's settings name every program it runs
+	// in a split pod: workerd and runsc.
+	hosts := []string{"--set", "privilegeMode=split", "--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true",
+		"--set", "worker.gvisor.checkpointMoves=true"}
 	for name, flags := range map[string][]string{"single": hosts, "cluster": append(slices.Clone(chartClusterFlags), hosts...)} {
 		t.Run(name, func(t *testing.T) {
 			out, err := renderChart(helm, flags...)
@@ -508,6 +606,12 @@ func TestChartSplitHosts(t *testing.T) {
 			if !strings.Contains(scripts["workerd"], "/usr/local/bin/workerd") {
 				t.Error("the workerd init container copies no workerd")
 			}
+			// The helper runs no program from a folder anyone else can write
+			// (rootd checkRootBinaries). The kubelet makes an emptyDir root's
+			// and open to everyone, so the init container closes it.
+			if dir := filepath.Dir(workerd); w.path != dir || !strings.Contains(scripts["workerd"], "chmod 0755 "+dir+"\n") {
+				t.Errorf("the workerd init container leaves workerd's folder %s open to others (mount %+v)", dir, w)
+			}
 
 			// The helper's environment is the runtime container's, plus the
 			// cgroup parent the supervisor works out (internal/supervisor
@@ -535,7 +639,36 @@ func TestChartSplitHosts(t *testing.T) {
 			if cfg.Hosts.Workerd == nil || cfg.Hosts.Workerd.Jail.ChrootBase != base || cfg.Hosts.Workerd.Jail.WorkerdPath != workerd {
 				t.Errorf("helper's V8 hosts = %+v", cfg.Hosts.Workerd)
 			}
+			// Every program the helper runs from these settings passes its
+			// own path rule (rootd.CheckRootProgramPath), with every folder
+			// the agent can write in this pod as its folders.
+			var agentDirs []string
+			for _, m := range containers["agent"] {
+				if !m.ro {
+					agentDirs = append(agentDirs, m.path)
+				}
+			}
+			// They are what internal/rootd's list of split programs names for
+			// the chart, which its real-layout test checks on real distributions.
+			programs := rootd.RootPrograms(cfg)
+			if want := splitProgramsFor(t, "chart"); !maps.Equal(programs, want) {
+				t.Errorf("the helper runs %v from the chart's settings; internal/rootd/testdata/split_programs.txt lists %v", programs, want)
+			}
+			for k, p := range programs {
+				if err := rootd.CheckRootProgramPath(p, agentDirs); err != nil {
+					t.Errorf("the chart's split settings: %s: %v", k, err)
+				}
+			}
 		})
+	}
+	// The helper's V8 jail limit is one the operator may set, as its move
+	// limits: worker.extraEnv reaches the runtime container.
+	out, err := renderChart(helm, append(slices.Clone(hosts), "--set-string", "worker.extraEnv.SB_ROOTD_ISOLATE_MAX_JAILS=100")...)
+	if err != nil {
+		t.Fatalf("split with SB_ROOTD_ISOLATE_MAX_JAILS in extraEnv: %v", err)
+	}
+	if v := workerEnv(t, out, "runtime")["SB_ROOTD_ISOLATE_MAX_JAILS"]; v != "100" {
+		t.Fatalf("the helper's SB_ROOTD_ISOLATE_MAX_JAILS = %q, want 100", v)
 	}
 }
 
@@ -752,15 +885,31 @@ func TestChartSplitNonRootReadsItsFiles(t *testing.T) {
 }
 
 // Single renders none of split: no setting, no helper, a privileged agent.
+// It shares one process namespace exactly when WASM or V8 isolates are on:
+// sandboxd starts their hosts in the runtime container's group, and they
+// outlive an agent restart only with the namespace shared (C14); without
+// them it stays off, so no container reads another's command lines.
 func TestChartSingleHasNoSplit(t *testing.T) {
 	helm := chartHelm(t)
-	hosts := []string{"--set", "worker.wasm.enabled=true", "--set", "worker.isolate.enabled=true"}
-	for name, flags := range map[string][]string{"single": nil, "cluster": chartClusterFlags,
-		"single WASM and V8 isolates": hosts, "cluster WASM and V8 isolates": append(slices.Clone(chartClusterFlags), hosts...)} {
+	wasm, v8 := []string{"--set", "worker.wasm.enabled=true"}, []string{"--set", "worker.isolate.enabled=true"}
+	hosts := append(slices.Clone(wasm), v8...)
+	cluster := func(flags []string) []string { return append(slices.Clone(chartClusterFlags), flags...) }
+	for name, tc := range map[string]struct {
+		flags  []string
+		shared bool
+	}{
+		"single": {nil, false}, "cluster": {chartClusterFlags, false},
+		"single WASM and V8 isolates": {hosts, true}, "cluster WASM and V8 isolates": {cluster(hosts), true},
+		"single WASM": {wasm, true}, "cluster WASM": {cluster(wasm), true},
+		"single V8 isolates": {v8, true}, "cluster V8 isolates": {cluster(v8), true},
+	} {
 		t.Run(name, func(t *testing.T) {
-			out, err := renderChart(helm, flags...)
+			out, err := renderChart(helm, tc.flags...)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if shared, _ := workerSpec(t, out)["shareProcessNamespace"].(bool); shared != tc.shared {
+				t.Errorf("the worker pod shares one process namespace: %v, want %v", shared, tc.shared)
 			}
 			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime", "run-egress", "SB_EGRESS_GATEWAY_SOCKET",
 				"/srv/isolate-jail", "HostToContainer", "aerolvm-workerd", "supplementalGroups"} {

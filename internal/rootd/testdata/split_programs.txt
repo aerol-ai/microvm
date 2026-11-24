@@ -1,0 +1,26 @@
+# The programs the root helper runs as root, by the path each deploy tool
+# gives it for privilege mode split with every runtime on: tool, setting,
+# path. Each tool's test holds what it renders to its lines here
+# (internal/rootd config_test.go and install_split_env_test.go,
+# pkg/daemon chart_split_test.go, integration-tests/safety
+# terraform_privilege_mode_test.go and ansible_privilege_mode_test.go), and
+# TestRootProgramsOnThisHostsLayout runs the helper's own check
+# (checkRootBinaryFile) on each path on a real host: on the CI runner, and
+# by scripts/rootd-program-layouts.sh in Ubuntu 22.04 and 24.04, Debian 13
+# and Amazon Linux 2023. "helper" is the helper's own defaults.
+helper SB_ISOLATE_WORKERD_PATH /usr/local/bin/workerd
+helper SB_JAILER_BINARY /usr/local/bin/jailer
+helper SB_FIRECRACKER_BINARY /usr/local/bin/firecracker
+helper SB_FIRECRACKER_MKFS_BIN /usr/sbin/mkfs.ext4
+helper SB_ROOTD_RUNSC /usr/local/bin/runsc
+install.sh SB_ISOLATE_WORKERD_PATH /usr/local/bin/workerd
+install.sh SB_JAILER_BINARY /usr/local/bin/jailer
+install.sh SB_FIRECRACKER_BINARY /usr/local/bin/firecracker
+install.sh SB_FIRECRACKER_MKFS_BIN /usr/sbin/mkfs.ext4
+chart SB_ISOLATE_WORKERD_PATH /opt/aerolvm-workerd/workerd
+chart SB_ROOTD_RUNSC /usr/local/bin/runsc
+terraform SB_JAILER_BINARY /usr/local/bin/jailer
+terraform SB_FIRECRACKER_BINARY /usr/local/bin/firecracker
+terraform SB_FIRECRACKER_MKFS_BIN /usr/sbin/mkfs.ext4
+ansible SB_FIRECRACKER_BINARY /usr/local/bin/firecracker
+ansible SB_JAILER_BINARY /usr/local/bin/jailer

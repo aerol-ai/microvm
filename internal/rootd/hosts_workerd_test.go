@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
@@ -91,5 +93,107 @@ func TestWorkerdHosts(t *testing.T) {
 	// The real base check: a folder of this test's own user passes.
 	if err := newWorkerdHosts(cfg.Workerd, cfg.LogPath).checkBase(shortDir(t)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestWorkerdJailLimit: the helper keeps at most maxJails V8 jails,
+// counting those on disk (running groups', the warm pool's, ones a stopped
+// group left) and those being made, but not the one a group makes again
+// in its own place. Past it a prepare is refused ResourceExhausted, with
+// no refusal reason (a limit, not a broken request), and changes nothing.
+func TestWorkerdJailLimit(t *testing.T) {
+	cfg := testHostsConfig(t)
+	c := *cfg.Workerd
+	c.MaxJails = 2
+	w := newWorkerdHosts(&c, cfg.LogPath)
+	var disk []string
+	w.groups = func() ([]string, error) { return slices.Clone(disk), nil }
+	refused := func(err error) bool {
+		var fe *fileError
+		return errors.As(err, &fe) && fe.code == codes.ResourceExhausted && fe.reason == "" &&
+			strings.Contains(fe.msg, "SB_ROOTD_ISOLATE_MAX_JAILS=2")
+	}
+
+	doneA, err := w.reserveJail("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doneB, err := w.reserveJail("b") // a is being made: one other
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.reserveJail("c"); !refused(err) {
+		t.Fatalf("a third jail while two are made: %v, want the limit", err)
+	}
+	// a's jail is on disk now; b's make failed and left none.
+	disk = []string{"a"}
+	doneA()
+	doneB()
+	if _, err := w.reserveJail("c"); err != nil {
+		t.Fatalf("one jail of two: %v", err)
+	}
+	w.making = map[string]bool{}
+
+	for _, tc := range []struct {
+		name string
+		disk []string
+		id   string
+		ok   bool
+	}{
+		{"under the limit", []string{"a"}, "b", true},
+		{"at the limit", []string{"a", "b"}, "c", false},
+		{"a group made again in its own place", []string{"a", "b"}, "a", true},
+		{"the warm pool's and a stopped group's jails count", []string{"warm-1-0", "left"}, "t1", false},
+	} {
+		disk = tc.disk
+		done, err := w.reserveJail(tc.id)
+		if tc.ok != (err == nil) || (!tc.ok && !refused(err)) {
+			t.Errorf("%s: %v, want ok %v", tc.name, err, tc.ok)
+		}
+		if done != nil {
+			done()
+		}
+	}
+	w.groups = func() ([]string, error) { return nil, errors.New("permission denied") }
+	if _, err := w.reserveJail("a"); err == nil || refused(err) {
+		t.Fatalf("a jail folder that cannot be read: %v, want its own error", err)
+	}
+
+	// Through prepare: a refused group's leftovers stay as they were.
+	w.prepareBase, w.checkBase = func() error { return nil }, func(string) error { return nil }
+	disk = []string{"a", "b"}
+	w.groups = func() ([]string, error) { return slices.Clone(disk), nil }
+	left := filepath.Join(c.Jail.ChrootBase, "c")
+	if err := os.MkdirAll(left, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.prepare("c", false, nil); !refused(err) {
+		t.Fatalf("prepare past the limit: %v", err)
+	}
+	if _, err := os.Stat(left); err != nil {
+		t.Fatalf("a refused prepare tore down group c: %v", err)
+	}
+}
+
+// TestWorkerdJailLimitOverTheSocket: the agent sees the limit as
+// ResourceExhausted with no refusal detail, so its client takes it for a
+// busy helper (503, retry), not a refusal it records.
+func TestWorkerdJailLimitOverTheSocket(t *testing.T) {
+	kernel := newFakeHostKernel()
+	r := newRig(t, func(c *Config, o *Options) {
+		c.Hosts = testHostsConfig(t)
+		c.Hosts.Workerd.MaxJails = 1
+		w := newWorkerdHosts(c.Hosts.Workerd, c.Hosts.LogPath)
+		w.prepareBase, w.checkBase = func() error { return nil }, func(string) error { return nil }
+		w.groups = func() ([]string, error) { return []string{"tenant-a"}, nil }
+		o.HostKernel = kernel
+		o.hostLaunchers = map[rootpolicy.HostKind]hostLauncher{rootpolicy.HostWorkerd: w}
+	})
+	_, err := hostClient(r).PrepareHost(callCtx(t), &rootdpb.PrepareHostRequest{Kind: workerd, Id: "tenant-b"})
+	if status.Code(err) != codes.ResourceExhausted || !strings.Contains(err.Error(), "SB_ROOTD_ISOLATE_MAX_JAILS=1") {
+		t.Fatalf("PrepareHost past the limit = %v, want ResourceExhausted naming the setting", err)
+	}
+	if _, ok := rootdpb.RefusalReason(err); ok || len(r.refused()) != 0 {
+		t.Fatalf("the limit was answered as a refusal: %v %v", err, r.refused())
 	}
 }

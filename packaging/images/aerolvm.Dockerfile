@@ -135,6 +135,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       skopeo umoci e2fsprogs \
       fuse3 sshfs rclone nfs-common /tmp/mount-s3.deb \
     && rm -rf /var/lib/apt/lists/* /tmp/mount-s3.deb
+# Privilege mode split runs sandboxd here as uid 65531, with no rights
+# (charts/aerolvm/templates/_workerpod.tpl). It shares each WASM sandbox's
+# files with the sandbox's worker by the workers' group, aerolvm-wasm
+# (SB_WASM_WORKER_GID, 61000), and will not start outside it. The container
+# runtime gives a container the groups its image lists for its user, so
+# naming 65531 here and listing it in aerolvm-wasm gives that group to the
+# agent alone; no other container in the pod runs as 65531. The home folder
+# is /, as it is for a uid with no entry: HOME does not change.
+RUN printf '%s\n' 'sandboxd:x:65531:65531:AerolVM agent:/:/usr/sbin/nologin' >> /etc/passwd \
+    && printf '%s\n' 'sandboxd:x:65531:' 'aerolvm-wasm:x:61000:sandboxd' >> /etc/group
 COPY --from=fetch /out/cni /opt/aerolvm/cni
 COPY --from=fetch /out/workerd /usr/local/bin/workerd
 COPY --from=fetch /out/fc/firecracker /out/fc/jailer /out/runsc /usr/local/bin/

@@ -2,15 +2,19 @@ package safety
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/aerol-ai/microvm/internal/rootd"
 )
 
 // Ansible's configure-ops.yml checks a node's settings for its privilege mode
@@ -28,6 +32,7 @@ const (
 	aFirecracker = "Refuse Firecracker settings privilege mode split cannot run"
 	aClean       = "Refuse paths privilege mode split cannot check"
 	aRootFiles   = "Refuse root-run Firecracker files in sandboxd's folders"
+	aLinks       = "Refuse root-run Firecracker files under a merged /usr's links"
 	aFolders     = "Refuse runtime folders a split sandboxd cannot write"
 	aUnit        = "Refuse Firecracker on a split node install.sh did not set up for it"
 )
@@ -76,6 +81,13 @@ var ansibleCases = map[string]ansibleCase{
 		"firecracker.jailer_path": "/var/lib/sandboxd/bin/jailer"}, unit: splitUnit, wantFailed: aRootFiles},
 	"split_firecracker_in_procid": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
 		"firecracker.binary_path": "/run/aerolvm-procid/firecracker"}, unit: splitUnit, wantFailed: aRootFiles},
+	// Nor through a merged /usr's link: the helper refuses each at start.
+	"split_jailer_under_sbin": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
+		"firecracker.jailer_path": "/sbin/jailer"}, unit: splitUnit, wantFailed: aLinks},
+	"split_firecracker_under_bin": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
+		"firecracker.binary_path": "/bin/firecracker"}, unit: splitUnit, wantFailed: aLinks},
+	"split_kernel_under_lib": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
+		"firecracker.kernel_path": "/lib/vmlinux"}, unit: splitUnit, wantFailed: aLinks},
 	"split_kernel_dotdot": {set: map[string]any{"privilege_mode": "split", "firecracker.enabled": true,
 		"firecracker.kernel_path": "/usr/local/lib/../../../var/lib/sandboxd/vmlinux"}, unit: splitUnit, wantFailed: aClean},
 	"split_modules_doubleslash": {set: map[string]any{"privilege_mode": "split", "wasm.enabled": true,
@@ -137,7 +149,8 @@ func TestAnsiblePrivilegeChecks(t *testing.T) {
 				"rescue": []any{map[string]any{"ansible.builtin.set_fact": map[string]any{"check_failed": "{{ ansible_failed_task.name }}"}}},
 			},
 			map[string]any{"ansible.builtin.debug": map[string]any{
-				"msg": "RESULT {{ inventory_hostname }} kernel={{ sandboxd_firecracker_kernel_path }} failed={{ check_failed | default('') }}|"}},
+				"msg": "RESULT {{ inventory_hostname }} kernel={{ sandboxd_firecracker_kernel_path }} failed={{ check_failed | default('') }}|" +
+					" files={{ sandboxd_split_root_files | default([]) | join(',') }} dirs={{ sandboxd_split_agent_dirs | default([]) | join(',') }}|"}},
 		},
 	}})
 	writeFile(t, filepath.Join(dir, "ansible.cfg"), "[defaults]\nhost_key_checking = False\nretry_files_enabled = False\n"+
@@ -151,10 +164,10 @@ func TestAnsiblePrivilegeChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ansible-playbook: %v\n%s", err, out)
 	}
-	result := regexp.MustCompile(`RESULT (\S+) kernel=(\S*) failed=([^|]*)\|`)
-	got := map[string][2]string{}
+	result := regexp.MustCompile(`RESULT (\S+) kernel=(\S*) failed=([^|]*)\| files=([^ ]*) dirs=([^|]*)\|`)
+	got := map[string][4]string{}
 	for _, m := range result.FindAllStringSubmatch(string(out), -1) {
-		got[m[1]] = [2]string{m[2], m[3]}
+		got[m[1]] = [4]string{m[2], m[3], m[4], m[5]}
 	}
 	for _, name := range names {
 		c := ansibleCases[name]
@@ -168,6 +181,38 @@ func TestAnsiblePrivilegeChecks(t *testing.T) {
 			}
 			if c.wantKernel != "" && r[0] != c.wantKernel {
 				t.Errorf("SB_FIRECRACKER_KERNEL = %q, want %q", r[0], c.wantKernel)
+			}
+			// The files root runs or links (SB_FIRECRACKER_BINARY,
+			// SB_JAILER_BINARY, the kernel) against the root helper's own
+			// path rule: the checks refuse exactly when the helper would.
+			// The defaults are what internal/rootd's list of split programs
+			// names for Ansible (its env: SB_FIRECRACKER_BINARY and
+			// SB_JAILER_BINARY, the first two root files), which its
+			// real-layout test checks on Ubuntu, Debian and Amazon Linux.
+			if name == "split_every_runtime" {
+				files := strings.Split(r[2], ",")
+				if len(files) < 2 || !maps.Equal(map[string]string{"SB_FIRECRACKER_BINARY": files[0], "SB_JAILER_BINARY": files[1]}, splitProgramsFor(t, "ansible")) {
+					t.Errorf("Ansible gives the root helper %q for split; internal/rootd/testdata/split_programs.txt lists %v", files, splitProgramsFor(t, "ansible"))
+				}
+			}
+			if c.set["privilege_mode"] == "split" && slices.Contains([]string{"", aClean, aRootFiles, aLinks}, r[1]) {
+				var refused []string
+				for _, f := range strings.Split(r[2], ",") {
+					if f == "" {
+						continue
+					}
+					if err := rootd.CheckRootProgramPath(f, strings.Split(r[3], ",")); err != nil {
+						refused = append(refused, err.Error())
+					}
+				}
+				// A path that is not clean fails its own check, whatever the
+				// file (a WASM folder's too).
+				switch {
+				case len(refused) > 0 && r[1] == "":
+					t.Errorf("the root helper refuses %q, but the checks pass", refused)
+				case len(refused) == 0 && (r[1] == aRootFiles || r[1] == aLinks):
+					t.Errorf("the checks failed %q on root files %q that the root helper takes", r[1], r[2])
+				}
 			}
 		})
 	}

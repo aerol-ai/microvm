@@ -271,6 +271,50 @@ func TestNodeSetupFailing(t *testing.T) {
 	}
 }
 
+// TestSetupFailingNamesAnyInitContainer: past failAfter, any init
+// container in a crash loop is named (split mode's split-folders and
+// workerd as well as the setup container), with its last exit; a main
+// container's crash loop is not setup, but its image pull is.
+func TestSetupFailingNamesAnyInitContainer(t *testing.T) {
+	created := time.Now()
+	crash := func(name string, exit int32, msg string) corev1.ContainerStatus {
+		cs := corev1.ContainerStatus{Name: name, State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+			Reason: "CrashLoopBackOff", Message: "back-off 5m0s restarting failed container=" + name}}}
+		if exit != 0 {
+			cs.LastTerminationState.Terminated = &corev1.ContainerStateTerminated{ExitCode: exit, Message: msg}
+		}
+		return cs
+	}
+	for _, tc := range []struct {
+		name       string
+		after      time.Duration
+		init, main []corev1.ContainerStatus
+		want       string
+	}{
+		{"the setup container", 10 * time.Minute, []corev1.ContainerStatus{crash(SetupContainer, 2, "")}, nil,
+			"setup: CrashLoopBackOff (exit 2) back-off 5m0s restarting failed container=setup"},
+		{"split-folders", 10 * time.Minute, []corev1.ContainerStatus{{Name: PreflightContainer,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{ExitCode: 0}}}, crash("split-folders", 1, "")}, nil,
+			"split-folders: CrashLoopBackOff (exit 1) back-off 5m0s restarting failed container=split-folders"},
+		{"workerd, with the last line it left", 10 * time.Minute,
+			[]corev1.ContainerStatus{crash("workerd", 1, "copying\ninstall: cannot stat '/usr/local/bin/workerd': No such file or directory\n")}, nil,
+			"workerd: CrashLoopBackOff (exit 1: install: cannot stat '/usr/local/bin/workerd': No such file or directory) back-off 5m0s restarting failed container=workerd"},
+		{"not yet failAfter", time.Minute, []corev1.ContainerStatus{crash("split-folders", 1, "")}, nil, ""},
+		{"an init container that runs", 10 * time.Minute, []corev1.ContainerStatus{{Name: "workerd",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}}}, nil, ""},
+		{"the agent's own crash loop", 10 * time.Minute, nil, []corev1.ContainerStatus{crash(AgentContainer, 1, "")}, ""},
+		{"the agent's image", 10 * time.Minute, nil, []corev1.ContainerStatus{{Name: AgentContainer,
+			State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff", Message: "not found"}}}},
+			"agent: ImagePullBackOff not found"},
+	} {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(created)},
+			Status: corev1.PodStatus{InitContainerStatuses: tc.init, ContainerStatuses: tc.main}}
+		if got := setupFailing(pod, created.Add(tc.after)); got != tc.want {
+			t.Errorf("%s:\n got %q\nwant %q", tc.name, got, tc.want)
+		}
+	}
+}
+
 // Its turn in the rollout: the agent (and edge) image swaps in place.
 func TestNodeSwapsAgentOnItsTurn(t *testing.T) {
 	c := bootstrapped(testCluster())

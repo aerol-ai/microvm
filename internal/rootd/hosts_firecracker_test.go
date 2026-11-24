@@ -699,3 +699,14 @@ func TestFirecrackerCallsOnAHelperWithout(t *testing.T) {
 		t.Fatalf("MakeFilesystem: %v", err)
 	}
 }
+
+// TestMkfsArgs: every filesystem is ext4 whatever the program's name
+// (mke2fs makes ext2 unless called mkfs.ext4), empty or holding a folder.
+func TestMkfsArgs(t *testing.T) {
+	if got := mkfsArgs("/proc/self/fd/3/overlay.ext4", "", 0); !slices.Equal(got, []string{"-t", "ext4", "-F", "/proc/self/fd/3/overlay.ext4"}) {
+		t.Errorf("empty: %v", got)
+	}
+	if got := mkfsArgs("/proc/self/fd/3/rootfs.ext4", "/src", 64); !slices.Equal(got, []string{"-t", "ext4", "-d", "/src", "-F", "/proc/self/fd/3/rootfs.ext4", "64M"}) {
+		t.Errorf("from a folder: %v", got)
+	}
+}

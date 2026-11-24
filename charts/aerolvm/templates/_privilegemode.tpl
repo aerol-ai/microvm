@@ -128,10 +128,11 @@ worker group. */}}
 {{- if and (hasKey $env "SB_CONTAINER_ENGINE") (ne (index $env "SB_CONTAINER_ENGINE" | toString | trim | lower) "containerd") }}
 - worker.extraEnv.SB_CONTAINER_ENGINE names another engine: split runs the containerd engine only. Remove it.
 {{- end }}
-{{- /* The helper's move limits are the one exception: the chart does not
-set them, and worker.extraEnv reaches the helper's container too. */}}
+{{- /* The helper's limits are the exception: its move limits and its V8
+jail limit. The chart does not set them, and worker.extraEnv reaches the
+helper's container too. */}}
 {{- range $k, $_ := $env }}
-{{- if and (or (hasPrefix "SB_ROOTD_" $k) (eq $k "SB_MOUNTS_CRED_DIR")) (not (has $k (list "SB_ROOTD_MOVE_MAX_BYTES" "SB_ROOTD_MOVE_MAX_STAGED"))) }}
+{{- if and (or (hasPrefix "SB_ROOTD_" $k) (eq $k "SB_MOUNTS_CRED_DIR")) (not (has $k (list "SB_ROOTD_MOVE_MAX_BYTES" "SB_ROOTD_MOVE_MAX_STAGED" "SB_ROOTD_ISOLATE_MAX_JAILS"))) }}
 - worker.extraEnv.{{ $k }}: the chart sets it in split, where the agent and the root helper share folders. Remove it.
 {{- end }}
 {{- end }}
