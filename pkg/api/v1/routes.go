@@ -171,9 +171,10 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	mux.Handle("GET "+PathPrefix+"/sandboxes/{id}", d.RouteByForNodes(apihttp.ReadOrSecretsTag, apihttp.ReadOrSecrets, nodeGrantSandboxRow, wrap(http.HandlerFunc(h.getSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/start", d.Route(permWrite, wrap(http.HandlerFunc(h.startSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/stop", d.Route(permWrite, wrap(http.HandlerFunc(h.stopSandbox))))
-	// DELETE goes through clusterForwardWrap (forward to owner if not us)
-	// then through clusterDestroyWrap (local destroy + DeletePlacement).
-	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Route(permWrite, wrap(http.HandlerFunc(h.clusterDestroyWrap))))
+	// DELETE goes through clusterDestroyForwardWrap (forward to owner if not
+	// us, or to a server when the owner was deleted) then through
+	// clusterDestroyWrap (local destroy + DeletePlacement).
+	mux.Handle("DELETE "+PathPrefix+"/sandboxes/{id}", d.Route(permWrite, h.clusterDestroyForwardWrap(http.HandlerFunc(h.clusterDestroyWrap))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/resize", d.Route(permWrite, wrap(http.HandlerFunc(h.resizeSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandboxes/{id}/snapshot", d.Route(permWrite, wrap(http.HandlerFunc(h.createSnapshot))))
 	// destroy_at is checked against the cluster's builds before the forward

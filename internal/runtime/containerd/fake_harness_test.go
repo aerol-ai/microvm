@@ -221,6 +221,8 @@ type fakeContainer struct {
 	newTaskErr   error
 	specOverride *oci.Spec
 	setLabelsErr error
+	// onSetLabels runs at the start of each SetLabels, before its error.
+	onSetLabels func()
 	// mountCheck makes NewTask fail, as runc does, when a bind mount in
 	// specOverride names a host path that isn't there; onTaskStart runs (in
 	// a goroutine) each time a task of this container starts, with its spec.
@@ -353,6 +355,9 @@ func (c *fakeContainer) Labels(context.Context) (map[string]string, error) {
 	return out, nil
 }
 func (c *fakeContainer) SetLabels(_ context.Context, labels map[string]string) (map[string]string, error) {
+	if c.onSetLabels != nil {
+		c.onSetLabels()
+	}
 	if c.setLabelsErr != nil {
 		return nil, c.setLabelsErr
 	}

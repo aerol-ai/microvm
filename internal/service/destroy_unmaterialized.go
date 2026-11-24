@@ -37,6 +37,11 @@ import (
 // finishes the job (begin-delete is a no-op on a deleting placement), and so
 // does reconcileMissingSelfOwnedPlacements, which deletes a self-owned
 // deleting placement whose local row is gone.
+//
+// The same no-row path finishes a DELETE of a sandbox whose node an operator
+// deleted (deleteAbandonedPlacement). No node holds its row any more, and
+// the router never forwards to a deleted node, so it sends the call to a
+// server, which lands here and deletes the placement.
 
 // unmaterializedDeleteTimeout bounds each control-plane call on this path,
 // matching the destroy path's 5s per commit.
@@ -58,11 +63,17 @@ func (s *Service) destroyUnmaterializedPlacement(ctx context.Context, id string,
 	// holds it, and a delete of an id with no self-owned placement (unknown,
 	// already deleted, or a reservation still being created) must keep
 	// answering 404 at once rather than 503.
-	placement, ok, err := s.unmaterializedSelfPlacement(ctx, c, id)
+	placement, found, err := s.authoritativePlacementWithoutRow(ctx, c, id)
 	if err != nil {
 		return err
 	}
-	if !ok {
+	if !found {
+		return notFound
+	}
+	if !selfDeletableWithoutRow(c, placement) {
+		if cluster.PlacementAbandoned(c, placement) {
+			return s.deleteAbandonedPlacement(ctx, c, placement, notFound)
+		}
 		return notFound
 	}
 	// The placement carries the tenant. Another tenant's sandbox answers
@@ -86,13 +97,10 @@ func (s *Service) destroyUnmaterializedPlacement(ctx context.Context, id string,
 	return s.deletePlacementWithoutLocalRow(leaseCtx, c, placement)
 }
 
-// unmaterializedSelfPlacement reads id's authoritative placement and reports
-// whether this node may delete it without a local row: it owns it actively,
-// it is a placement and not a reservation (a reservation belongs to a create
-// on its way here, whose own rollback cancels it), and it names its lifetime.
-// A deleting placement qualifies, so a retry finishes an interrupted delete.
-// An unreadable placement is an error: "not found" would be a guess.
-func (s *Service) unmaterializedSelfPlacement(ctx context.Context, c cluster.Client, id string) (cluster.Placement, bool, error) {
+// authoritativePlacementWithoutRow reads id's authoritative placement for a
+// delete that found no local row. An unreadable placement is an error: "not
+// found" would be a guess.
+func (s *Service) authoritativePlacementWithoutRow(ctx context.Context, c cluster.Client, id string) (cluster.Placement, bool, error) {
 	readCtx, cancel := context.WithTimeout(ctx, unmaterializedDeleteTimeout)
 	placements, err := c.AuthoritativePlacementsByIDs(readCtx, []string{id})
 	cancel()
@@ -100,13 +108,66 @@ func (s *Service) unmaterializedSelfPlacement(ctx context.Context, c cluster.Cli
 		return cluster.Placement{}, false, fmt.Errorf("%w: resolve authoritative placement for a sandbox with no local row: %v", ErrClusterFinalizationUnavailable, err)
 	}
 	p, ok := placements[id]
-	if !ok || p.IsReserved() || p.IsOrphaned() || strings.TrimSpace(p.IncarnationID) == "" {
-		return cluster.Placement{}, false, nil
+	return p, ok, nil
+}
+
+// selfDeletableWithoutRow reports whether this node may delete p without a
+// local row: it owns it actively, it is a placement and not a reservation (a
+// reservation belongs to a create on its way here, whose own rollback
+// cancels it), and it names its lifetime. A deleting placement qualifies, so
+// a retry finishes an interrupted delete.
+func selfDeletableWithoutRow(c cluster.Client, p cluster.Placement) bool {
+	if p.IsReserved() || p.IsOrphaned() || strings.TrimSpace(p.IncarnationID) == "" {
+		return false
 	}
-	if strings.TrimSpace(p.OwnerNodeID) != strings.TrimSpace(c.SelfNodeID()) {
-		return cluster.Placement{}, false, nil
+	return strings.TrimSpace(p.OwnerNodeID) == strings.TrimSpace(c.SelfNodeID())
+}
+
+// deleteAbandonedPlacement finishes a DELETE of a sandbox whose placement is
+// left on a node an operator deleted (cluster.PlacementAbandoned: still
+// named as its owner, or orphaned from it). Nothing runs it any more, so no
+// node holds a row or a runtime to tear down: the delete is the placement's
+// alone, and the forward the router would make has no node to reach. Only a
+// server can write it (cluster.AbandonedPlacementDeleter); a worker or
+// gateway router sends the call to one, so any other caller here answers as
+// before.
+//
+// The lifetime's sealed secrets are not deleted from here: this node is not
+// a recipient, and a holder takes a delete only from the owner or another
+// recipient. The holders retire their copies once the placement is gone, as
+// they do when the leader expires an abandoned delete fence.
+//
+// Idempotent: a second DELETE finds no placement and answers 404, and one
+// that races this one either deletes first or finds it gone.
+func (s *Service) deleteAbandonedPlacement(ctx context.Context, c cluster.Client, placement cluster.Placement, notFound error) error {
+	deleter, ok := c.(cluster.AbandonedPlacementDeleter)
+	if !ok {
+		return notFound
 	}
-	return p, true, nil
+	// The placement carries the tenant: another tenant's sandbox answers
+	// 404, as everywhere else.
+	if err := enforceOwner(ctx, &models.Sandbox{ID: placement.SandboxID, OwnerRef: placement.OwnerRef}); err != nil {
+		return err
+	}
+	deleteCtx, cancel := context.WithTimeout(ctx, unmaterializedDeleteTimeout)
+	defer cancel()
+	if err := deleter.DeleteAbandonedPlacement(deleteCtx, placement); err != nil {
+		return fmt.Errorf("%w: delete the placement of a sandbox whose node was deleted: %v", ErrClusterFinalizationUnavailable, err)
+	}
+	if s.logger != nil {
+		s.logger.Info("audit sandbox destroyed after its node was deleted",
+			"sandbox_id", placement.SandboxID, "incarnation_id", placement.IncarnationID,
+			"node_id", abandonedNode(placement))
+	}
+	return nil
+}
+
+// abandonedNode is the deleted node p is left on.
+func abandonedNode(p cluster.Placement) string {
+	if p.IsOrphaned() {
+		return p.OrphanedOwnerNodeID
+	}
+	return p.OwnerNodeID
 }
 
 // deletePlacementWithoutLocalRow commits the delete of a placement this node

@@ -10,7 +10,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	cntr "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/containers"
@@ -650,5 +652,269 @@ func TestSplitClaimRefusesAnExistingSandbox(t *testing.T) {
 	delete(r.tr.containers, "park-x1")
 	if _, err := r.d.adoptParked(context.Background(), models.CreateSandboxRequest{Image: "cfg:test"}, "sb-x2", "tok", slot); !errdefs.IsNotFound(err) {
 		t.Fatalf("a slot that is gone: %v", err)
+	}
+}
+
+// claimFirewall is splitFirewall with a hook at the start of a lift and
+// errors to give back; the relabel is recorded in the same list, so a test
+// reads the order of both trips.
+type claimFirewall struct {
+	*splitFirewall
+	onLift   func()
+	liftErr  error
+	blockErr error
+}
+
+func (f *claimFirewall) LiftBlockAllEgress(ip string) error {
+	if f.onLift != nil {
+		f.onLift()
+	}
+	_ = f.rec("lift %s", ip)
+	return f.liftErr
+}
+
+func (f *claimFirewall) BlockAllEgress(ip string) error {
+	_ = f.rec("block %s", ip)
+	return f.blockErr
+}
+
+// ownerNetns records the netns slot owner moves a claim makes.
+type ownerNetns struct {
+	harnessNetns
+	mu    sync.Mutex
+	moves []string
+}
+
+func (n *ownerNetns) ReassignOwner(_ context.Context, from, to string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.moves = append(n.moves, from+">"+to)
+	return nil
+}
+
+func (n *ownerNetns) moved() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return slices.Clone(n.moves)
+}
+
+// claimHandle is a parked slot's handle that records the adopt frame.
+type claimHandle struct {
+	adopted atomic.Bool
+	closed  atomic.Bool
+}
+
+func (h *claimHandle) Alive() bool { return !h.closed.Load() }
+func (h *claimHandle) AdoptWithEnv(context.Context, string, string, string, map[string]string) error {
+	h.adopted.Store(true)
+	return nil
+}
+func (h *claimHandle) Adopt(ctx context.Context, sandboxID, token, nonce string) error {
+	return h.AdoptWithEnv(ctx, sandboxID, token, nonce, nil)
+}
+func (h *claimHandle) Close() error { h.closed.Store(true); return nil }
+
+const claimIP = "10.88.0.9"
+
+// claimRig is a warm claim of slot park-a (claimIP) over the fake
+// transport, in privilege mode split (split) or single.
+type claimRig struct {
+	d     *Driver
+	tr    *fakeTransport
+	c     *fakeContainer
+	fw    *claimFirewall
+	netns *ownerNetns
+	h     *claimHandle
+	slot  *containerdpool.ParkedSlot
+}
+
+func newClaimRig(t *testing.T, split bool) *claimRig {
+	t.Helper()
+	r := &claimRig{tr: newFakeTransport(), fw: &claimFirewall{splitFirewall: &splitFirewall{}}, h: &claimHandle{}}
+	r.c = &fakeContainer{id: "park-a", labels: map[string]string{poolParkLabelKey: poolParkLabelValue}, snapshotKey: "park-a"}
+	r.c.onDelete = func() {
+		r.tr.mu.Lock()
+		delete(r.tr.containers, "park-a")
+		r.tr.mu.Unlock()
+	}
+	r.tr.containers["park-a"] = r.c
+	r.d = newTestDriver(t)
+	r.d.cfg.ReadyEnabled = true
+	r.d.SetClient(NewTestClient("aerolvm", r.tr))
+	r.netns = &ownerNetns{harnessNetns: harnessNetns{path: "/run/netns/sb", ip: claimIP}}
+	r.d.SetNetnsHandoff(r.netns)
+	r.d.SetHostFirewall(r.fw)
+	if split {
+		r.d.SetRootHelper(&fakeHelper{})
+	}
+	r.c.onSetLabels = func() { _ = r.fw.rec("relabel") }
+	r.slot = &containerdpool.ParkedSlot{ID: "park-a", ContainerID: "park-a", ContainerIP: claimIP, Handle: r.h,
+		Key: containerdpool.KeyFromRequest(models.CreateSandboxRequest{Image: "alpine:3.20"}, models.RuntimeDocker)}
+	return r
+}
+
+// TestSplitClaimRelabelsAndPutsRulesOnAtOnce: a split claim's relabel
+// (through the gate) and its rules (through the helper's firewall) are in
+// flight at the same time, both after the toolbox took the sandbox's
+// identity; the claim ends with both done and the netns slot moved to the
+// sandbox. Each trip waits for the other to start: made one after the
+// other, the first would wait out its bound.
+func TestSplitClaimRelabelsAndPutsRulesOnAtOnce(t *testing.T) {
+	r := newClaimRig(t, true)
+	labelIn, liftIn := make(chan struct{}), make(chan struct{})
+	waitFor := func(ch chan struct{}, what string) {
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s did not start while the other trip was in flight", what)
+		}
+	}
+	inner := r.c.onSetLabels
+	r.c.onSetLabels = func() {
+		if !r.h.adopted.Load() {
+			t.Error("relabelled before the toolbox took the sandbox's identity")
+		}
+		inner()
+		close(labelIn)
+		waitFor(liftIn, "the rules trip")
+	}
+	r.fw.onLift = func() {
+		if !r.h.adopted.Load() {
+			t.Error("lifted the slot's block before the toolbox took the sandbox's identity")
+		}
+		close(liftIn)
+		waitFor(labelIn, "the relabel")
+	}
+	state, err := r.d.adoptParked(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-a", "tok", r.slot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SandboxID != "sb-a" || state.AdoptedParkID != "park-a" {
+		t.Fatalf("state %+v", state)
+	}
+	if r.c.labels[sandboxIDLabelKey] != "sb-a" || r.c.labels[poolParkLabelKey] != "" {
+		t.Fatalf("labels %v", r.c.labels)
+	}
+	if got := r.netns.moved(); !slices.Equal(got, []string{"park-a>sb-a"}) {
+		t.Fatalf("netns moves %v", got)
+	}
+	if got := r.fw.recorded(); len(got) != 2 || !slices.Contains(got, "relabel") || !slices.Contains(got, "lift "+claimIP) {
+		t.Fatalf("calls %v", got)
+	}
+}
+
+// TestSplitClaimFailurePutsTheBlockBack: a split claim whose relabel or
+// rules fail puts the slot's egress block back before it returns, after
+// the rules trip has ended (a slow lift still comes first), so the slot is
+// blocked whatever the rules trip did. The netns slot moves only once the
+// relabel is in, as in single mode.
+func TestSplitClaimFailurePutsTheBlockBack(t *testing.T) {
+	relabelErr, liftErr := errors.New("gate refused the relabel"), errors.New("helper unavailable")
+	for _, tc := range []struct {
+		name               string
+		req                models.CreateSandboxRequest
+		label, lift, block error
+		want               []string
+		calls              []string
+		moved              bool
+	}{
+		{name: "the relabel fails", label: relabelErr, want: []string{"gate refused the relabel"},
+			calls: []string{"relabel", "lift " + claimIP, "block " + claimIP}},
+		{name: "the lift fails", lift: liftErr, want: []string{"helper unavailable"},
+			calls: []string{"relabel", "lift " + claimIP, "block " + claimIP}, moved: true},
+		{name: "both fail", label: relabelErr, lift: liftErr, want: []string{"gate refused the relabel", "helper unavailable"},
+			calls: []string{"relabel", "lift " + claimIP, "block " + claimIP}},
+		{name: "the block cannot go back", label: relabelErr, block: errors.New("no helper"),
+			want: []string{"gate refused the relabel", "put the slot's egress block back: no helper"}, calls: []string{"relabel", "lift " + claimIP, "block " + claimIP}},
+		{name: "an egress policy", req: models.CreateSandboxRequest{NetworkAllowOut: []string{"1.2.3.4/32"}}, label: relabelErr,
+			want: []string{"gate refused the relabel"}, calls: []string{"relabel", "policy " + claimIP + " [1.2.3.4/32] []", "lift " + claimIP, "block " + claimIP}},
+		{name: "a block-all create", req: models.CreateSandboxRequest{NetworkBlockAll: true}, label: relabelErr,
+			want: []string{"gate refused the relabel"}, calls: []string{"relabel", "block " + claimIP, "block " + claimIP}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newClaimRig(t, true)
+			r.c.setLabelsErr = tc.label
+			r.fw.liftErr, r.fw.blockErr = tc.lift, tc.block
+			// The rules trip ends after the relabel: the block that goes
+			// back must still come after it.
+			r.fw.onLift = func() { time.Sleep(30 * time.Millisecond) }
+			req := tc.req
+			req.Image = "alpine:3.20"
+			_, err := r.d.adoptParked(context.Background(), req, "sb-a", "tok", r.slot)
+			if err == nil {
+				t.Fatal("the claim passed")
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Fatalf("err %q, want %q in it", err, w)
+				}
+			}
+			if tc.label != nil && !errors.Is(err, tc.label) || tc.lift != nil && !errors.Is(err, tc.lift) {
+				t.Fatalf("err %v does not wrap the trips' errors", err)
+			}
+			// The relabel and the rules trip run at once, so only these
+			// orders are fixed: the rules in their own order, and the
+			// block that goes back last of all.
+			got := r.fw.recorded()
+			if !slices.Equal(slices.Sorted(slices.Values(got)), slices.Sorted(slices.Values(tc.calls))) || got[len(got)-1] != "block "+claimIP {
+				t.Fatalf("calls %v, want %v with the block back last", got, tc.calls)
+			}
+			rules := slices.DeleteFunc(slices.Clone(got), func(c string) bool { return c == "relabel" })
+			want := slices.DeleteFunc(slices.Clone(tc.calls), func(c string) bool { return c == "relabel" })
+			if !slices.Equal(rules, want) {
+				t.Fatalf("rule calls %v, want %v", rules, want)
+			}
+			if moved := len(r.netns.moved()) > 0; moved != tc.moved {
+				t.Fatalf("netns moves %v, want moved=%v", r.netns.moved(), tc.moved)
+			}
+		})
+	}
+}
+
+// TestSplitClaimFailureDestroysABlockedSlot: through the pool, a split
+// claim that fails part way is destroyed with its block back on: the
+// block goes back before the teardown clears the slot's rules, and the
+// create goes cold.
+func TestSplitClaimFailureDestroysABlockedSlot(t *testing.T) {
+	r := newClaimRig(t, true)
+	pool := containerdpool.New(nil)
+	pool.RecordLoaded(r.slot)
+	r.d.SetWarmPool(pool)
+	r.c.setLabelsErr = errors.New("gate refused the relabel")
+	_, err := r.d.tryWarmAdopt(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-a", "tok", nil, models.RuntimeDocker)
+	if err == nil || !strings.Contains(err.Error(), "warm adopt failed") {
+		t.Fatalf("err %v", err)
+	}
+	r.tr.mu.Lock()
+	_, left := r.tr.containers["park-a"]
+	r.tr.mu.Unlock()
+	if left {
+		t.Fatal("the slot was not destroyed")
+	}
+	got := r.fw.recorded()
+	lift, block, clear := slices.Index(got, "lift "+claimIP), slices.Index(got, "block "+claimIP), slices.Index(got, "clear-block "+claimIP)
+	if lift < 0 || block < lift || clear < block {
+		t.Fatalf("calls %v: want the lift, then the block back, then the teardown's clears", got)
+	}
+}
+
+// TestSingleClaimRelabelsFirst: single mode's claim is as before: the
+// relabel, then the rules, one after the other; a failed relabel makes no
+// rule call (the slot's park block is still on) and puts nothing back.
+func TestSingleClaimRelabelsFirst(t *testing.T) {
+	r := newClaimRig(t, false)
+	if _, err := r.d.adoptParked(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-a", "tok", r.slot); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.fw.recorded(); !slices.Equal(got, []string{"relabel", "lift " + claimIP}) {
+		t.Fatalf("calls %v", got)
+	}
+	r = newClaimRig(t, false)
+	r.c.setLabelsErr = errors.New("containerd unavailable")
+	if _, err := r.d.adoptParked(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20"}, "sb-a", "tok", r.slot); err == nil {
+		t.Fatal("the claim passed")
+	}
+	if got := r.fw.recorded(); !slices.Equal(got, []string{"relabel"}) || len(r.netns.moved()) != 0 {
+		t.Fatalf("calls %v, moves %v", got, r.netns.moved())
 	}
 }
