@@ -617,6 +617,15 @@ func TestChartSplitHosts(t *testing.T) {
 			}
 		})
 	}
+	// The helper's V8 jail limit is one the operator may set, as its move
+	// limits: worker.extraEnv reaches the runtime container.
+	out, err := renderChart(helm, append(slices.Clone(hosts), "--set-string", "worker.extraEnv.SB_ROOTD_ISOLATE_MAX_JAILS=100")...)
+	if err != nil {
+		t.Fatalf("split with SB_ROOTD_ISOLATE_MAX_JAILS in extraEnv: %v", err)
+	}
+	if v := workerEnv(t, out, "runtime")["SB_ROOTD_ISOLATE_MAX_JAILS"]; v != "100" {
+		t.Fatalf("the helper's SB_ROOTD_ISOLATE_MAX_JAILS = %q, want 100", v)
+	}
 }
 
 // In a split worker no root process writes in a folder the agent can write

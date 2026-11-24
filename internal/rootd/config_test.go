@@ -618,7 +618,8 @@ func TestHostsFromEnv(t *testing.T) {
 		Workerd: &WorkerdHostsConfig{
 			Jail: isolate.RootJail{ChrootBase: "/srv/isolate-jail", WorkerdPath: "/usr/local/bin/workerd", UID: 2000, GID: 2001,
 				AgentUID: DefaultAgentUID, Jitless: true, SeccompMode: isolate.SeccompAudit, ShimPath: "/usr/local/bin/aerolvm-rootd"},
-			PidsMax: 300,
+			PidsMax:  300,
+			MaxJails: defaultMaxV8Jails,
 		},
 	}
 	if cfg.Hosts.CgroupParent != want.CgroupParent || cfg.Hosts.LogPath != want.LogPath || *cfg.Hosts.Workerd != *want.Workerd {
@@ -629,6 +630,25 @@ func TestHostsFromEnv(t *testing.T) {
 		"SB_CONTAINERD_CGROUP_PARENT": "/a", "SB_HOST_PROCESS_CGROUP_PARENT": "/b"}))
 	if err != nil || cfg.Hosts.CgroupParent != "/b" {
 		t.Fatalf("parent %q, %v", cfg.Hosts.CgroupParent, err)
+	}
+	// The V8 jail limit: the default, a value of the operator's, and
+	// values that are no limit.
+	for _, tc := range []struct {
+		v    string
+		want int
+		err  string
+	}{{"", defaultMaxV8Jails, ""}, {"8", 8, ""}, {"32768", 32768, ""}, {"x", 0, "SB_ROOTD_ISOLATE_MAX_JAILS"},
+		{"0", 0, "want 1 to 32768"}, {"-1", 0, "want 1 to 32768"}, {"32769", 0, "want 1 to 32768"}} {
+		cfg, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true", "SB_ROOTD_ISOLATE_MAX_JAILS": tc.v}))
+		if tc.err != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("SB_ROOTD_ISOLATE_MAX_JAILS=%q: %v, want an error naming %q", tc.v, err, tc.err)
+			}
+			continue
+		}
+		if err != nil || cfg.Hosts.Workerd.MaxJails != tc.want {
+			t.Errorf("SB_ROOTD_ISOLATE_MAX_JAILS=%q: %v, want %d jails", tc.v, err, tc.want)
+		}
 	}
 	// Root links, mounts and removes in the jail base, and reads and
 	// copies workerd: neither may be in a folder the agent writes.
@@ -843,7 +863,7 @@ func TestFirecrackerHostsValidate(t *testing.T) {
 	}
 	// The jailer shares no user with the V8 jail or the WASM worker.
 	h := HostsConfig{LogPath: "/var/lib/aerolvm-rootd/hosts.log", Firecracker: &good,
-		Workerd: &WorkerdHostsConfig{Jail: testHostsConfig(t).Workerd.Jail, PidsMax: 512}}
+		Workerd: &WorkerdHostsConfig{Jail: testHostsConfig(t).Workerd.Jail, PidsMax: 512, MaxJails: defaultMaxV8Jails}}
 	h.Workerd.Jail.UID = good.UID
 	if err := h.validate(); err == nil || !strings.Contains(err.Error(), "V8 jail") {
 		t.Errorf("the jailer as the V8 jail's user: %v", err)

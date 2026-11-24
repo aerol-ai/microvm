@@ -183,7 +183,23 @@ type WorkerdHostsConfig struct {
 	// PidsMax is SB_ISOLATE_JAIL_PIDS_MAX: every group's pids limit, at
 	// most.
 	PidsMax uint32
+	// MaxJails is SB_ROOTD_ISOLATE_MAX_JAILS: how many V8 jails the helper
+	// keeps at once. Each is two tmpfs mounts in the node's mount table
+	// (on Kubernetes, the machine's too).
+	MaxJails int
 }
+
+// V8 jails: the default and the most SB_ROOTD_ISOLATE_MAX_JAILS may name.
+// A jail is a group: one per tenant (SB_ISOLATE_GROUP_GRANULARITY's
+// default), or one per sandbox, plus the warm pool's blank groups. At the
+// default 1024 MB a sandbox, admission takes about 540 sandboxes on a 64
+// GiB node, so 4096 is far above a node's groups. The most, 32768, is
+// 65536 mounts: under the kernel's 100000 a mount namespace may hold
+// (fs.mount-max), with room for the node's own.
+const (
+	defaultMaxV8Jails = 4096
+	maxV8Jails        = 32768
+)
 
 // any reports whether the helper serves a host kind.
 func (h HostsConfig) any() bool { return h.Workerd != nil || h.Wasm != nil || h.Firecracker != nil }
@@ -204,6 +220,9 @@ func (h HostsConfig) validate() error {
 		}
 		if w.PidsMax == 0 {
 			return errors.New("root helper: SB_ISOLATE_JAIL_PIDS_MAX must be above 0: the V8 jail lets workerd make threads")
+		}
+		if w.MaxJails < 1 || w.MaxJails > maxV8Jails {
+			return fmt.Errorf("root helper: SB_ROOTD_ISOLATE_MAX_JAILS=%d: want 1 to %d V8 jails", w.MaxJails, maxV8Jails)
 		}
 	}
 	if w := h.Wasm; w != nil {
@@ -837,6 +856,10 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 	if pids <= 0 || pids > math.MaxUint32 {
 		return h, fmt.Errorf("SB_ISOLATE_JAIL_PIDS_MAX=%d: want a limit above 0", pids)
 	}
+	jails, err := envInt(getenv, "SB_ROOTD_ISOLATE_MAX_JAILS", defaultMaxV8Jails)
+	if err != nil {
+		return h, err
+	}
 	shim, err := selfExecutable()
 	if err != nil {
 		return h, fmt.Errorf("root helper: its own binary, the V8 jail's shim: %w", err)
@@ -864,7 +887,8 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 			SeccompMode: strings.ToLower(get("SB_ISOLATE_SECCOMP_MODE", isolate.SeccompEnforce)),
 			ShimPath:    filepath.Clean(shim),
 		},
-		PidsMax: uint32(pids),
+		PidsMax:  uint32(pids),
+		MaxJails: jails,
 	}
 	return h, nil
 }
