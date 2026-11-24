@@ -916,6 +916,8 @@ jobs:
           scripts/chart-pod-templates.sh > "$RUNNER_TEMP/pod-templates.yaml"
           scripts/chart-pod-templates.sh --set worker.externalStorage.enabled=true > "$RUNNER_TEMP/pod-templates-external-storage.yaml"
           scripts/chart-pod-templates.sh --set privilegeMode=split > "$RUNNER_TEMP/pod-templates-split.yaml"
+          scripts/chart-pod-templates.sh --set privilegeMode=split --set worker.wasm.enabled=true \
+            --set worker.isolate.enabled=true > "$RUNNER_TEMP/pod-templates-split-hosts.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set identity.tokenMaxTTL=2160h \
             --set-string identity.file.content='version: 1' > "$RUNNER_TEMP/pod-templates-identity.yaml"
           scripts/chart-pod-templates.sh --set identity.enabled=true --set enterprise.enabled=true \
@@ -952,6 +954,7 @@ jobs:
           AEROLVM_POD_TEMPLATES: ${{ runner.temp }}/pod-templates.yaml
           AEROLVM_POD_TEMPLATES_EXTERNAL_STORAGE: ${{ runner.temp }}/pod-templates-external-storage.yaml
           AEROLVM_POD_TEMPLATES_SPLIT: ${{ runner.temp }}/pod-templates-split.yaml
+          AEROLVM_POD_TEMPLATES_SPLIT_HOSTS: ${{ runner.temp }}/pod-templates-split-hosts.yaml
           AEROLVM_POD_TEMPLATES_IDENTITY: ${{ runner.temp }}/pod-templates-identity.yaml
           AEROLVM_POD_TEMPLATES_ENTERPRISE: ${{ runner.temp }}/pod-templates-enterprise.yaml
           AEROLVM_CHART_OPERATOR: ${{ runner.temp }}/chart-operator.yaml
