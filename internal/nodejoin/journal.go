@@ -3,8 +3,10 @@ package nodejoin
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 )
@@ -25,22 +27,38 @@ type journalEntry struct {
 	mode    os.FileMode
 }
 
-// remember notes path's content before the first change to it.
+// remember notes path's content before the first change to it. It reads
+// the file itself, never what a link names (O_NOFOLLOW, then the open file's
+// own kind): in privilege mode split the certificate folders and the data
+// folder are sandboxd's user's, and a link that user left there would have
+// root read any file, which a rollback would then write back into that
+// folder. sandboxd makes no link there, so one is refused.
 func (j *fileJournal) remember(path string) error {
 	for _, e := range j.entries {
 		if e.path == path {
 			return nil
 		}
 	}
-	st, err := os.Stat(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		j.entries = append(j.entries, journalEntry{path: path})
 		return nil
 	}
+	if errors.Is(err, syscall.ELOOP) {
+		return fmt.Errorf("%s is a symbolic link; init and join replace only files, never through a link", path)
+	}
 	if err != nil {
 		return err
 	}
-	old, err := os.ReadFile(path)
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (%v); init and join replace only files", path, st.Mode().Type())
+	}
+	old, err := io.ReadAll(f)
 	if err != nil {
 		return err
 	}

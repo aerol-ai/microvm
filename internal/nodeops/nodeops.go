@@ -73,6 +73,9 @@ type Node struct {
 	WrappedKey string
 	// Custody is SB_CREDENTIAL_KEY_CUSTODY, lower case; empty means file.
 	Custody string
+	// Split is SB_PRIVILEGE_MODE=split: sandboxd runs as its own user,
+	// which owns the data folder and the certificate folders.
+	Split bool
 	// EnvKey reports a non-empty SB_CREDENTIAL_ENCRYPTION_KEY.
 	EnvKey bool
 	// Cluster identity; empty on a single node.
@@ -108,6 +111,7 @@ func ReadNode(configDir string) (Node, error) {
 		KeyFile:    get("SB_CREDENTIAL_ENCRYPTION_KEY_PATH", defaultKeyFile),
 		WrappedKey: get("SB_CREDENTIAL_ENCRYPTION_KEY_WRAPPED_PATH", defaultWrappedKey),
 		Custody:    strings.ToLower(get("SB_CREDENTIAL_KEY_CUSTODY", "")),
+		Split:      strings.EqualFold(get("SB_PRIVILEGE_MODE", ""), "split"),
 		EnvKey:     get("SB_CREDENTIAL_ENCRYPTION_KEY", "") != "",
 		NodeID:     get("SB_NODE_ID", ""),
 		NodeRole:   strings.ToLower(get("SB_NODE_ROLE", "")),

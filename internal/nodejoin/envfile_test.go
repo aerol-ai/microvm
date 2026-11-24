@@ -3,6 +3,7 @@ package nodejoin
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -130,5 +131,43 @@ func TestFileJournal(t *testing.T) {
 	// A file that can't be read can't be remembered.
 	if err := j.write(filepath.Join(existing, "under-a-file"), []byte("x"), 0o600); err == nil {
 		t.Fatal("wrote under a regular file")
+	}
+}
+
+// A link at a path init or join writes is refused before anything is read
+// or written: in privilege mode split sandboxd's user owns those folders,
+// and root must never read or write what such a link names.
+func TestFileJournalRefusesALink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "root-only")
+	mustWrite(t, target, "not for the journal")
+	link := filepath.Join(dir, "node.key")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	j := &fileJournal{}
+	err := j.write(link, []byte("new key"), 0o600)
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("write through a link: %v, want a refusal", err)
+	}
+	if err := j.remove(link); err == nil {
+		t.Fatal("remove of a link was not refused")
+	}
+	if readFile(t, target) != "not for the journal" {
+		t.Fatal("the link's target changed")
+	}
+	if fi, err := os.Lstat(link); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("the link was replaced: %v", err)
+	}
+	if len(j.entries) != 0 || j.changed() {
+		t.Fatal("the journal remembered a link")
+	}
+	// A folder or other non-file is refused too.
+	sub := filepath.Join(dir, "a-dir")
+	if err := os.Mkdir(sub, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.write(sub, []byte("x"), 0o600); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("write over a folder: %v, want a refusal", err)
 	}
 }

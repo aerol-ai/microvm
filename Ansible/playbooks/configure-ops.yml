@@ -714,12 +714,16 @@
     #   * shared SoT      -> aocr.upstream_wrap_key in config/secrets.yml
     #   * control-node file -> sandboxd_upstream_wrap_key_src (fleet / Vault rendering)
     # If both are set, the secrets.yml value wins (it runs first).
+    # Mode 0400: sandboxd never rewrites the wrap key, and its loader
+    # (pkg/secrets LoadUpstreamWrapKeyRing) refuses a key file with any write
+    # or group/other bit. With 0600 it was refused, and private pulls through
+    # the mirror got 401. secret_file_modes_test.go ties this to the loader.
     - name: Install upstream wrap key (from config/secrets.yml)
       when: aocr.upstream_wrap_key | length > 0
       ansible.builtin.copy:
         content: "{{ aocr.upstream_wrap_key }}\n"
         dest: "{{ sandboxd_upstream_wrap_key_path }}"
-        mode: "0600"
+        mode: "0400"
         owner: "{{ sandboxd_file_owner }}"
         group: "{{ sandboxd_file_owner }}"
       no_log: true
@@ -732,7 +736,7 @@
       ansible.builtin.copy:
         src: "{{ sandboxd_upstream_wrap_key_src }}"
         dest: "{{ sandboxd_upstream_wrap_key_path }}"
-        mode: "0600"
+        mode: "0400"
         owner: "{{ sandboxd_file_owner }}"
         group: "{{ sandboxd_file_owner }}"
       notify: Apply sandboxd ops config
@@ -976,6 +980,15 @@
         owner: root
         group: root
 
+    # sandboxd backup runs as root: it reads the env files in /etc/sandboxd,
+    # root's alone. It reads the database (VACUUM INTO), the Raft folder,
+    # the server key files and /etc/sandboxd, and writes one 0600 archive in
+    # sandboxd_backup_output_dir, root's. In privilege mode split, which it
+    # reads from the node's env files, it follows no link in sandboxd's
+    # folders: it reads them through an os.Root and refuses a database that
+    # is not the file at its path (internal/nodeops splitSource,
+    # internal/nodeupgrade VacuumIntoNoFollow), so a link sandboxd's user
+    # left there leads it nowhere.
     - name: Configure local sandboxd backup cron
       when: sandboxd_backup_enabled | bool
       ansible.builtin.cron:
@@ -994,6 +1007,32 @@
       ansible.builtin.cron:
         name: sandboxd local backup
         user: root
+        state: absent
+
+    # The settings above (SB_SSH_HOST_KEY_PATH among them) are in force
+    # before the old SSH host key copy below goes: a restart in between
+    # (after a crash, say) must not find the copy gone while the env still
+    # names it, or sandboxd would make a new per-node key.
+    - name: Apply the settings before removing the old SSH host key copy
+      ansible.builtin.meta: flush_handlers
+
+    # A split node that an older play set up keeps a copy of the shared key
+    # in sandboxd's folder (sandboxd_ssh_host_key_path), unused once
+    # SB_SSH_HOST_KEY_PATH names the secrets folder. Were the shared key
+    # later taken out of the config, SB_SSH_HOST_KEY_PATH would name that
+    # copy again and sandboxd would serve the old shared key instead of
+    # making a key of its own. So it goes while the shared key is still set,
+    # after the restart above, removed as sandboxd's user: the folder is that
+    # user's, and root acts in it never. Becoming that user needs pipelining
+    # (ansible.cfg sets it) or ACLs on the node, as stage-wasm-modules.yml.
+    - name: Remove the old copy of the shared SSH host key from sandboxd's folder (split)
+      when:
+        - sandboxd_privilege_mode == 'split'
+        - sandboxd_shared_ssh_host_key | bool
+        - sandboxd_ssh_host_key_path != sandboxd_split_ssh_host_key_path
+      become_user: sandboxd
+      ansible.builtin.file:
+        path: "{{ sandboxd_ssh_host_key_path }}"
         state: absent
 
   handlers:

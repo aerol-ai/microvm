@@ -1014,11 +1014,14 @@ Cost guards:
   is interrupted (`EKS_BANK_KEEP=1` keeps the run up instead), but only a
   run this process made with `cluster.sh up` or passed the gate for: never
   after a refusal, and never a state an earlier run left. `up` refuses a
-  name whose state still holds resources or whose EKS cluster exists.
-  Before the teardown starts, the AWS credentials are refreshed at the
-  terminal (an MFA prompt comes there); a prompt inside the teardown
-  fails at once instead of stopping it. Its output also goes to
-  `.state/<name>/teardown.log`.
+  name whose state still holds resources or whose EKS cluster exists. Before
+  the teardown starts, the AWS credentials are refreshed at the terminal (an
+  MFA prompt comes there); a prompt inside the teardown fails at once
+  instead of stopping it. Its output also goes to
+  `.state/<name>/teardown.log`. It runs the copy of `eks-bank.sh` made in
+  `.state/<name>/` when the run started, so a branch switched in the
+  checkout during the run does not change it; a closed terminal does not
+  stop it either.
 - **One account, one region.** `cluster.sh up` records the AWS account in
   the run's inputs; Terraform refuses any other (`allowed_account_ids`), and
   `cluster.sh down` and `eks-bank.sh down` check it before anything else.

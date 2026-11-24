@@ -55,7 +55,8 @@
 #   final     verify, evidence
 #   down      the chart and its volumes, cluster.sh down, leak-check.sh
 # Not in `all`: verifynow (aerolvm k8s verify on its own, labelled
-# M1_VERIFY_LABEL), for a run resumed by hand.
+# M1_VERIFY_LABEL), for a run resumed by hand; teardown (diag, then down:
+# what on_exit runs, with no terminal).
 #
 # up, setup, build and install are what the rest needs: one that fails ends
 # the run (and `all` tears it down unless M1_KEEP=1). Every later step is a
@@ -79,7 +80,11 @@
 set -euo pipefail
 # bash 4 or newer: macOS's /bin/bash is 3.2 (`brew install bash`).
 [[ "${BASH_VERSINFO[0]}" -ge 4 ]] || { echo "m1-eks.sh: needs bash 4 or newer; this is bash $BASH_VERSION" >&2; exit 2; }
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ME: the folder this file is in: the checkout's m1/, or .state/<name>/
+# for the copy on_exit runs (keep_copy). HERE: the drill's folder, which
+# that copy is told (M1_KIT_DIR).
+ME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HERE="${M1_KIT_DIR:-$ME}"
 K8S="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$K8S/../.." && pwd)"
 usage() { sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2; }
@@ -93,12 +98,29 @@ esac
 [[ "$name" =~ ^[a-z][a-z0-9-]{2,30}$ ]] || { echo "m1-eks.sh: \"$name\" is not a cluster.sh run name" >&2; exit 2; }
 sd="$K8S/.state/$name"
 mkdir -p "$sd/evidence"
+# keep_copy: this script and m1-lib.sh copied into $sd, and SELF set to
+# the copy, which on_exit's teardown runs. The teardown reads the script
+# from disk, and a run takes hours: a branch switched in the checkout
+# meanwhile must not change what tears the run down. The copy itself (ME
+# is $sd) copies nothing. Each copy is a new file moved into place, never a
+# copy over the old one: a teardown still running from it (a second run of
+# the same name, `down` by hand, starts while it runs) keeps reading the
+# file it opened, as bash reads its script while it runs.
+keep_copy() {
+  SELF="$sd/$(basename "${BASH_SOURCE[0]}")"
+  [[ "$ME" != "$sd" ]] || return 0
+  cp "${BASH_SOURCE[0]}" "$SELF.new.$$"
+  mv -f "$SELF.new.$$" "$SELF"
+  cp "$ME/m1-lib.sh" "$sd/m1-lib.sh.new.$$"
+  mv -f "$sd/m1-lib.sh.new.$$" "$sd/m1-lib.sh"
+}
+keep_copy
 sha="$(git -C "$REPO" rev-parse "${AEROL_BUILD_REF:-HEAD}^{commit}")"
 # The versions: T1 is installed, T2 is S2's upgrade, T3 only signs the
 # refused variants (newer than T2, so only the signature is wrong).
 T1=v0.0.0-m1drill.1 T2=v0.0.0-m1drill.2 T3=v0.0.0-m1drill.3
 # shellcheck source=m1-lib.sh
-source "$HERE/m1-lib.sh"
+source "$ME/m1-lib.sh"
 # made_here: this process called cluster.sh up (step_up sets it).
 made_here=0
 CERT_MANAGER_VERSION=v1.21.3
@@ -930,11 +952,10 @@ stop_teardown=0
 # refuses after this run's own up (an STS blip) does not keep it up:
 # cluster.sh down checks the account itself.
 on_exit() {
-  local rc=$? teardown=0 down_pid
+  local rc=$? teardown=0
   # From here no INT or TERM stops this script: a second Ctrl-C used to end
-  # the run before down. The teardown runs as a job of its own (set -m), in
-  # its own process group, so a Ctrl-C at the terminal reaches no part of
-  # it, Terraform included (eks-bank.sh's on_exit).
+  # the run before down. The teardown runs with no terminal (detach), so a
+  # Ctrl-C there reaches no part of it, Terraform included.
   trap - EXIT
   trap '' INT TERM HUP
   # A closed terminal (HUP, exit 129) takes no more writes, and a failed
@@ -954,19 +975,20 @@ on_exit() {
     # Credentials first, here in the foreground, where an MFA prompt can
     # be answered (not after a hangup: no terminal is left).
     [[ "$rc" == 129 ]] || refresh_credentials || true
-    # The teardown's group is in the background: a process of it that read
-    # the terminal (a prompt that still comes) was stopped by SIGTTIN, and
-    # the run then waited for it forever with the cluster up until AWS's
-    # timer (review of #1439). With TTIN and TTOU ignored, inherited by
-    # every process the teardown starts, such a read fails at once and a
-    # write still goes through. Its stdin is /dev/null; its output goes to
-    # the terminal and to $sd/teardown.log.
-    trap '' TTIN TTOU
-    set -m
-    { diag exit || true; step_down || exit 1; } < /dev/null > >(tee -a "$sd/teardown.log") 2>&1 &
-    down_pid=$!
-    set +m
-    wait "$down_pid" || say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true
+    # The teardown: this script again, step teardown (diag, then down), in
+    # a session of its own with no controlling terminal (detach). A
+    # background process group that read the terminal (a prompt that still
+    # comes) was stopped by SIGTTIN, and the run waited for it forever with
+    # the cluster up until AWS's timer (review of #1439). Ignoring TTIN and
+    # TTOU was not enough: macOS's bash 3.2, running a script, gives its
+    # children the default back, and ssh-style prompts install their own
+    # handler and spin (review of #1443). With no terminal, /dev/tty fails
+    # at once. Its output reaches $sd/teardown.log and the terminal through
+    # teardown_detached: straight to the log, shown here by a viewer. It is
+    # the copy keep_copy made (SELF), told where the drill's folder is.
+    if ! teardown_detached env M1_TEARDOWN_ON_EXIT=0 M1_KIT_DIR="$HERE" "$BASH" "$SELF" "$name" teardown; then
+      say "down did not finish: run ./m1-eks.sh $name down again, or ../reap.sh after the TTL" || true
+    fi
   fi
   rm -f "$sd/.teardown-next"
   exit "$rc"
@@ -981,6 +1003,7 @@ for s in "${steps[@]}"; do
   case "$s" in
     estimate|up|setup|build|install) "step_$s" ;;
     down) step_down; torn=1 ;;
+    teardown) diag exit || true; step_down; torn=1 ;;
     # The API's port-forward keeper, from this (the main) shell: each check
     # runs in a subshell, which must never own the forward (m1-lib.sh). It
     # starts only once the gate passes: a kubeconfig the gate refuses may
@@ -990,7 +1013,7 @@ for s in "${steps[@]}"; do
       run_check "$s" ;;
     *) echo "m1-eks.sh: unknown step $s" >&2; exit 2 ;;
   esac
-  if [[ "$s" != down && "$s" != estimate ]]; then
+  if [[ "$s" != down && "$s" != teardown && "$s" != estimate ]]; then
     cost_check "$s" || [[ "$dry" == 1 ]] || stop_run "the projected cost passed \$${M1_COST_LIMIT:-6.15} after $s"
   fi
   # A blocker: with no split worker after the first switch, nothing after

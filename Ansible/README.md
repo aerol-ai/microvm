@@ -196,6 +196,19 @@ runs as the `sandboxd` user. `/etc/sandboxd/secrets` stays root's
 shared SSH host key go there as files that user owns.
 `SB_SSH_HOST_KEY_PATH` then names the key there.
 
+A copy of the shared key that an older run left in `/var/lib/sandboxd`
+is removed, as the `sandboxd` user, while the shared key is still set. This
+happens last, after sandboxd has restarted with the new settings. If you
+later take the shared key out of the config, sandboxd then makes a key of
+its own instead of using the old shared one. This task, like
+`stage-wasm-modules.yml`, becomes the `sandboxd` user, which needs
+pipelining (`ansible.cfg` turns it on) or ACL support on the node.
+
+The backup cron (`sandboxd_backup_enabled`) still runs `sandboxd backup` as
+root, because it must read root's env files in `/etc/sandboxd`. In split it
+reads the `sandboxd` user's folders without following a link out of them;
+see `setup/runbooks/backup-restore.md`.
+
 ## Connect this cluster to AOCR (mirror + auto-import)
 
 If you operate an [AOCR](https://github.com/aerolai/aocr) deployment alongside
@@ -370,8 +383,8 @@ ansible-playbook playbooks/configure-ops.yml
 
 For each host the play:
 
-1. Creates `/etc/sandboxd/secrets/` at `0700`.
-2. Copies `upstream_wrap_key` → `/etc/sandboxd/secrets/upstream-wrap.key` (`0600`).
+1. Creates `/etc/sandboxd/secrets/` at `0700` (`0750` with group `sandboxd` in privilege mode split).
+2. Copies `upstream_wrap_key` → `/etc/sandboxd/secrets/upstream-wrap.key` (`0400`: sandboxd refuses a wrap key file it could write).
 3. Copies `cluster_pat` → `/etc/sandboxd/secrets/cluster-pat` (`0600`).
 4. Re-renders `/etc/sandboxd/cluster.env` with the `SB_MIRROR_*` / `SB_AUTO_IMPORT_*` lines.
 5. Restarts `sandboxd` (gated by `sandboxd_restart_after_ops_config`, default true).
