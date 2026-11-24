@@ -476,6 +476,93 @@ func TestChartSplitRootWritesNoAgentFolder(t *testing.T) {
 	}
 }
 
+// A split worker pod sets no fsGroup (it would regroup the folders
+// split-folders closes), and its containers run as different users, so
+// the kubelet makes every Secret, ConfigMap and projected file root's, in
+// root's group. A container that is not root reads such a file only
+// through the bit for others: each file the chart gives one must have it.
+// (The operator's stamped volumes, the join token and an external-CA
+// certificate, are checked in operator/internal/controller, EKS drill
+// m1d-1.)
+func TestChartSplitNonRootReadsItsFiles(t *testing.T) {
+	helm := chartHelm(t)
+	edge := []string{"--set", "edge.enabled=true", "--set", "edge.domain=aerolvm.test", "--set", "edge.certManager.issuerRef.name=ci"}
+	files := []string{"--set", "worker.registryCA.existingConfigMap=ca", "--set", "identity.enabled=true",
+		"--set", "identity.file.content=issuers: []", "--set", "audit.credentials.caBundle.existingConfigMap=aws-ca"}
+	enterprise := append(slices.Clone(chartClusterFlags), "--set", "enterprise.enabled=true",
+		"--set", "audit.witness.bucket=w", "--set", "audit.export.backend=s3", "--set", "audit.export.s3.bucket=a")
+	for name, flags := range map[string][]string{
+		"single":     append(slices.Clone(edge), files...),
+		"enterprise": append(append(slices.Clone(enterprise), edge...), files...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, flags...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spec := workerSpec(t, out)
+			if dig(spec, "securityContext")["fsGroup"] != nil {
+				t.Fatal("a split worker pod sets fsGroup")
+			}
+			// Each file's mode: its item's, else the volume's default,
+			// else 0644.
+			modes := map[string][]int{}
+			vols, _ := spec["volumes"].([]any)
+			for _, v := range vols {
+				vm, _ := v.(map[string]any)
+				for _, kind := range []string{"secret", "configMap", "projected"} {
+					src := dig(vm, kind)
+					if src == nil {
+						continue
+					}
+					def := 0o644
+					if m, ok := src["defaultMode"].(int); ok {
+						def = m
+					}
+					items, _ := src["items"].([]any)
+					if kind == "projected" {
+						items, _ = src["sources"].([]any)
+					}
+					fileModes := []int{def}
+					for _, it := range items {
+						if m, ok := it.(map[string]any)["mode"].(int); ok {
+							fileModes = append(fileModes, m)
+						}
+					}
+					modes[fmt.Sprint(vm["name"])] = fileModes
+				}
+			}
+			if len(modes) == 0 {
+				t.Fatal("no Secret, ConfigMap or projected volume rendered")
+			}
+			checked := 0
+			for _, list := range []string{"initContainers", "containers"} {
+				cs, _ := spec[list].([]any)
+				for _, c := range cs {
+					m, _ := c.(map[string]any)
+					sc, _ := m["securityContext"].(map[string]any)
+					if user := fmt.Sprint(sc["runAsUser"]); user == "0" || user == "<nil>" {
+						continue
+					}
+					vms, _ := m["volumeMounts"].([]any)
+					for _, x := range vms {
+						vol := fmt.Sprint(x.(map[string]any)["name"])
+						for _, mode := range modes[vol] {
+							checked++
+							if mode&0o004 == 0 {
+								t.Errorf("%s (uid %v) mounts %s, whose file mode %#o it cannot read", m["name"], sc["runAsUser"], vol, mode)
+							}
+						}
+					}
+				}
+			}
+			if checked == 0 {
+				t.Fatal("no non-root container mounts a Secret, ConfigMap or projected volume: the check checked nothing")
+			}
+		})
+	}
+}
+
 // Single renders none of split: no setting, no helper, a privileged agent.
 func TestChartSingleHasNoSplit(t *testing.T) {
 	helm := chartHelm(t)
