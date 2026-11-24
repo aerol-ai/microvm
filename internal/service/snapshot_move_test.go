@@ -206,9 +206,10 @@ func TestSnapshotMoveRefusals(t *testing.T) {
 	if _, err := dst.store.Get(ctx, "sb-vm"); err == nil || dst.movesIn.held("sb-vm", time.Now()) || dstRT.dropped == 0 {
 		t.Fatalf("a failed import left something: row err %v, held %v, dropped %d", err, dst.movesIn.held("sb-vm", time.Now()), dstRT.dropped)
 	}
-	// A sandbox that is not Firecracker is not moved by snapshot.
+	// A sandbox that is not Firecracker is not moved by snapshot, and never
+	// will be from here: refused for good, so the leader stops asking.
 	_ = src.store.Create(ctx, &models.Sandbox{ID: "sb-ctr", Name: "sb-ctr", Image: "alpine", Runtime: models.RuntimeGvisor, Status: models.SandboxStatusStarted})
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-ctr", "worker-b", ""); !strings.HasPrefix(got, "error:") {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-ctr", "worker-b", ""); !strings.HasPrefix(got, cluster.MoveRefusedPrefix) {
 		t.Fatalf("release of a gVisor sandbox = %q", got)
 	}
 	if got := src.ReleaseForSnapshotMove(ctx, "sb-none", "worker-b", ""); got != MoveGone {
@@ -232,9 +233,15 @@ type fakeGvisorMoveRuntime struct {
 	createRestored   []bool
 	createTokens     []string
 	restoreErr       error
+	// checkpointErr is a checkpointing stop's answer, before it stops
+	// anything (the driver refuses a warm-pool sandbox this way).
+	checkpointErr error
 }
 
 func (f *fakeGvisorMoveRuntime) Stop(ctx context.Context, _ string) error {
+	if runtime.CheckpointRequested(ctx) && f.checkpointErr != nil {
+		return f.checkpointErr
+	}
 	f.stopCheckpointed = runtime.CheckpointRequested(ctx)
 	return nil
 }
@@ -381,20 +388,38 @@ func TestCheckpointMoveRefusals(t *testing.T) {
 	ctx := context.Background()
 	src, dst, srcRT, dstRT, dstC := gvisorMovePair(t)
 
-	// The kill switch: off, a gVisor sandbox does not move with its memory.
+	// The kill switch: off, a gVisor sandbox does not move with its memory,
+	// whatever the leader retries (refused for good).
 	src.cfg.GvisorCheckpointMoves = false
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); !strings.HasPrefix(got, "error:") {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); !strings.HasPrefix(got, cluster.MoveRefusedPrefix) {
 		t.Fatalf("release with the switch off = %q", got)
 	}
 	src.cfg.GvisorCheckpointMoves = true
-	// A stopped one has no memory to save.
+	// A stopped one has no memory to save. Someone may start it again, so
+	// this one is an error the leader retries until the deadline.
 	_ = src.store.Create(ctx, &models.Sandbox{ID: "sb-off", Name: "sb-off", Image: "alpine:3.20", Runtime: models.RuntimeGvisor, Status: models.SandboxStatusStopped})
-	if got := src.ReleaseForSnapshotMove(ctx, "sb-off", "worker-b", ""); !strings.Contains(got, "no memory") {
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-off", "worker-b", ""); !strings.HasPrefix(got, "error:") || !strings.Contains(got, "no memory") {
 		t.Fatalf("release of a stopped sandbox = %q", got)
 	}
 	if srcRT.stopCheckpointed {
 		t.Fatal("a refused release stopped the sandbox")
 	}
+	// A warm-pool sandbox: the runtime refuses to save it (its spec names
+	// the pool's park socket) before it stops anything. Refused for good;
+	// it keeps running, unfenced, and nothing names a target for it.
+	srcRT.checkpointErr = runtime.NotMovable("a sandbox from the warm pool moves by recreate only")
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != cluster.MoveRefusedPrefix+"a sandbox from the warm pool moves by recreate only" {
+		t.Fatalf("release of a warm-pool sandbox = %q", got)
+	}
+	if row, _ := src.store.Get(ctx, "sb-g"); row.Status != models.SandboxStatusStarted || src.moveFenced("sb-g") || src.moveTargets.get("sb-g") != "" {
+		t.Fatalf("a refused release left the sandbox %s, fenced %v, target %q", row.Status, src.moveFenced("sb-g"), src.moveTargets.get("sb-g"))
+	}
+	// A failure that may pass is still a plain error.
+	srcRT.checkpointErr = errors.New("runsc: checkpoint timed out")
+	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != "error: runsc: checkpoint timed out" {
+		t.Fatalf("release with a passing failure = %q", got)
+	}
+	srcRT.checkpointErr = nil
 
 	// A move that does not happen leaves nothing on the target.
 	if got := src.ReleaseForSnapshotMove(ctx, "sb-g", "worker-b", ""); got != MoveReleased {

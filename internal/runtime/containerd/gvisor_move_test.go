@@ -136,13 +136,16 @@ func TestCheckpointRefusals(t *testing.T) {
 		err   error
 		write map[string]string
 		want  error
+		// forGood: the refusal holds as long as the sandbox lives
+		// (sbruntime.ErrNotMovable), so the leader stops asking.
+		forGood bool
 	}{
-		{"a runc sandbox", &fakeContainer{id: "sb-r", runtime: containers.RuntimeInfo{Name: "io.containerd.runc.v2"}, task: &fakeTask{status: cntr.Running}}, nil, savedCheckpoint, errNotCheckpointable},
-		{"a stopped sandbox", stopped, nil, savedCheckpoint, errNotCheckpointable},
-		{"no task", noTask, nil, savedCheckpoint, errNotCheckpointable},
-		{"a warm-pool sandbox", parked, nil, savedCheckpoint, errWarmPoolMove},
-		{"runsc fails", gvisorContainer("sb-f"), errors.New("exit status 1"), savedCheckpoint, nil},
-		{"runsc writes nothing", gvisorContainer("sb-e"), nil, nil, nil},
+		{"a runc sandbox", &fakeContainer{id: "sb-r", runtime: containers.RuntimeInfo{Name: "io.containerd.runc.v2"}, task: &fakeTask{status: cntr.Running}}, nil, savedCheckpoint, errNotCheckpointable, false},
+		{"a stopped sandbox", stopped, nil, savedCheckpoint, errNotCheckpointable, false},
+		{"no task", noTask, nil, savedCheckpoint, errNotCheckpointable, false},
+		{"a warm-pool sandbox", parked, nil, savedCheckpoint, errWarmPoolMove, true},
+		{"runsc fails", gvisorContainer("sb-f"), errors.New("exit status 1"), savedCheckpoint, nil, false},
+		{"runsc writes nothing", gvisorContainer("sb-e"), nil, nil, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, _ := driverWith(t, tc.c)
@@ -150,6 +153,9 @@ func TestCheckpointRefusals(t *testing.T) {
 			err := d.Stop(ctx, tc.c.id)
 			if err == nil || (tc.want != nil && !errors.Is(err, tc.want)) {
 				t.Fatalf("stop = %v, want %v", err, tc.want)
+			}
+			if got := errors.Is(err, sbruntime.ErrNotMovable); got != tc.forGood {
+				t.Fatalf("stop = %v: refused for good %v, want %v", err, got, tc.forGood)
 			}
 			if runscwrap.HasCheckpoint(mustMoveDir(t, d, moveOut, tc.c.id)) {
 				t.Fatal("a failed checkpoint left files")

@@ -15,6 +15,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/runscwrap"
+	sbruntime "github.com/aerol-ai/microvm/internal/runtime"
 	"github.com/aerol-ai/microvm/internal/runtime/movebundle"
 	dockerpkg "github.com/aerol-ai/microvm/pkg/docker"
 )
@@ -66,7 +67,11 @@ const (
 
 var (
 	errNotCheckpointable = errors.New("only a running gVisor sandbox is checkpointed for a move")
-	errWarmPoolMove      = errors.New("a sandbox from the warm pool moves by recreate only: its spec carries the pool's park socket")
+	// errWarmPoolMove is a refusal for good (sbruntime.ErrNotMovable): the
+	// sandbox's spec names its pool slot's park socket for as long as it
+	// lives, so the leader stops trying and a decommission stops it at its
+	// deadline with the sandboxes that do not move.
+	errWarmPoolMove = sbruntime.NotMovable("a sandbox from the warm pool moves by recreate only: its spec carries the pool's park socket")
 )
 
 // runscCommandFn runs runsc with args; tests replace it.

@@ -73,8 +73,11 @@ var (
 	// ErrMoveNotForThisNode: a bundle asked for by a node the move does not
 	// name, or for a sandbox no move released.
 	ErrMoveNotForThisNode = errors.New("no snapshot move of this sandbox names this node")
-	// ErrNotSnapshotMovable: a sandbox a snapshot move does not take.
-	ErrNotSnapshotMovable = errors.New("only a Firecracker sandbox, or a gVisor one where checkpoint moves are on, without external-storage mounts moves with its memory")
+	// ErrNotSnapshotMovable: a sandbox a snapshot move does not take. A
+	// release answers it as a refusal for good (runtime.ErrNotMovable): this
+	// worker's runtimes and the sandbox's mounts do not change between the
+	// leader's passes.
+	ErrNotSnapshotMovable = runtime.NotMovable("only a Firecracker sandbox, or a gVisor one where checkpoint moves are on, without external-storage mounts moves with its memory")
 )
 
 // moveRow is the row a bundle carries: the API's view of the sandbox and
@@ -251,7 +254,7 @@ func (s *Service) ReleaseForSnapshotMove(ctx context.Context, id, target, lifeti
 		return "error: " + err.Error()
 	}
 	if _, err := s.snapshotMoverFor(sb); err != nil {
-		return "error: " + err.Error()
+		return moveErrorAnswer(err)
 	}
 	// External-storage mounts are not re-attached on the target (as for C21).
 	raw, err := s.store.GetMounts(ctx, id)
@@ -259,7 +262,7 @@ func (s *Service) ReleaseForSnapshotMove(ctx context.Context, id, target, lifeti
 		return "error: " + err.Error()
 	}
 	if len(raw) > 0 && string(raw) != "null" && string(raw) != "[]" {
-		return "error: " + ErrNotSnapshotMovable.Error()
+		return moveErrorAnswer(ErrNotSnapshotMovable)
 	}
 	if s.isCheckpointMovable(sb) {
 		// Only a running gVisor sandbox has memory to save, unless an
