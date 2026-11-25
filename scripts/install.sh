@@ -240,11 +240,13 @@ SPLIT_FIRECRACKER_KERNEL_PATH="/usr/local/lib/aerolvm-firecracker/vmlinux"
 # (setup_privilege_mode): a change is a switch, which moves files' owners.
 PREVIOUS_PRIVILEGE_MODE=""
 # Says a switch back to privilege mode single has started and not finished.
-# setup_privilege_mode writes it before sandboxd.env says single, and
-# leave_split_mode removes it once the cleanup is done. A run stopped in
-# between leaves it, so the next run still sees a node coming from split
-# (running_privilege_mode) and finishes the switch. Root's folder, never
-# one of sandboxd's user's.
+# mark_switch_back writes it just before write_environment makes sandboxd.env
+# say single, and leave_split_mode removes it once the cleanup is done. A
+# run stopped in between leaves it, so the next run still sees a node
+# coming from split (running_privilege_mode) and finishes the switch. A run
+# stopped earlier, on a download say, has changed no setting: it leaves no
+# marker, and the node runs and re-runs as split. Root's folder, never one
+# of sandboxd's user's.
 PRIVILEGE_SWITCH_BACK_MARKER="/etc/sandboxd/privilege-mode-switch-back"
 
 # agent_may_own_folders reports whether sandboxd's user may own its folders
@@ -2553,6 +2555,16 @@ install_binaries() {
 	fi
 }
 
+# mark_switch_back writes PRIVILEGE_SWITCH_BACK_MARKER on a switch back to
+# single. The main flow calls it right before write_environment, after
+# every download, so the marker is there from the moment sandboxd.env says
+# single until leave_split_mode is done, and not before: a run that stops
+# on a download leaves a split node that re-runs as split.
+mark_switch_back() {
+	[[ "$PRIVILEGE_MODE" == "single" && "$PREVIOUS_PRIVILEGE_MODE" == "split" ]] || return 0
+	printf '%s\n' "install.sh started to switch this node back to privilege mode single and has not finished. Run install.sh --privilege-mode single to finish it." >"$PRIVILEGE_SWITCH_BACK_MARKER"
+}
+
 write_environment() {
 	mkdir -p /etc/sandboxd /var/lib/sandboxd /run/sandboxd
 	chmod 0700 /var/lib/sandboxd /run/sandboxd
@@ -4551,8 +4563,6 @@ setup_privilege_mode() {
 		if [[ -e "$PRIVILEGE_SWITCH_BACK_MARKER" ]]; then
 			echo "A switch of this node back to privilege mode single did not finish; finishing it now"
 		fi
-		# Before write_environment says single: see PRIVILEGE_SWITCH_BACK_MARKER.
-		printf '%s\n' "install.sh started to switch this node back to privilege mode single and has not finished. Run install.sh --privilege-mode single to finish it." >"$PRIVILEGE_SWITCH_BACK_MARKER"
 	fi
 	[[ "$PRIVILEGE_MODE" == "split" ]] || return 0
 	if ! command -v setfacl >/dev/null 2>&1; then
@@ -5473,6 +5483,7 @@ install_custom_caddy "$DNS_PROVIDER"
 # Before install_binaries, so the restart check sees a new binary too.
 record_sandboxd_state
 install_binaries
+mark_switch_back
 write_environment
 write_node_settings
 prepare_key_custody

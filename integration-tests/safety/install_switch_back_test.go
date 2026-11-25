@@ -69,7 +69,7 @@ func newSwitchBackHost(t *testing.T, env string) *switchBackHost {
 		mustWrite(t, h.env, env)
 	}
 	h.funcs = installShFunction(t, installShSource(t), "env_file_value", "running_privilege_mode", "check_privilege_mode_change",
-		"setup_privilege_mode", "forget_single_upgrade_folder", "leave_split_mode")
+		"setup_privilege_mode", "forget_single_upgrade_folder", "mark_switch_back", "leave_split_mode")
 	return h
 }
 
@@ -127,7 +127,7 @@ func TestInstallWarnsOnSwitchBackToSingle(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newSwitchBackHost(t, tc.env)
-			calls, stdout, stderr := h.run(tc.mode, "setup_privilege_mode\nleave_split_mode\n")
+			calls, stdout, stderr := h.run(tc.mode, writeEnvMarks+"setup_privilege_mode\nwrite_environment\nleave_split_mode\n")
 			want := 0
 			if tc.warned {
 				want = 1
@@ -152,16 +152,72 @@ func TestInstallWarnsOnSwitchBackToSingle(t *testing.T) {
 	}
 }
 
+// writeEnvMarks stands in for install.sh's main flow at the env rewrite:
+// mark_switch_back, then write_environment
+// (TestInstallMarksTheSwitchBackOnlyWithTheEnvRewrite checks that order).
+const writeEnvMarks = "write_environment() { mark_switch_back; }\n"
+
+// TestInstallMarksTheSwitchBackOnlyWithTheEnvRewrite: the marker covers
+// only the window where sandboxd.env says single and the cleanup is not
+// done. A switch-back run that stops before write_environment (on a
+// download, say: the downloads all come before it) has changed no setting.
+// It leaves no marker, sandboxd.env still says split, and the next plain
+// run is a normal split run, not refused and not finishing anything.
+func TestInstallMarksTheSwitchBackOnlyWithTheEnvRewrite(t *testing.T) {
+	const splitEnv = "SB_API_PORT=21212\nSB_PRIVILEGE_MODE=split\n"
+	h := newSwitchBackHost(t, splitEnv)
+	// The run stops after setup_privilege_mode, where the downloads start.
+	_, stdout, stderr := h.run("single", writeEnvMarks+"setup_privilege_mode\nexit 0\n")
+	if h.markerThere() {
+		t.Fatal("a switch-back run that stopped before sandboxd.env changed left the marker")
+	}
+	if strings.Contains(stdout+stderr, switchBackWarning) {
+		t.Fatalf("it warned:\n%s%s", stdout, stderr)
+	}
+	if raw, _ := os.ReadFile(h.env); string(raw) != splitEnv {
+		t.Fatalf("sandboxd.env changed:\n%s", raw)
+	}
+	// The next plain run (node.json still says split) goes on as split.
+	calls, stdout, stderr := h.run("split", writeEnvMarks+"check_privilege_mode_change\nsetup_privilege_mode\nwrite_environment\nleave_split_mode\necho PREVIOUS=$PREVIOUS_PRIVILEGE_MODE\n")
+	if !strings.Contains(stdout, "PREVIOUS=split") || strings.Contains(stdout+stderr, "did not finish") || h.markerThere() {
+		t.Fatalf("the split re-run was not a plain split run:\nstdout: %s\nstderr: %s", stdout, stderr)
+	}
+	checkCalls(t, calls, nil, []string{"systemctl stop sandboxd", "aerolvm-rootd.service"})
+
+	// In install.sh's main flow, mark_switch_back runs right before
+	// write_environment and after every download (install_custom_caddy,
+	// install_binaries); it is the only place the marker is written.
+	src := installShSource(t)
+	if n := strings.Count(src, ">\"$PRIVILEGE_SWITCH_BACK_MARKER\""); n != 1 {
+		t.Fatalf("install.sh writes the marker in %d places, want 1 (mark_switch_back)", n)
+	}
+	if n := strings.Count(src, "\n\tmark_switch_back\n") + strings.Count(src, "\nmark_switch_back\n"); n != 1 {
+		t.Fatalf("install.sh calls mark_switch_back %d times, want once", n)
+	}
+	flow := src[strings.Index(src, "\nsetup_privilege_mode\n"):]
+	at := strings.Index(flow, "\nmark_switch_back\nwrite_environment\n")
+	if at < 0 {
+		t.Fatal("the main flow does not call mark_switch_back right before write_environment")
+	}
+	for _, download := range []string{"\ninstall_custom_caddy ", "\ninstall_binaries\n"} {
+		if i := strings.Index(flow, download); i < 0 || i > at {
+			t.Errorf("%q does not run before mark_switch_back in the main flow", strings.TrimSpace(download))
+		}
+	}
+}
+
 // TestInstallFinishesAnInterruptedSwitchBack: write_environment rewrites
 // sandboxd.env (single, no SB_PRIVILEGE_MODE) before leave_split_mode
 // cleans up. A switch-back run stopped between the two used to leave a node
 // that every later run read as single: no cleanup, no warning, and root
-// writing in folders sandboxd's user still owned. The marker setup_privilege
-// _mode writes first makes the next run finish the switch.
+// writing in folders sandboxd's user still owned. The marker
+// (mark_switch_back, right before write_environment) makes the next run
+// finish the switch.
 func TestInstallFinishesAnInterruptedSwitchBack(t *testing.T) {
 	h := newSwitchBackHost(t, "SB_API_PORT=21212\nSB_PRIVILEGE_MODE=split\n")
-	// write_environment as far as the mode goes: sandboxd.env says single.
-	writeEnv := "write_environment() { printf 'SB_API_PORT=21212\\n' >\"$SANDBOXD_ENV_FILE\"; }\n"
+	// write_environment as far as the mode goes: the marker first, then
+	// sandboxd.env says single.
+	writeEnv := "write_environment() { mark_switch_back; printf 'SB_API_PORT=21212\\n' >\"$SANDBOXD_ENV_FILE\"; }\n"
 
 	// The switch-back run stops right after sandboxd.env is rewritten.
 	calls, stdout, stderr := h.run("single", writeEnv+"setup_privilege_mode\nwrite_environment\nexit 0\n")
