@@ -74,7 +74,10 @@ public class SandboxData {
      * Firecracker VM the warm pool had already restored), {@code "parked"} (a
      * container, WASM worker or workerd host started ahead of time) or
      * {@code "none"} (nothing was waiting). Null for a sandbox made before the
-     * server sent it, or moved between nodes.
+     * server sent it, a WASM sandbox moved to another node, or a durable WASM
+     * sandbox recreated after its node failed. A Firecracker sandbox moved to
+     * another node keeps its value; a gVisor sandbox moved with its memory
+     * reports how it was rebuilt.
      */
     public String warm;
     public String durability;

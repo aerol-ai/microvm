@@ -96,6 +96,7 @@ func (h *switchBackHost) run(mode, script string, extra ...string) (calls []stri
 		"SPLIT_PROCID_DIR":             filepath.Join(h.dir, "procid"),
 		"BUILDKIT_UNIT_FILE":           filepath.Join(h.dir, "buildkit.service"),
 		"GIVEN_FLAGS":                  " ",
+		"FIRECRACKER_KERNEL_PATH":      filepath.Join(h.dir, "varlib-firecracker", "vmlinux"),
 	}
 	for i := 0; i+1 < len(extra); i += 2 {
 		env[extra[i]] = extra[i+1]
@@ -143,6 +144,11 @@ func TestInstallWarnsOnSwitchBackToSingle(t *testing.T) {
 				// On stderr, with the other warnings, and naming what to do.
 				if !strings.Contains(stderr, switchBackWarning) || !strings.Contains(stderr, "rebuild the machine instead") {
 					t.Errorf("the warning is not on stderr, or does not say to rebuild:\n%s", stderr)
+				}
+				// It names the data single keeps as it is, besides the
+				// database, and what to do about the templates.
+				if !strings.Contains(stderr, "Firecracker templates and saved VM snapshots") || !strings.Contains(stderr, "rebuild the templates") {
+					t.Errorf("the warning does not name templates and snapshots:\n%s", stderr)
 				}
 				// The switch itself still runs after it.
 				checkCalls(t, calls, []string{"systemctl stop sandboxd", "systemctl disable --now aerolvm-rootd.service"}, nil)
@@ -365,6 +371,45 @@ func TestInstallSwitchBackMovesBuildkitAfterSandboxdStops(t *testing.T) {
 				t.Fatalf("a %s run removed BuildKit's split drop-in", tc.name)
 			}
 			checkCalls(t, calls, nil, []string{"buildkit"})
+		})
+	}
+}
+
+// TestInstallSwitchBackRemovesTheOldKernelWithTheMarkerThere: single's
+// old guest kernel (in the data folder sandboxd's user controlled in split)
+// is removed by leave_split_mode before it removes the switch-back marker.
+// A run cut off anywhere before the marker goes finishes the switch next
+// time (and copies the new kernel in); one cut off after it finds no old
+// kernel to keep. Other runs leave the kernel alone.
+func TestInstallSwitchBackRemovesTheOldKernelWithTheMarkerThere(t *testing.T) {
+	for _, tc := range []struct {
+		name, env, mode string
+		removed         bool
+	}{
+		{name: "switch back", env: "SB_PRIVILEGE_MODE=split\n", mode: "single", removed: true},
+		{name: "split again", env: "SB_PRIVILEGE_MODE=split\n", mode: "split"},
+		{name: "single again", env: "SB_API_PORT=21212\n", mode: "single"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newSwitchBackHost(t, tc.env)
+			kernel := filepath.Join(h.dir, "varlib-firecracker", "vmlinux")
+			mustMkdir(t, filepath.Dir(kernel))
+			mustWrite(t, kernel, "kernel left from single\n")
+			calls, _, _ := h.run(tc.mode, writeEnvMarks+"setup_privilege_mode\nwrite_environment\nleave_split_mode\n")
+			_, err := os.Stat(kernel)
+			if !tc.removed {
+				if err != nil {
+					t.Fatalf("a %s run removed the kernel", tc.name)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("the switch back kept single's old guest kernel")
+			}
+			checkCalls(t, calls, []string{"rm -f " + kernel + " marker=yes", "rm -f " + h.marker + " marker=yes"}, nil)
+			if h.markerThere() {
+				t.Fatal("the marker is still there after the switch")
+			}
 		})
 	}
 }

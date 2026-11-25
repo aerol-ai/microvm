@@ -1048,8 +1048,12 @@ type Sandbox struct {
 	// WarmPoolKindNone (everything started for this create). The same signal
 	// the create metrics count as warm or cold. Stored with the row, so a
 	// replayed create and a later read report what the first create did.
-	// Empty on a row made before the field, or by a path that records no
-	// create (a move between nodes keeps the source row's value).
+	// Empty on a row made before the field. A move to another node: a
+	// Firecracker sandbox keeps the value its create recorded (its row comes
+	// over in the move bundle); a gVisor sandbox moved with its memory
+	// records how it was rebuilt there (the rebuild is a create); a WASM
+	// sandbox moved, or a durable WASM sandbox recreated after its node
+	// failed, saves none (a fresh row with no create behind it).
 	Warm string `json:"warm,omitempty"`
 	// GPUs is the GPU configuration this sandbox was created with. Nil means
 	// no GPU was requested.

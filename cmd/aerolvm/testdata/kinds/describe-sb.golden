@@ -4,6 +4,8 @@ Name:         box
 ID:           sb-0000000000000001
 Status:       started (warm)
 Runtime:      docker
+Backend:      -
+Warm start:   parked
 Image:        python:3.12
 CPU:          1.5
 Memory:       512Mi

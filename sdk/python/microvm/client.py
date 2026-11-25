@@ -1041,8 +1041,11 @@ class _SandboxBase:
     @property
     def warm(self) -> Optional[str]:
         """How this sandbox's create started: "snapshot", "parked" or
-        "none". None when the server did not record it (a sandbox made
-        before the field, or moved between nodes)."""
+        "none". None when the server did not record it: a sandbox made
+        before the field, a WASM sandbox moved to another node, or a
+        durable WASM sandbox recreated after its node failed. A Firecracker
+        sandbox moved to another node keeps its value; a gVisor sandbox
+        moved with its memory reports how it was rebuilt."""
         return self._data.get("warm")
 
     def __getattr__(self, name: str) -> Any:

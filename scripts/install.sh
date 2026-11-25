@@ -236,10 +236,13 @@ SPLIT_PROCID_DIR="/run/aerolvm-procid"
 # into every VM's jail, so it sits in a folder only root writes. Single
 # keeps it in sandboxd's data folder, which sandboxd's user owns in split.
 SPLIT_FIRECRACKER_KERNEL_PATH="/usr/local/lib/aerolvm-firecracker/vmlinux"
-# Set by install_firecracker on a switch back from split: the arch and pins
-# finish_firecracker_after_switch_back installs single's guest kernel with,
-# once leave_split_mode has given /var/lib/sandboxd back to root.
-FIRECRACKER_DATA_AFTER_SWITCH_BACK=""
+# Set by install_firecracker on a switch back from split
+# (stage_switch_back_kernel): the guest kernel, in a folder of root's, that
+# finish_firecracker_after_switch_back copies over single's once
+# leave_split_mode has given /var/lib/sandboxd back to root; and the folder
+# it was downloaded to, when split had no kernel to copy.
+FIRECRACKER_KERNEL_FOR_SWITCH_BACK=""
+FIRECRACKER_KERNEL_STAGE=""
 # The privilege mode this node ran in before this run, read from sandboxd.env
 # (setup_privilege_mode): a change is a switch, which moves files' owners.
 PREVIOUS_PRIVILEGE_MODE=""
@@ -3904,14 +3907,16 @@ install_firecracker_release() {
 # and so does the one the templates and stopped sandboxes on this node were
 # made with. Either way the config must set CONFIG_VMGENID=y. Without it,
 # VMs restored from one snapshot can start with the same random-number state,
-# and sandboxd's /health reports Firecracker degraded.
+# and sandboxd's /health reports Firecracker degraded. The kernel goes to
+# FIRECRACKER_KERNEL_PATH, or to the path given fifth
+# (stage_switch_back_kernel).
 install_firecracker_kernel() {
-	local arch="$1" kernel_sha="$2" config_sha="$3" tmp_dir="$4"
-	local config="${FIRECRACKER_KERNEL_PATH}.config" downloaded="false"
-	if [[ -f "$FIRECRACKER_KERNEL_PATH" ]]; then
-		echo "Keeping the guest kernel already at $FIRECRACKER_KERNEL_PATH"
+	local arch="$1" kernel_sha="$2" config_sha="$3" tmp_dir="$4" kernel="${5:-$FIRECRACKER_KERNEL_PATH}"
+	local config="${kernel}.config" downloaded="false"
+	if [[ -f "$kernel" ]]; then
+		echo "Keeping the guest kernel already at $kernel"
 		if [[ ! -f "$config" ]]; then
-			echo "--with-firecracker: the kernel at $FIRECRACKER_KERNEL_PATH has no build config at $config." >&2
+			echo "--with-firecracker: the kernel at $kernel has no build config at $config." >&2
 			echo "Put the kernel's .config there, or remove the kernel to install the pinned one." >&2
 			exit 1
 		fi
@@ -3936,10 +3941,10 @@ install_firecracker_kernel() {
 	if [[ "$downloaded" == "true" ]]; then
 		# Config first: a run cut off between the two leaves no kernel, so the
 		# next run downloads both again instead of keeping a kernel without one.
-		install -d -m 0755 "${FIRECRACKER_KERNEL_PATH%/*}"
-		install -m 0644 "${tmp_dir}/vmlinux.config" "${FIRECRACKER_KERNEL_PATH}.config"
-		install -m 0644 "${tmp_dir}/vmlinux" "$FIRECRACKER_KERNEL_PATH"
-		echo "Installed guest kernel ${FIRECRACKER_KERNEL_VERSION} to $FIRECRACKER_KERNEL_PATH"
+		install -d -m 0755 "${kernel%/*}"
+		install -m 0644 "${tmp_dir}/vmlinux.config" "${kernel}.config"
+		install -m 0644 "${tmp_dir}/vmlinux" "$kernel"
+		echo "Installed guest kernel ${FIRECRACKER_KERNEL_VERSION} to $kernel"
 	fi
 }
 
@@ -3983,13 +3988,13 @@ install_firecracker() {
 	# root, so root writes nothing there before then: the main flow runs
 	# finish_firecracker_after_switch_back after leave_split_mode.
 	if [[ "${PRIVILEGE_MODE:-single}" != "split" ]] && agent_may_own_folders; then
+		stage_switch_back_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
 		echo "The guest kernel and the templates folder go in /var/lib/sandboxd once it is root's again, after the switch back"
-		FIRECRACKER_DATA_AFTER_SWITCH_BACK="$arch $kernel_sha $config_sha"
 	else
 		install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
 	fi
 	install -d -m 0755 "$JAILER_CHROOT_BASE"
-	[[ -n "${FIRECRACKER_DATA_AFTER_SWITCH_BACK:-}" ]] || make_firecracker_templates_dir
+	[[ -n "${FIRECRACKER_KERNEL_FOR_SWITCH_BACK:-}" ]] || make_firecracker_templates_dir
 	if ! getent passwd "$JAILER_USER" >/dev/null 2>&1; then
 		useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$JAILER_USER"
 	fi
@@ -4006,18 +4011,50 @@ make_firecracker_templates_dir() {
 	fi
 }
 
-# finish_firecracker_after_switch_back runs the install_firecracker_data a
-# switch back left for later, now that leave_split_mode has given
-# sandboxd's folders back to root.
+# stage_switch_back_kernel picks, before the switch back's cleanup, the
+# guest kernel single will boot. The one already in /var/lib/sandboxd (from
+# an earlier single period) sat in a folder sandboxd's user controlled in
+# split, so it is replaced, never kept. The new one is split's kernel, from
+# a folder only root writes (the pinned kernel, or an operator's own), or,
+# when split has none, the pinned kernel, downloaded and checked here into
+# a folder of root's. Either way nothing is downloaded after the cleanup
+# has stopped sandboxd (finish_firecracker_after_switch_back only copies),
+# and a config without CONFIG_VMGENID=y stops the run before anything of
+# the switch changes.
+stage_switch_back_kernel() {
+	local arch="$1" kernel_sha="$2" config_sha="$3" tmp_dir="$4"
+	if [[ -f "$SPLIT_FIRECRACKER_KERNEL_PATH" && -f "${SPLIT_FIRECRACKER_KERNEL_PATH}.config" ]]; then
+		if ! grep -qx 'CONFIG_VMGENID=y' "${SPLIT_FIRECRACKER_KERNEL_PATH}.config"; then
+			echo "--with-firecracker: the guest kernel's config (${SPLIT_FIRECRACKER_KERNEL_PATH}.config) does not set CONFIG_VMGENID=y" >&2
+			exit 1
+		fi
+		FIRECRACKER_KERNEL_FOR_SWITCH_BACK="$SPLIT_FIRECRACKER_KERNEL_PATH"
+		return 0
+	fi
+	FIRECRACKER_KERNEL_STAGE="$(mktemp -d)"
+	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir" "${FIRECRACKER_KERNEL_STAGE}/vmlinux"
+	FIRECRACKER_KERNEL_FOR_SWITCH_BACK="${FIRECRACKER_KERNEL_STAGE}/vmlinux"
+}
+
+# finish_firecracker_after_switch_back puts single's guest kernel and
+# templates folder in place, now that leave_split_mode has given sandboxd's
+# folders back to root: a copy of the kernel stage_switch_back_kernel chose.
+# leave_split_mode has already removed the old kernel, before it removed the
+# switch-back marker, so a run cut off before this copy leaves no kernel,
+# and the next run installs the pinned one instead of keeping the old one.
 finish_firecracker_after_switch_back() {
-	[[ -n "${FIRECRACKER_DATA_AFTER_SWITCH_BACK:-}" ]] || return 0
-	local tmp_dir arch kernel_sha config_sha
-	read -r arch kernel_sha config_sha <<<"$FIRECRACKER_DATA_AFTER_SWITCH_BACK"
-	tmp_dir="$(mktemp -d)"
-	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
-	trap "rm -rf '$tmp_dir'" RETURN
-	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
-	FIRECRACKER_DATA_AFTER_SWITCH_BACK=""
+	[[ -n "${FIRECRACKER_KERNEL_FOR_SWITCH_BACK:-}" ]] || return 0
+	local from="$FIRECRACKER_KERNEL_FOR_SWITCH_BACK"
+	install -d -m 0755 "${FIRECRACKER_KERNEL_PATH%/*}"
+	install -m 0644 "${from}.config" "${FIRECRACKER_KERNEL_PATH}.config"
+	install -m 0644 "$from" "$FIRECRACKER_KERNEL_PATH"
+	echo "Replaced the guest kernel at $FIRECRACKER_KERNEL_PATH with a copy of $from"
+	if [[ -n "${FIRECRACKER_KERNEL_STAGE:-}" ]]; then
+		rm -f "${FIRECRACKER_KERNEL_STAGE}/vmlinux" "${FIRECRACKER_KERNEL_STAGE}/vmlinux.config"
+		rmdir "$FIRECRACKER_KERNEL_STAGE" 2>/dev/null || true
+		FIRECRACKER_KERNEL_STAGE=""
+	fi
+	FIRECRACKER_KERNEL_FOR_SWITCH_BACK=""
 	make_firecracker_templates_dir
 }
 
@@ -4995,7 +5032,7 @@ leave_split_mode() {
 	# tell whether what sandboxd's user wrote is honest. The docs say so
 	# (privilege-mode.mdx, installer-options.mdx); this says it on the node,
 	# on this switch only.
-	echo "warning: in single mode, sandboxd runs as root and trusts its database and its files in /var/lib/sandboxd, /etc/sandboxd/tls and /etc/sandboxd/cluster-ca. sandboxd wrote them while it ran without root. This switch gives them back to root and removes links, but does not check what they hold. If you think this server was broken into, rebuild the machine instead." >&2
+	echo "warning: in single mode, sandboxd runs as root and trusts its database and its files in /var/lib/sandboxd, /etc/sandboxd/tls and /etc/sandboxd/cluster-ca. sandboxd wrote them while it ran without root. This switch gives them back to root and removes links, but does not check what they hold. That includes Firecracker templates and saved VM snapshots, which single uses as they are: if in doubt, rebuild the templates after the switch back. If you think this server was broken into, rebuild the machine instead." >&2
 	systemctl stop sandboxd 2>/dev/null || true
 	# Rootless BuildKit's split drop-in (the socket's ACL for sandboxd's
 	# user) was kept until the split sandboxd stopped
@@ -5033,6 +5070,11 @@ leave_split_mode() {
 		done
 	fi
 	systemctl disable --now aerolvm-rootd.service 2>/dev/null || true
+	# Single's guest kernel was sandboxd's user's to change in split, and
+	# every new VM boots it: it goes while the marker still says the switch
+	# is unfinished, so no run, however it stops, keeps it.
+	# finish_firecracker_after_switch_back copies the new one in.
+	rm -f "$FIRECRACKER_KERNEL_PATH"
 	# Done: from here sandboxd.env alone says this node runs single.
 	rm -f "$PRIVILEGE_SWITCH_BACK_MARKER"
 }
