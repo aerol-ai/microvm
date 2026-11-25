@@ -7681,6 +7681,64 @@ mod tests {
         assert_eq!((bare.backend, bare.limits, bare.nodes), (None, None, None));
     }
 
+    // A null features or limits reads as the empty value, as the other SDKs
+    // read it, instead of failing the whole list (#1456 review).
+    #[test]
+    fn runtimes_list_reads_null_features_and_limits() {
+        let body = r#"{"runtimes":[{"name":"wasm","isolation":"wasm","features":null,"limits":null,"available":true}]}"#;
+        let (url, _rx) = spawn_route_server(vec![("GET /v1/runtimes ", "200 OK", body.to_string())], 1);
+        let runtimes = team_client(&url, None).runtimes().list().expect("null features should decode");
+        assert_eq!(runtimes.len(), 1);
+        assert_eq!(runtimes[0].features, RuntimeFeatures::default());
+        assert_eq!(runtimes[0].limits, None);
+        assert!(runtimes[0].available);
+    }
+
+    // backend and warm map when the server sends them, and are None when it
+    // leaves them out (a container, or a sandbox made before the fields).
+    #[test]
+    fn sandbox_reads_backend_and_warm() {
+        let sandbox = |extra: serde_json::Value| {
+            let mut body = serde_json::json!({
+                "id": "sb-1",
+                "image": "ubuntu:22.04",
+                "status": "started",
+                "public_url": "https://sb-1.example.com",
+                "cpu": 1,
+                "memory_mb": 512,
+                "disk_gb": 10,
+                "os_user": "root",
+                "network_block_all": false,
+                "toolbox_enabled": true,
+                "created_at": "2026-05-07T10:00:00Z",
+                "updated_at": "2026-05-07T10:00:00Z",
+                "last_active_at": "2026-05-07T10:00:00Z",
+                "runtime": "firecracker"
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            body.to_string()
+        };
+        let (url, rx) = spawn_route_server(
+            vec![("GET /v1/sandboxes/sb-1 ", "200 OK", sandbox(serde_json::json!({"backend": "kvm", "warm": "snapshot"})))],
+            1,
+        );
+        let got = team_client(&url, None).get("sb-1").expect("get should succeed");
+        assert!(rx.recv().unwrap().starts_with("GET /v1/sandboxes/sb-1 HTTP/1.1\r\n"));
+        assert_eq!(got.data.backend.as_deref(), Some("kvm"));
+        assert_eq!(got.data.warm.as_deref(), Some("snapshot"));
+
+        let (url, _rx) = spawn_route_server(vec![("GET /v1/sandboxes/sb-1 ", "200 OK", sandbox(serde_json::json!({})))], 1);
+        let got = team_client(&url, None).get("sb-1").expect("get should succeed");
+        assert_eq!((got.data.backend, got.data.warm), (None, None));
+
+        // Absent fields are not written back out.
+        let raw: SandboxData = serde_json::from_str(&sandbox(serde_json::json!({}))).unwrap();
+        let out = serde_json::to_value(&raw).unwrap();
+        assert!(out.get("backend").is_none() && out.get("warm").is_none(), "{}", out);
+    }
+
     #[test]
     fn runtimes_list_keeps_the_server_refusal() {
         let (url, _rx) = spawn_route_server(

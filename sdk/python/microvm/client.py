@@ -1032,6 +1032,19 @@ class _SandboxBase:
     def id(self) -> str:
         return str(self._data.get("id", ""))
 
+    @property
+    def backend(self) -> Optional[str]:
+        """The hardware a VM runtime runs on ("kvm" for firecracker), or
+        None for a runtime that is not a VM."""
+        return self._data.get("backend")
+
+    @property
+    def warm(self) -> Optional[str]:
+        """How this sandbox's create started: "snapshot", "parked" or
+        "none". None when the server did not record it (a sandbox made
+        before the field, or moved between nodes)."""
+        return self._data.get("warm")
+
     def __getattr__(self, name: str) -> Any:
         if name in self._data:
             return self._data[name]
@@ -5210,6 +5223,12 @@ def _from_api_sandbox(sandbox: Dict[str, Any]) -> SandboxData:
     runtime = _first_of(sandbox, "runtime")
     if runtime not in (None,):
         result["runtime"] = str(runtime)  # type: ignore[typeddict-item]
+    backend = _first_of(sandbox, "backend")
+    if backend not in (None, ""):
+        result["backend"] = str(backend)
+    warm = _first_of(sandbox, "warm")
+    if warm not in (None, ""):
+        result["warm"] = str(warm)  # type: ignore[typeddict-item]
     durability = _first_of(sandbox, "durability")
     if durability not in (None, ""):
         result["durability"] = str(durability)  # type: ignore[typeddict-item]

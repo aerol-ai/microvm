@@ -5,12 +5,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/controlplane"
 	"github.com/aerol-ai/microvm/pkg/models"
@@ -159,4 +161,50 @@ func TestListRuntimesRoute(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCreateRefusalNamesOfferedRuntimesOverHTTP: a create of a runtime this
+// node does not offer keeps the status it had (501 for a runtime this build
+// or node cannot run) and its body names the runtimes that are offered,
+// with no node named.
+func TestCreateRefusalNamesOfferedRuntimesOverHTTP(t *testing.T) {
+	tenant := controlplane.Access{
+		Identity:  controlplane.Identity{OwnerRef: controlplane.TeamOwnerRef("payments")},
+		Role:      controlplane.RoleRunner,
+		Principal: controlplane.Principal{Kind: controlplane.PrincipalToken, ID: "tok_team"},
+	}
+	for _, runtime := range []string{models.RuntimeKata, models.RuntimeFirecracker, models.RuntimeWasm, models.RuntimeIsolate} {
+		t.Run(runtime, func(t *testing.T) {
+			mux := newRefusalMux(t, []string{models.RuntimeDocker, models.RuntimeGvisor}, tenant)
+			rr := do(t, mux, http.MethodPost, "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "runtime": runtime})
+			if rr.Code != http.StatusNotImplemented {
+				t.Fatalf("POST /v1/sandboxes = %d %s, want 501 as before", rr.Code, rr.Body.String())
+			}
+			want := `runtime \"` + runtime + `\" is not offered here (offered: docker, gvisor)`
+			if !strings.Contains(rr.Body.String(), want) {
+				t.Fatalf("body = %s, want it to name the offered runtimes: %s", rr.Body.String(), want)
+			}
+		})
+	}
+}
+
+// newRefusalMux is a single node with a store and no runtime driver: enough
+// for a create to reach its runtime checks and be refused there.
+func newRefusalMux(t *testing.T, hostRuntimes []string, access controlplane.Access) http.Handler {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	admitter := capacity.New(capacity.HostInfo{CPUCores: 4, MemoryTotalMB: 8192, SupportedRuntimes: hostRuntimes}, capacity.Limits{}, nil)
+	svc := service.New(config.Config{}, logger, st, nil, nil, nil, nil, nil, admitter)
+	mux := http.NewServeMux()
+	RegisterRoutes(mux, Deps{Service: svc, Logger: logger, Auth: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h.ServeHTTP(w, r.WithContext(controlplane.ContextWithAccess(r.Context(), access)))
+		})
+	}})
+	return mux
 }

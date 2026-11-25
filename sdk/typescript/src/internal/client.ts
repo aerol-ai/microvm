@@ -513,6 +513,8 @@ interface ApiSandbox {
   lifecycle?: ApiLifecycle;
   failover?: ApiFailover;
   runtime?: string;
+  backend?: string;
+  warm?: string;
   durability?: string;
   module_ref?: string;
   module_digest?: string;
@@ -2600,6 +2602,8 @@ export class SandboxResource implements Sandbox {
   declare lifecycle: Lifecycle;
   declare failover?: Failover;
   declare runtime: Sandbox["runtime"];
+  declare backend?: string;
+  declare warm?: string;
   declare identity?: SandboxIdentity;
 
   declare protected readonly client: APIClient;
@@ -3093,6 +3097,9 @@ function fromApiSandbox(sandbox: ApiSandbox): Sandbox {
     lifecycle: fromApiLifecycle(sandbox.lifecycle),
     failover: fromApiFailover(sandbox.failover),
     runtime: normalizeRuntime(sandbox.runtime),
+    // Both are left out by the server when empty; nothing is filled in.
+    backend: sandbox.backend || undefined,
+    warm: sandbox.warm || undefined,
     durability: sandbox.durability as Sandbox["durability"] | undefined,
     moduleRef: sandbox.module_ref,
     moduleDigest: sandbox.module_digest,

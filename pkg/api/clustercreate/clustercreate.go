@@ -309,6 +309,7 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 		}
 		target, err := c.SelectPlacement(placementReq)
 		if err != nil {
+			err = svc.ExplainRuntimeRefusal(req.Runtime, err)
 			if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 				return Decision{}, false
 			}
@@ -384,6 +385,9 @@ func Prepare(w http.ResponseWriter, r *http.Request, svc *service.Service, req m
 	target, recipients, err := c.SelectPlacementForCreate(CapacityRequestFromCreate(req), sandboxID, recipientBackups)
 	placeDur := time.Since(placeStart)
 	if err != nil {
+		// A runtime no worker offers is refused as before, and the refusal
+		// names the runtimes that are offered (§11, R18). Refusal path only.
+		err = svc.ExplainRuntimeRefusal(req.Runtime, err)
 		if writeNoEgressGateway(w, err, writeError) || writePlacementUnsatisfiable(w, err, writeError) {
 			return Decision{}, false
 		}

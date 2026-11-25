@@ -1037,6 +1037,20 @@ type Sandbox struct {
 	// and resolve to docker so flipping SB_CONTAINER_ENGINE does not strand
 	// existing sandboxes on the wrong driver.
 	Engine string `json:"engine,omitempty"`
+	// Backend is the hardware a VM runtime runs on: the feature table's
+	// backend for Runtime (RuntimeBackend), "kvm" for firecracker. Empty for
+	// a runtime that is not a VM. Not stored: it follows from Runtime, so
+	// the store fills it on every read and a row older than the field has it.
+	Backend string `json:"backend,omitempty"`
+	// Warm is how the create that made this sandbox started: WarmPoolKindSnapshot
+	// (a Firecracker VM the warm pool had already restored), WarmPoolKindParked
+	// (a container, WASM worker or workerd host started ahead of time) or
+	// WarmPoolKindNone (everything started for this create). The same signal
+	// the create metrics count as warm or cold. Stored with the row, so a
+	// replayed create and a later read report what the first create did.
+	// Empty on a row made before the field, or by a path that records no
+	// create (a move between nodes keeps the source row's value).
+	Warm string `json:"warm,omitempty"`
 	// GPUs is the GPU configuration this sandbox was created with. Nil means
 	// no GPU was requested.
 	GPUs *GPURequest `json:"gpus,omitempty"`

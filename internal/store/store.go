@@ -2295,8 +2295,9 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 			restart_on_failure, restart_failures, restart_at, last_restarted_at,
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
-			net_seen_pid
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			net_seen_pid,
+			warm
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		sandbox.ID,
 		sandbox.Image,
@@ -2368,6 +2369,10 @@ func (s *Store) insertSandbox(ctx context.Context, exec dbExecer, sandbox *model
 		// row it creates is "unknown" and baselined, and a row it updates
 		// keeps its reading.
 		NetSeenNew,
+		// How this create started (models.Sandbox.Warm), written with the
+		// row the create already writes. Upsert never writes it: it
+		// describes the create, so no later whole-row write may change it.
+		strings.TrimSpace(sandbox.Warm),
 	)
 	if err != nil {
 		if isSandboxNameConflict(err, sandbox.Name) {
@@ -2786,7 +2791,8 @@ func (s *Store) Get(ctx context.Context, id string) (*models.Sandbox, error) {
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
 			run_generation,
-			rollback_pending
+			rollback_pending,
+			warm
 		FROM sandboxes
 		WHERE id = ?
 	`, id)
@@ -2874,7 +2880,8 @@ func (s *Store) List(ctx context.Context) ([]*models.Sandbox, error) {
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
 			run_generation,
-			rollback_pending
+			rollback_pending,
+			warm
 		FROM sandboxes
 		ORDER BY created_at DESC
 	`)
@@ -2951,7 +2958,8 @@ func (s *Store) ListByOwner(ctx context.Context, ownerRef string) ([]*models.San
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
 			run_generation,
-			rollback_pending
+			rollback_pending,
+			warm
 		FROM sandboxes
 		WHERE owner_ref = ?
 		ORDER BY created_at DESC
@@ -3015,7 +3023,8 @@ func (s *Store) ListByRuntime(ctx context.Context, runtime string) ([]*models.Sa
 			destroy_after_exit_for_ns, program_exited_at,
 			tokens_not_before,
 			run_generation,
-			rollback_pending
+			rollback_pending,
+			warm
 		FROM sandboxes
 		WHERE runtime = ?
 		ORDER BY created_at DESC
@@ -6227,10 +6236,14 @@ func (s *Store) scanSandbox(scanner interface {
 		&sandbox.TokensNotBefore,
 		&sandbox.RunGeneration,
 		&rollbackPending,
+		&sandbox.Warm,
 	)
 	if err != nil {
 		return nil, err
 	}
+	// Backend has no column: it follows from the runtime (the feature
+	// table), so every row reads it, an older one included.
+	sandbox.Backend = models.RuntimeBackend(sandbox.Runtime)
 	sandbox.ExitCode = intFromNull(exitCode)
 	sandbox.RestartAt = timeFromNull(restartAt)
 	sandbox.LastRestartedAt = timeFromNull(lastRestartedAt)

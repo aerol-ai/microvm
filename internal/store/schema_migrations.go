@@ -120,6 +120,19 @@ var newerSchemaMigrations = []schemaMigration{
 		}
 		return nil
 	}},
+	// 16: how each sandbox's create started (models.Sandbox.Warm:
+	// "snapshot", "parked", "none"; plans/security-gaps-m1-m4.md §11). An
+	// added column only: the previous release never reads it, and its
+	// default "" is what an older row means (not recorded). Safe at open,
+	// no backfill. A database that has the column without the record keeps
+	// it as it is.
+	{number: 16, name: "sandbox_warm_start", n1Safe: true, applyTx: func(ctx context.Context, tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `ALTER TABLE sandboxes ADD COLUMN warm TEXT NOT NULL DEFAULT '';`)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+		return nil
+	}},
 }
 
 // ErrSchemaFromNewerRelease is Open's error for a database on which a newer
