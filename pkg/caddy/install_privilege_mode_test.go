@@ -392,6 +392,41 @@ func TestInstallPrivilegeModeSwitchBackFinishesAndConfigOnlyRefuses(t *testing.T
 	}
 }
 
+// A switch back that fails on a download has changed no setting: it leaves
+// no switch-back marker, the node stays split, and a plain re-run (the
+// upgrader's, say) is a normal split run, not refused.
+func TestInstallPrivilegeModeSwitchBackThatFailsADownloadStaysSplit(t *testing.T) {
+	r := newRunRig(t)
+	r.stubEngineSteps()
+	if out, err := r.run(r.env("SANDBOXD_ACTIVE=false"), append(r.splitRelease("helper v0.7.8\n"), "--with-containerd-engine", "--privilege-mode", "split")...); err != nil {
+		t.Fatalf("install.sh: %v\n%s", err, out)
+	}
+	unit, env := r.read("systemd/system/sandboxd.service"), r.read("sandboxd/sandboxd.env")
+
+	broken := append(r.splitRelease("helper v0.7.9\n"), "--privilege-mode", "single", "--sandboxd-url", "file://"+r.path("rel/no-such-file"))
+	// No retries: the missing file fails at once instead of after curl's
+	// 15 minutes of them.
+	if out, err := r.run(r.env("SANDBOXD_ACTIVE=true", "AEROL_DOWNLOAD_RETRY=0", "AEROL_DOWNLOAD_RETRY_MAX_TIME=1"), broken...); err == nil ||
+		!strings.Contains(out, "Failed to download no-such-file") {
+		t.Fatalf("want the switch back to stop on the missing download: err %v\n%s", err, out)
+	}
+	if _, err := os.Stat(r.path("sandboxd/privilege-mode-switch-back")); err == nil {
+		t.Fatal("the failed download left the switch-back marker")
+	}
+	if r.read("sandboxd/sandboxd.env") != env || r.read("systemd/system/sandboxd.service") != unit {
+		t.Fatal("the failed switch back changed sandboxd.env or sandboxd.service")
+	}
+
+	out, err := r.run(r.env("SANDBOXD_ACTIVE=true"), r.splitRelease("helper v0.7.9\n")...)
+	if err != nil || strings.Contains(out, "did not finish") {
+		t.Fatalf("the plain re-run: err %v\n%s", err, out)
+	}
+	if !strings.Contains(r.read("systemd/system/sandboxd.service"), "NoNewPrivileges=yes") ||
+		!strings.Contains(r.read("sandboxd/sandboxd.env"), "SB_PRIVILEGE_MODE=split") {
+		t.Fatal("the plain re-run did not keep the node split")
+	}
+}
+
 // A switch from single to split removes single mode's upgrade folder: split
 // never reads it, and in split it sits in the folder sandboxd's user owns
 // (M1 PR 10 review). A fresh split install has none to remove.
