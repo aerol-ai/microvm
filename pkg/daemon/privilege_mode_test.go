@@ -181,12 +181,12 @@ func TestMountsOffFor(t *testing.T) {
 }
 
 func TestNewRootHelper(t *testing.T) {
-	if newRootHelper(config.Config{PrivilegeMode: privmode.Single}, nil) != nil {
+	if newRootHelper(config.Config{PrivilegeMode: privmode.Single}, nil, nil) != nil {
 		t.Fatal("single mode built a helper client")
 	}
 	cfg := splitConfig()
 	cfg.RootdSocket = "/run/h/root.sock"
-	c := newRootHelper(cfg, nil)
+	c := newRootHelper(cfg, nil, nil)
 	if c == nil || c.Socket() != "/run/h/root.sock" {
 		t.Fatalf("split mode client %v", c)
 	}
@@ -197,6 +197,45 @@ func TestNewRootHelper(t *testing.T) {
 	got := rootHelperConfig(cfg)
 	if got.Timeout != rootclient.DefaultTimeout || got.NetworkTimeout != rootclient.DefaultNetworkTimeout || got.NetworkTimeout < 30*time.Second {
 		t.Fatalf("helper client bounds: call %v, network %v", got.Timeout, got.NetworkTimeout)
+	}
+	// The parent the agent's specs name, by the gate's rule: the setting,
+	// or containerd's /<namespace> without one. The helper's handshake must
+	// say the same (rootclient.ParentMovedError).
+	for _, tc := range []struct{ ns, parent, want string }{
+		{"aerolvm", "", "/aerolvm"},
+		{"aerolvm", "/kubepods/pod1/ctr-a/sandboxes", "/kubepods/pod1/ctr-a/sandboxes"},
+	} {
+		cfg.ContainerdNamespace, cfg.ContainerdCgroupParent = tc.ns, tc.parent
+		if got := rootHelperConfig(cfg).CgroupParent; got != tc.want {
+			t.Errorf("namespace %q, parent %q: the client checks %q, want %q", tc.ns, tc.parent, got, tc.want)
+		}
+	}
+	var heard error
+	c = newRootHelper(cfg, nil, func(err error) { heard = err })
+	defer c.Close()
+	if heard != nil {
+		t.Fatalf("heard %v before any handshake", heard)
+	}
+}
+
+// TestSelfRestart: a reason to stop stops sandboxd as a signal would, and
+// is what Run returns; the first one wins; none, nil.
+func TestSelfRestart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &selfRestart{cancel: cancel}
+	if r.reason() != nil {
+		t.Fatal("a reason with none asked for")
+	}
+	moved := &rootclient.ParentMovedError{Agent: "/a", Helper: "/b"}
+	r.request(moved)
+	r.request(errors.New("later"))
+	if ctx.Err() == nil {
+		t.Fatal("a restart did not stop sandboxd")
+	}
+	var pm *rootclient.ParentMovedError
+	if err := r.reason(); !errors.As(err, &pm) || !strings.Contains(err.Error(), "started again") {
+		t.Fatalf("reason = %v, want the first one asked for", err)
 	}
 }
 
@@ -241,6 +280,13 @@ func TestResolveSplitBridgeSubnet(t *testing.T) {
 	f = &fakeHostNetwork{answers: []error{refused}}
 	if _, err := resolveSplitBridgeSubnet(ctx, config.Config{}, f, testLogger()); err == nil || f.calls != 1 {
 		t.Fatalf("an answer that is not a helper down is not waited out: %v after %d", err, f.calls)
+	}
+	// A helper whose cgroup parent moved matches ErrUnavailable, but does
+	// not come right by waiting: this agent must start again.
+	f = &fakeHostNetwork{answers: []error{&rootclient.ParentMovedError{Agent: "/a", Helper: "/b"}}}
+	var pm *rootclient.ParentMovedError
+	if _, err := resolveSplitBridgeSubnet(ctx, config.Config{}, f, testLogger()); !errors.As(err, &pm) || f.calls != 1 {
+		t.Fatalf("a moved parent is not waited out: %v after %d", err, f.calls)
 	}
 	f = &fakeHostNetwork{answers: slices.Repeat([]error{down}, 1000)}
 	start := time.Now()
@@ -555,6 +601,12 @@ func (h *engineHelper) MarkSandboxCgroup(_ context.Context, id string) error {
 // network in memory, containerd's version answered as the gate would.
 func splitHelper(t *testing.T, sock string) *stubNetwork {
 	t.Helper()
+	return splitHelperWith(t, sock, nil)
+}
+
+// splitHelperWith is splitHelper with a change to the helper's config.
+func splitHelperWith(t *testing.T, sock string, config func(*rootd.Config)) *stubNetwork {
+	t.Helper()
 	base := filepath.Dir(filepath.Dir(sock))
 	cfg := rootd.Config{
 		Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()),
@@ -568,6 +620,9 @@ func splitHelper(t *testing.T, sock string) *stubNetwork {
 	}
 	cfg.Policy.HelperFileRoots = []string{cfg.Files.Hosts, cfg.Files.Ready}
 	cfg.Policy.RunscConfigPaths = []string{filepath.Join(cfg.Files.Runsc, "config.toml"), filepath.Join(cfg.Files.Runsc, "restore.toml")}
+	if config != nil {
+		config(&cfg)
+	}
 	net := &stubNetwork{ns: map[string]rootd.NetnsState{}}
 	srv, err := rootd.New(cfg, rootd.Options{
 		Peer:    egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, ""),
@@ -677,6 +732,46 @@ func TestRun_SplitMode(t *testing.T) {
 	defer net.mu.Unlock()
 	if net.next == 0 {
 		t.Fatal("no namespace was built through the helper: the warm slot came from somewhere else")
+	}
+}
+
+// TestRun_SplitModeParentMoved: a helper that holds sandboxes to another
+// cgroup parent than this agent's (the runtime container started again
+// after the agent read its parent) stops sandboxd at once, not after the
+// boot wait for a helper that is down, with an error that names both: the
+// kubelet starts it again, and it reads the new parent.
+func TestRun_SplitModeParentMoved(t *testing.T) {
+	setBaseRunEnv(t)
+	dir, err := os.MkdirTemp("/tmp", "sp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if dir, err = filepath.EvalSymlinks(dir); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "sock", "root.sock")
+	const moved = "/kubepods/pod1/ctr-b/sandboxes"
+	splitHelperWith(t, sock, func(c *rootd.Config) { c.Policy.CgroupParent = moved })
+	origUID := rootHelperUID
+	t.Cleanup(func() { rootHelperUID = origUID })
+	rootHelperUID = uint32(os.Getuid())
+	t.Setenv("SB_PRIVILEGE_MODE", "split")
+	t.Setenv("SB_ROOTD_SOCKET", sock)
+	t.Setenv("SB_CONTAINER_ENGINE", "containerd")
+	t.Setenv("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", "true")
+	t.Setenv("SB_CONTAINERD_RUN_DIR", filepath.Join(dir, "ctr"))
+	t.Setenv("SB_EGRESS_FQDN_ENABLED", "false")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	err = Run(ctx, testLogger(), nil)
+	var pm *rootclient.ParentMovedError
+	if !errors.As(err, &pm) || pm.Helper != moved || pm.Agent != "/aerolvm" {
+		t.Fatalf("Run = %v, want a ParentMovedError from /aerolvm to %s", err, moved)
+	}
+	if d := time.Since(start); d >= helperBootWait {
+		t.Fatalf("Run took %v: a moved parent was waited out like a helper that is down", d)
 	}
 }
 
