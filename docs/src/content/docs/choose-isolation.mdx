@@ -245,6 +245,66 @@ This example creates a gVisor sandbox. Change `"gvisor"` to `"docker"` or `"fire
   </TabItem>
 </Tabs>
 
+### See what you got
+
+The sandbox you get back says how it runs:
+
+- **`runtime`**: the runtime you asked for. The server never swaps in another one.
+- **`backend`**: the hardware a VM runs on, `kvm` for Firecracker today. Empty for runtimes that are not VMs.
+- **`warm`**: how the create started. `snapshot` means a Firecracker VM the warm pool had already started from a saved memory image. `parked` means a container, WebAssembly worker or V8 host that was started ahead of time. `none` means nothing was waiting, so everything started for this create.
+
+The server saves `warm` with the sandbox, so a later get, or a retried create with the same key, gives the same answer. It is empty for sandboxes made before the server recorded it.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    const sandbox = await client.create({ image: "python:3.12-slim", runtime: "firecracker" });
+    console.log(sandbox.runtime, sandbox.backend, sandbox.warm); // firecracker kvm snapshot
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    sandbox = client.create(image="python:3.12-slim", runtime="firecracker")
+    print(sandbox.runtime, sandbox.backend, sandbox.warm)  # firecracker kvm snapshot
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    sandbox, err := client.Create(ctx, sdktypes.CreateSandboxOptions{
+        Image:   "python:3.12-slim",
+        Runtime: sdktypes.RuntimeFirecracker,
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(sandbox.Runtime, sandbox.Backend, sandbox.Warm) // firecracker kvm snapshot
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    let sandbox = client.create(CreateOptions {
+        image: "python:3.12-slim".into(),
+        runtime: Some("firecracker".into()),
+        ..Default::default()
+    })?;
+    println!(
+        "{} {} {}",
+        sandbox.data.runtime,
+        sandbox.data.backend.as_deref().unwrap_or("-"),
+        sandbox.data.warm.as_deref().unwrap_or("-"),
+    ); // firecracker kvm snapshot
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    Sandbox sandbox = client.create(
+        new CreateOptions().setImage("python:3.12-slim").setRuntime("firecracker")
+    );
+    System.out.println(sandbox.runtime + " " + sandbox.backend + " " + sandbox.warm); // firecracker kvm snapshot
+    ```
+  </TabItem>
+</Tabs>
+
 ### WebAssembly and V8 isolate
 
 These two do not start from a container image. They run a module, so you also pass `moduleRef`. This example runs the standard `python` WebAssembly module. For an isolate, set `runtime` to `"isolate"` and pass your bundle's reference instead (see [V8 isolate](/isolate-sandbox/#step-3-create-a-sandbox-and-call-it)).
@@ -304,12 +364,14 @@ These two do not start from a container image. They run a module, so you also pa
 
 ## When the runtime is not available
 
-A server runs only the runtimes its operator turned on. Call `runtimes.list()` first to see them. If you ask for one it does not run, the create fails and nothing is started. The error names the problem, for example:
+A server runs only the runtimes its operator turned on. Call `runtimes.list()` first to see them. If you ask for one it does not run, the create fails and nothing is started. AerolVM never gives you a different runtime instead.
 
-- `runtime "gvisor" not supported on this host`
-- `runtime "firecracker" requires SB_ENABLE_FIRECRACKER=true`
+The error starts with the runtimes this server or cluster does offer, then says why yours was refused, for example:
 
-On a cluster, AerolVM sends each sandbox only to a worker that can run its runtime.
+- `runtime "gvisor" is not offered here (offered: docker, wasm): host capacity exceeded: ...`
+- `runtime "firecracker" is not offered here (offered: docker): runtime "firecracker" requires SB_ENABLE_FIRECRACKER=true ...`
+
+The HTTP status code is the same as it was before the list was added. The list holds runtime names only, never server names or counts. On a cluster, AerolVM sends each sandbox only to a worker that can run its runtime, and the list covers every worker.
 
 ## Good to know
 

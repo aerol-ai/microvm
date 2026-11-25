@@ -533,7 +533,17 @@ A runtime is the technology that walls the sandbox off from the server. Set it w
   </TabItem>
 </Tabs>
 
-Only the standard container is always on. gVisor, Firecracker, WebAssembly and V8 isolates work only after the server operator turns them on.
+Only the standard container is always on. gVisor, Firecracker, WebAssembly and V8 isolates work only after the server operator turns them on. If you ask for one the server does not offer, the create fails, nothing is started, and the error names the runtimes it does offer.
+
+Every sandbox you get back says how it runs:
+
+| Field | What it says |
+|---|---|
+| `runtime` | The runtime you asked for, or the server's default. |
+| `backend` | The hardware a VM runs on: `kvm` for Firecracker. Empty for runtimes that are not VMs. |
+| `warm` | How its create started: `snapshot` (a Firecracker VM from the warm pool), `parked` (a container, WebAssembly worker or V8 host started ahead of time) or `none` (nothing was waiting). Empty for sandboxes made before the server recorded it. |
+
+See [Choose a runtime](/choose-isolation/#see-what-you-got) for an example in each language.
 
 How fast is a create? On our AWS test servers, with warm pools on, the median server time was about 4 ms for a V8 isolate. It was 22 ms for WebAssembly, 34 ms for Firecracker and 189 ms for a standard container. Network time between your app and the server comes on top.
 
