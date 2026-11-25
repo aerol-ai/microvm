@@ -120,7 +120,7 @@ func hostLimits(l pkgisolate.Limits) *rootdpb.HostLimits {
 		out.MemoryMb = uint64(l.MemoryMB)
 	}
 	if l.Pids > 0 {
-		out.Pids = uint32(min(l.Pids, math.MaxUint32))
+		out.Pids = uint32(min(int64(l.Pids), math.MaxUint32))
 	}
 	return out
 }

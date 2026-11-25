@@ -861,7 +861,7 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 	if err != nil {
 		return h, err
 	}
-	if pids <= 0 || pids > math.MaxUint32 {
+	if pids <= 0 || int64(pids) > math.MaxUint32 {
 		return h, fmt.Errorf("SB_ISOLATE_JAIL_PIDS_MAX=%d: want a limit above 0", pids)
 	}
 	jails, err := envInt(getenv, "SB_ROOTD_ISOLATE_MAX_JAILS", defaultMaxV8Jails)
@@ -1115,7 +1115,7 @@ func limitsFromEnv(getenv func(string) string) (rootpolicy.Limits, error) {
 	if err != nil {
 		return rootpolicy.Limits{}, err
 	}
-	if memMB > maxMemoryMB {
+	if int64(memMB) > maxMemoryMB {
 		return rootpolicy.Limits{}, fmt.Errorf("SB_HOST_MEMORY_MB=%d is more than a machine can have", memMB)
 	}
 	if pids <= 0 {
@@ -1344,7 +1344,7 @@ func uidSharedWith(getenv func(string) string, uid uint32) ([]string, error) {
 		}
 		// A value outside uid_t would wrap in the conversion and be compared
 		// as some other uid.
-		if n < 0 || n > math.MaxUint32 {
+		if n < 0 || int64(n) > math.MaxUint32 {
 			return nil, fmt.Errorf("%s=%d: not a uid", k, n)
 		}
 		if uint32(n) == uid {
