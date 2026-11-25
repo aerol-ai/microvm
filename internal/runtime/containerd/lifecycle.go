@@ -943,13 +943,26 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return nil
 	}
 	destroyErr := d.destroyContainer(ctx, sandbox)
+	// A failed warm claim's leftover (claim_leftovers.go), removed by a
+	// retried create (service create_leftover.go): no row ever held its
+	// lists, so its whole address is cleared, and once containerd has no
+	// container of the id left, the id is no longer refused. One atomic
+	// load for every other destroy.
+	leftover := destroyErr == nil && d.claimLeftovers.holds(sandbox.ID)
 	sbruntime.NotifyReleasingAddress(ctx, sandbox.ContainerIP)
 	if !d.clearsOnRelease() || d.netns == nil {
-		_ = d.ClearNetworkRules(sandbox.ContainerIP)
-		_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
+		if leftover {
+			_ = d.clearAddressRules(sandbox.ContainerIP)
+		} else {
+			_ = d.ClearNetworkRules(sandbox.ContainerIP)
+			_ = d.ClearEgressPolicy(sandbox.ContainerIP, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
+		}
 	}
 	if d.netns != nil {
 		_ = d.netns.Release(ctx, sandbox.ID)
+	}
+	if leftover {
+		d.forgetClaimLeftoverIfGone(ctx, sandbox.ID)
 	}
 	dockerpkg.RemoveReadySocketsForSandbox(d.cfg.ReadyDir, sandbox.ID)
 	// A warm-adopted sandbox's container keeps its park id, and so do its

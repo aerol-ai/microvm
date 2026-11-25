@@ -509,7 +509,9 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 		return err
 	}
 	if slot.ContainerIP != "" {
-		_ = d.ClearNetworkRules(slot.ContainerIP)
+		// Every rule of the address, not only the park block: a claim that
+		// failed half way may have put the request's lists there.
+		_ = d.clearAddressRules(slot.ContainerIP)
 	}
 	// Release the prepaid netns slot the park held (keyed by the park slot id,
 	// which equals ContainerID for a parked container). Without this, every park
