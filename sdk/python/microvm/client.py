@@ -31,6 +31,7 @@ from .types import (
     CreateAPITokenOptions,
     CreatedAPIToken,
     RevokeSandboxTokensResult,
+    RuntimeInfo,
     SandboxToken,
     WhoAmI,
     BuildImagePushOptions,
@@ -2187,6 +2188,17 @@ class _MicroVMCore:
         ``client.tokens.create/list/revoke``."""
         return self._tokens_class(self)
 
+    @property
+    def runtimes(self) -> Any:
+        """The runtimes a create can ask for here: ``client.runtimes.list()``."""
+        return self._runtimes_class(self)
+
+    def _op_list_runtimes(self):
+        # A read that changes nothing, so the transport's retries are safe.
+        payload = (yield _io("_do_json", "GET", self._versioned("/runtimes"), None)) or {}
+        runtimes = payload.get("runtimes") if isinstance(payload, dict) else None
+        return [_from_api_runtime(r) for r in runtimes or [] if isinstance(r, dict)]
+
     def _op_exec(self, sandbox_id: str, request: ExecRequest):
         # Not idempotent: a re-sent POST runs the user's command again, so a
         # timeout or reset after the request went out surfaces instead of
@@ -2776,6 +2788,7 @@ class MicroVM(_MicroVMCore):
 
     _sandbox_class: Any = None  # Sandbox; set below, after the class exists
     _tokens_class: Any = None  # Tokens; likewise
+    _runtimes_class: Any = None  # Runtimes; likewise
 
     def _run(self, op: Any) -> Any:
         """Drives an op: each I/O it yields runs on this client's blocking
@@ -3918,8 +3931,27 @@ class Tokens:
         return self._client._run(self._client._op_revoke_api_token(token_id))
 
 
+class Runtimes:
+    """The runtimes a create can ask for, reached as ``client.runtimes``.
+    Any caller that may read sandboxes may list them."""
+
+    def __init__(self, client: MicroVM) -> None:
+        self._client = client
+
+    @_timed
+    def list(self, *, timeout: Optional[float] = None) -> List[RuntimeInfo]:
+        """Every runtime name a create accepts, with what it can do
+        (``features``, ``limits``) and whether this deployment offers it now
+        (``available``). Pick an available one and pass its ``name`` as
+        ``runtime`` on create. ``nodes`` (how many nodes offer it) is sent
+        to fleet admins only; nobody sees node names. A read, so it is safe
+        to retry."""
+        return self._client._run(self._client._op_list_runtimes())
+
+
 MicroVM._sandbox_class = Sandbox
 MicroVM._tokens_class = Tokens
+MicroVM._runtimes_class = Runtimes
 
 def _from_api_whoami(payload: Dict[str, Any]) -> WhoAmI:
     principal = payload.get("principal") or {}
@@ -3957,6 +3989,35 @@ def _from_api_revoke_sandbox_tokens(payload: Dict[str, Any]) -> RevokeSandboxTok
         "sandboxID": str(payload.get("sandbox_id") or ""),
         "tokensNotBefore": str(payload.get("tokens_not_before") or ""),
     }
+
+
+def _from_api_runtime(payload: Dict[str, Any]) -> RuntimeInfo:
+    features = payload.get("features")
+    if not isinstance(features, dict):
+        features = {}
+    result: RuntimeInfo = {
+        "name": str(payload.get("name") or ""),
+        "isolation": str(payload.get("isolation") or ""),
+        "features": {
+            "snapshots": bool(features.get("snapshots", False)),
+            "pause": bool(features.get("pause", False)),
+            "moves": str(features.get("moves") or ""),
+            "warmPool": str(features.get("warm_pool") or ""),
+            "confidential": bool(features.get("confidential", False)),
+        },
+        "available": bool(payload.get("available", False)),
+    }
+    if payload.get("backend"):
+        result["backend"] = str(payload["backend"])
+    limits = payload.get("limits")
+    if isinstance(limits, dict):
+        result["limits"] = {}
+        if limits.get("max_checkpoint_memory_mb"):
+            result["limits"]["maxCheckpointMemoryMB"] = int(limits["max_checkpoint_memory_mb"])
+    # A count of 0 is still sent to fleet admins, so test for presence.
+    if payload.get("nodes") is not None:
+        result["nodes"] = int(payload["nodes"])
+    return result
 
 
 def _from_api_api_token(payload: Dict[str, Any]) -> APIToken:

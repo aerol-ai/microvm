@@ -103,7 +103,7 @@ func (a *app) verbGroups() []verbGroup {
 		}},
 		{"Manage sandboxes", []verb{
 			{"list", "List sandboxes", listHelp, runList},
-			{"get", "List or show sandboxes, snapshots, tokens or nodes", getHelp, runGet},
+			{"get", "List or show sandboxes, snapshots, tokens, nodes or runtimes", getHelp, runGet},
 			{"create", "Create a sandbox, or return the existing one with that name", createHelp, runCreate},
 			{"start", "Start stopped sandboxes", startHelp, runStart},
 			{"stop", "Stop sandboxes (files are kept)", stopHelp, runStop},

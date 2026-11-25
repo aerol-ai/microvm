@@ -32,6 +32,13 @@ concurrency:
 permissions:
   contents: read
 
+# The Prometheus release whose promtool checks the alert rules, pinned once
+# for both jobs that install it: go-tests (setup/prometheus) and kubernetes
+# (the chart's rules).
+env:
+  PROMETHEUS_VERSION: "3.5.0"
+  PROMETHEUS_SHA256: e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a
+
 jobs:
   paths:
     runs-on: ubuntu-latest
@@ -126,6 +133,10 @@ jobs:
               # cmd/aerolvm's tests check the evidence pack lists exactly the
               # rules `aerolvm k8s verify` checks (P7).
               - 'charts/aerolvm/EVIDENCE.md'
+              # go-tests (rest) runs setup/'s alert rule and dashboard tests,
+              # which compare the chart's copies of setup alerts.
+              - 'setup/**'
+              - 'charts/aerolvm/monitoring/**'
             go_sdk:
               - 'sdk/go/**'
               - 'go.mod'
@@ -270,6 +281,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential softhsm2
 
+      # promtool for setup/prometheus's rule unit tests.
+      - name: Install promtool
+        if: matrix.group == 'rest'
+        run: |
+          curl -fsSL -o prometheus.tgz "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          echo "${PROMETHEUS_SHA256}  prometheus.tgz" | sha256sum -c -
+          tar -xzf prometheus.tgz "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          sudo install -m 0755 "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+
       - name: Run unit tests with coverage
         env:
           AEROLVM_SCALE_GATES: "1"
@@ -283,6 +303,20 @@ jobs:
           # shellcheck disable=SC2086
           scripts/go-test-split.sh -count=1 -timeout 20m -- $PACKAGES
           go tool cover -func=coverage.out | tail -n 1
+
+      # The alert rules and dashboards in setup/ (sandboxd-alerts.yml, the
+      # Grafana dashboards). They sit outside the packages above, and the
+      # kubernetes job runs only the chart's tests (^TestKubernetesChart),
+      # with its pinned Helm. Before this step no pull request ran them,
+      # and the root helper alert's promtool tests skipped everywhere.
+      # AEROLVM_CHART_TOOLS=require fails a test that cannot find promtool
+      # instead of skipping it. It runs even when the step above failed.
+      - name: Alert rules and dashboards (setup/)
+        if: ${{ !cancelled() && matrix.group == 'rest' }}
+        env:
+          AEROLVM_CHART_TOOLS: require
+          PROMTOOL: /usr/local/bin/promtool
+        run: go test -count=1 -skip '^TestKubernetesChart' -v ./setup/...
 
       # The confined WASM worker end to end (worker uid, no_new_privs, the
       # seccomp filter, its own PID namespace) and the worker fence (an
@@ -998,10 +1032,10 @@ jobs:
           echo "aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind" | sha256sum -c -
           sudo install -m 0755 kind /usr/local/bin/kind
           # promtool, for the chart's alert rules (P6, P9).
-          curl -fsSL -o prometheus.tgz https://github.com/prometheus/prometheus/releases/download/v3.5.0/prometheus-3.5.0.linux-amd64.tar.gz
-          echo "e811827af26d822afb09a4f28314f61b618b12cff5369835a67f674d8b46f39a  prometheus.tgz" | sha256sum -c -
-          tar -xzf prometheus.tgz prometheus-3.5.0.linux-amd64/promtool
-          sudo install -m 0755 prometheus-3.5.0.linux-amd64/promtool /usr/local/bin/promtool
+          curl -fsSL -o prometheus.tgz "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+          echo "${PROMETHEUS_SHA256}  prometheus.tgz" | sha256sum -c -
+          tar -xzf prometheus.tgz "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool"
+          sudo install -m 0755 "prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
 
       - name: Lint and render the chart
         run: |

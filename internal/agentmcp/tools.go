@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -41,6 +42,14 @@ func (s *Server) register() {
 			Annotations: &mcp.ToolAnnotations{Title: "List sandboxes", ReadOnlyHint: true, OpenWorldHint: boolPtr(false)},
 		},
 	}, s.sandboxList)
+	addTool(s, toolSpec{
+		toolset: ToolsetCore, fleet: true, readOnly: true,
+		tool: &mcp.Tool{
+			Name:        "list_runtimes",
+			Description: "List the runtimes sandbox_create can use on this server, as {name, isolation, backend, available, features, limits}. Pick one with available true and pass its name as sandbox_create's runtime. isolation is what separates the sandbox from the server: container (shared kernel), user-space-kernel (gVisor) or hardware-vm (its own kernel). features say what it can do: snapshots, pause (a stop keeps memory), moves and warm_pool.",
+			Annotations: &mcp.ToolAnnotations{Title: "List runtimes", ReadOnlyHint: true, OpenWorldHint: boolPtr(false)},
+		},
+	}, s.listRuntimes)
 	addTool(s, toolSpec{
 		toolset: ToolsetCore, fleet: true,
 		tool: &mcp.Tool{
@@ -249,6 +258,51 @@ func (s *Server) sandboxList(ctx context.Context, in listIn) (listOut, string, e
 	out := listOut{Sandboxes: make([]SandboxRow, 0, len(items)), NextPageToken: next}
 	for _, sb := range items {
 		out.Sandboxes = append(out.Sandboxes, rowOf(sb))
+	}
+	return out, asJSON(out), nil
+}
+
+type listRuntimesIn struct{}
+
+// RuntimeRow is one runtime as list_runtimes shows it to the model. It
+// keeps what helps pick a runtime and drops the node count a fleet admin's
+// credential would add: the model never needs it, and a row should not
+// change with who runs the server.
+type RuntimeRow struct {
+	Name      string                   `json:"name"`
+	Isolation string                   `json:"isolation"`
+	Backend   string                   `json:"backend,omitempty"`
+	Available bool                     `json:"available"`
+	Features  sdktypes.RuntimeFeatures `json:"features"`
+	Limits    *sdktypes.RuntimeLimits  `json:"limits,omitempty"`
+}
+
+type listRuntimesOut struct {
+	Runtimes []RuntimeRow `json:"runtimes"`
+}
+
+// listRuntimes lists only the runtimes sandbox_create's enum takes
+// (MCPRuntimes), in the server's order, so every name it shows is one the
+// model can pass on. The server's tenant rules apply: the call carries the
+// caller's own credential.
+func (s *Server) listRuntimes(ctx context.Context, _ listRuntimesIn) (listRuntimesOut, string, error) {
+	runtimes, err := s.tools.Client().Runtimes().List(ctx)
+	if err != nil {
+		return listRuntimesOut{}, "", err
+	}
+	out := listRuntimesOut{Runtimes: make([]RuntimeRow, 0, len(MCPRuntimes))}
+	for _, rt := range runtimes {
+		if !slices.Contains(MCPRuntimes, rt.Name) {
+			continue
+		}
+		out.Runtimes = append(out.Runtimes, RuntimeRow{
+			Name:      rt.Name,
+			Isolation: rt.Isolation,
+			Backend:   rt.Backend,
+			Available: rt.Available,
+			Features:  rt.Features,
+			Limits:    rt.Limits,
+		})
 	}
 	return out, asJSON(out), nil
 }

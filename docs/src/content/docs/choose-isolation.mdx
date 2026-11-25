@@ -63,6 +63,92 @@ The start times come from our AWS test servers. Each runtime was measured on a d
 
 More options are planned. This page lists only what you can use today.
 
+## See which runtimes your server offers
+
+Ask the server before you create. `runtimes.list()` returns every runtime, what it can do, and whether this server or cluster offers it right now. It only reads, so it is safe to call as often as you like.
+
+<Tabs syncKey="lang">
+  <TabItem label="TypeScript">
+    ```ts
+    import { MicroVM } from "@aerol-ai/aerolvm-sdk";
+
+    const client = new MicroVM(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    for (const runtime of await client.runtimes.list()) {
+      if (runtime.available) {
+        console.log(runtime.name, runtime.isolation, "snapshots:", runtime.features.snapshots);
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Python">
+    ```python
+    from microvm import MicroVM
+
+    client = MicroVM()  # reads SB_API_URL and SB_PAT_TOKEN
+
+    for runtime in client.runtimes.list():
+        if runtime["available"]:
+            print(runtime["name"], runtime["isolation"], "snapshots:", runtime["features"]["snapshots"])
+    ```
+  </TabItem>
+  <TabItem label="Go">
+    ```go
+    client, err := microvm.NewClient() // reads SB_API_URL and SB_PAT_TOKEN
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    runtimes, err := client.Runtimes().List(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    for _, runtime := range runtimes {
+        if runtime.Available {
+            fmt.Println(runtime.Name, runtime.Isolation, "snapshots:", runtime.Features.Snapshots)
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Rust">
+    ```rust
+    use aerolvm_sdk::Client;
+
+    let client = Client::new(None, None)?; // reads SB_API_URL and SB_PAT_TOKEN
+
+    for runtime in client.runtimes().list()? {
+        if runtime.available {
+            println!("{} {} snapshots: {}", runtime.name, runtime.isolation, runtime.features.snapshots);
+        }
+    }
+    ```
+  </TabItem>
+  <TabItem label="Java">
+    ```java
+    MicroVMClient client = new MicroVMClient(); // reads SB_API_URL and SB_PAT_TOKEN
+
+    for (RuntimeInfo runtime : client.runtimes().list()) {
+        if (runtime.available) {
+            System.out.println(runtime.name + " " + runtime.isolation + " snapshots: " + runtime.features.snapshots);
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Each runtime in the list has:
+
+- **`name`**: the value to pass as `runtime` when you create a sandbox.
+- **`isolation`**: what keeps the sandbox apart. One of `container`, `user-space-kernel` (gVisor), `hardware-vm`, `wasm` or `v8-isolate`.
+- **`backend`**: the hardware a VM runtime runs on, such as `kvm` for Firecracker. Empty for runtimes that are not VMs.
+- **`available`**: true when at least one server can run it now. Pick one of these.
+- **`features`**: what it can do. `snapshots` (save it as an image), `pause` (a stop keeps memory), `moves` (what it keeps when the cluster moves it to another server: `memory`, `disk` or `none`), `warm_pool` (how a create can start warm: `snapshot`, `parked` or `none`) and `confidential`.
+- **`limits`**: fixed limits, when it has any. WebAssembly, for example, can restore at most 1,024 MiB of memory from a checkpoint.
+
+Each SDK spells the names its own way, such as `warmPool` in TypeScript and `warm_pool` in Rust. Anyone who can read sandboxes can ask. The list never names a server. Only fleet admins also get `nodes`, the number of servers that offer each runtime.
+
+From a terminal, `aerolvm get runtimes` prints the same list as a table (see [CLI](/cli/#kubectl-style-commands)). AI agents get it from the MCP tool `list_runtimes` (see [MCP](/mcp/#what-the-agent-can-do)).
+
 ## Pick a runtime for one sandbox
 
 Set `runtime` when you create the sandbox. Leave it out to get the server's default, which is `docker` unless your operator changed it.
@@ -218,7 +304,7 @@ These two do not start from a container image. They run a module, so you also pa
 
 ## When the runtime is not available
 
-A server runs only the runtimes its operator turned on. If you ask for one it does not run, the create fails and nothing is started. The error names the problem, for example:
+A server runs only the runtimes its operator turned on. Call `runtimes.list()` first to see them. If you ask for one it does not run, the create fails and nothing is started. The error names the problem, for example:
 
 - `runtime "gvisor" not supported on this host`
 - `runtime "firecracker" requires SB_ENABLE_FIRECRACKER=true`

@@ -134,6 +134,7 @@ If you know `kubectl`, the same words work. `get`, `describe` and `delete` take 
 | See a sandbox in detail | `aerolvm describe sb build-box` |
 | Delete a sandbox | `aerolvm delete sb build-box` |
 | Snapshots and API tokens | `aerolvm get snapshots`, `aerolvm get tokens` |
+| See which runtimes this server offers, and what each can do | `aerolvm get runtimes` (`-o wide` adds more columns) |
 | Open a shell, like `kubectl exec -it` | `aerolvm exec -it build-box` |
 | List the kinds and their short names | `aerolvm api-resources` |
 
@@ -462,6 +463,7 @@ Every sandbox the CLI creates gets the tag `aerolvm.created_by=cli`. Find them w
 
 ### Sandbox types
 
+- **Which runtimes you can use.** `aerolvm get runtimes` lists every runtime, its kind of isolation, and `AVAILABLE` when this server or cluster offers it now. Pass one of those names to `aerolvm create --runtime`. Fleet admins also see `NODES` with `-o wide`: how many servers offer each one. See [Choose a runtime](/choose-isolation/).
 - **WebAssembly sandboxes** run a command and print the output when it ends. They pass no input, and `-i`, `-t` and `shell` are refused. `cp -r` is refused too: a WebAssembly sandbox has no `tar`.
 - **V8 isolate sandboxes** run one request handler, with no shell and no files. `shell`, `exec`, `cp` and `ls` fail with `unsupported_runtime`. Call the handler from an SDK instead. See [V8 isolate](/isolate-sandbox/).
 
