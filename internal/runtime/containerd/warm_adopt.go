@@ -189,9 +189,9 @@ func (d *Driver) tryWarmAdopt(ctx context.Context, req models.CreateSandboxReque
 // 503 with Retry-After (apihttp Classify), so the caller retries, and in a
 // cluster the retry can go to another node. A retry here that takes a
 // warm slot meets the container by its sandbox label and has it removed as
-// the sandbox's leftover first (service create_leftover.go). One that goes
-// straight to a cold create before the pool's retry has removed the
-// container is not stopped here.
+// the sandbox's leftover first (service create_leftover.go). One that finds
+// no free slot and would go cold is refused the same way until the pool's
+// retry has removed the container (claim_leftovers.go).
 var errClaimLeftover = fmt.Errorf("an earlier attempt to create this sandbox on this node is still being cleaned up; retry shortly (%w)", capacity.ErrCapacityExceeded)
 
 // claimOwnerBackTimeout bounds moving a failed claim's netns owner back to
@@ -231,7 +231,9 @@ var claimOwnerBackTimeout = 5 * time.Second
 // only, and clears no rules, since by then the address may carry the
 // sandbox's own rules, or another sandbox's. The slot and its rules are
 // left to the sandbox id's own release: its leftover removal on a retry of
-// the create (Destroy), or the boot reconcile once no container holds it.
+// the create (Destroy), or, once the retry has removed the container and
+// no container of the sandbox is left, the driver's own
+// (finishClaimLeftover).
 func (d *Driver) discardClaimedSlot(ctx context.Context, slot *containerdpool.ParkedSlot, sandboxID string, cause error) error {
 	var ownerErr error
 	if d.netns != nil && slot.ID != "" && slot.ID != sandboxID {
@@ -248,6 +250,8 @@ func (d *Driver) discardClaimedSlot(ctx context.Context, slot *containerdpool.Pa
 		}
 		kept := *slot
 		kept.ContainerIP = ""
+		// Before the retry list gets it: the retry may run at once.
+		d.claimLeftovers.remember(slot.ID, sandboxID, slot.ContainerIP)
 		d.warmPool.RetainFailedDestroy(&kept, err)
 		d.logger.Warn("containerd warm claim: the failed claim's container could not be removed and its network namespace stays under the sandbox id; refusing the create instead of going cold",
 			"sandbox_id", sandboxID, "slot_id", slot.ID, "claim_error", cause, "error", err, "owner_error", ownerErr)
@@ -523,7 +527,10 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 	// files, FIFOs and its name for the park socket) go too. A no-op in
 	// single mode.
 	d.releaseHelperFiles(ctx, parkKey)
-	return nil
+	// A failed claim's leftover: the namespace its sandbox id still holds
+	// goes too, once it is empty (claim_leftovers.go). An error keeps the
+	// slot on the pool's retry list.
+	return d.finishClaimLeftover(ctx, parkKey)
 }
 
 // deleteParkedContainer kills a parked container's task and deletes the

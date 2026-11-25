@@ -108,6 +108,14 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 				"sandbox_id", sandboxID, "error", warmErr)
 		}
 	}
+	// An earlier claim for this id failed twice, and its container may
+	// still run in the namespace the id holds, which the netns step below
+	// would hand this create. Refused until the pool's retry has removed
+	// that container (claim_leftovers.go). One atomic load when no claim
+	// has failed that way.
+	if d.refusesClaimLeftover(sandboxID) {
+		return nil, errClaimLeftover
+	}
 
 	var (
 		netnsPath        string

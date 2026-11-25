@@ -65,3 +65,33 @@ func TestRuntimeHandoffProvisionFailureNoLeak(t *testing.T) {
 	}
 	_ = time.Now()
 }
+
+// Address names the address of the slot a sandbox holds, and "" once it
+// holds none: the containerd driver frees a failed claim's slot only while
+// the sandbox still holds the address it remembered.
+func TestRuntimeHandoffAddress(t *testing.T) {
+	ctx := context.Background()
+	if ip, err := (*RuntimeHandoff)(nil).Address(ctx, "sb-1"); ip != "" || err != nil {
+		t.Fatalf("nil handoff: %q %v", ip, err)
+	}
+	h := NewRuntimeHandoff(testPool(t, 2), NewFakeHost())
+	if ip, err := h.Address(ctx, "sb-1"); ip != "" || err != nil {
+		t.Fatalf("before provision: %q %v", ip, err)
+	}
+	_, want, err := h.Provision(ctx, "sb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip, err := h.Address(ctx, "sb-1"); ip != want || err != nil {
+		t.Fatalf("held: %q %v, want %q", ip, err, want)
+	}
+	if err := h.Release(ctx, "sb-1"); err != nil {
+		t.Fatal(err)
+	}
+	if ip, err := h.Address(ctx, "sb-1"); ip != "" || err != nil {
+		t.Fatalf("after release: %q %v", ip, err)
+	}
+	if _, err := h.Address(ctx, " "); err == nil {
+		t.Fatal("an empty sandbox id was not refused")
+	}
+}
