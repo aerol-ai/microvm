@@ -103,6 +103,21 @@ func (h *RuntimeHandoff) Release(ctx context.Context, sandboxID string) error {
 	return nil
 }
 
+// Address is the address of the slot sandboxID holds, "" when it holds
+// none. Read-only: the containerd driver asks it before it frees a slot a
+// failed warm claim left under the sandbox id, so it frees only a slot
+// that still has the address it remembered.
+func (h *RuntimeHandoff) Address(ctx context.Context, sandboxID string) (string, error) {
+	if h == nil || h.pool == nil {
+		return "", nil
+	}
+	slot, err := h.pool.Get(ctx, sandboxID)
+	if err != nil || slot == nil {
+		return "", err
+	}
+	return slot.ContainerIP, nil
+}
+
 // releaseAfterGet is set only by tests, to change the slot's ownership in the
 // window between Release's first read and its lock.
 var releaseAfterGet func(slotID string)

@@ -110,8 +110,9 @@ func eachMode(t *testing.T, run func(t *testing.T, split bool)) {
 // the delete both failed, so the park container still runs in a namespace
 // sb-a now holds. The pool's retry then removes the container and the
 // park's files only. It clears no rules on the address (by then sb-a's
-// own, or another sandbox's), and it frees no netns slot: sb-a keeps the
-// slot for its own release.
+// own, or another sandbox's), and, with sb-a running in it again, it frees
+// no netns slot: sb-a keeps the slot for its own release
+// (claim_leftovers_test.go covers the empty namespace).
 func TestClaimDoubleFailureRetryLeavesTheSandboxAddressAlone(t *testing.T) {
 	eachMode(t, func(t *testing.T, split bool) {
 		r := newDoubleFailureRig(t, split)
@@ -127,11 +128,15 @@ func TestClaimDoubleFailureRetryLeavesTheSandboxAddressAlone(t *testing.T) {
 			t.Fatalf("pending %d, released %v: want the slot kept for retry, still charged", n, r.released)
 		}
 
-		// A later create of sb-a holds that address with its own rules;
-		// containerd answers again and the pool retries the teardown.
+		// A later create of sb-a holds that address with its own rules,
+		// and runs there; containerd answers again and the pool retries the
+		// teardown.
 		if _, ip, err := r.h.Provision(ctx, "sb-a"); err != nil || ip != r.parkIP {
 			t.Fatalf("sb-a's namespace %s, %v; want %s", ip, err, r.parkIP)
 		}
+		r.tr.mu.Lock()
+		r.tr.containers["sb-a"] = &fakeContainer{id: "sb-a", labels: map[string]string{sandboxIDLabelKey: "sb-a"}}
+		r.tr.mu.Unlock()
 		mark := len(r.fw.recorded())
 		r.busy.Store(false)
 		r.pool.Close()

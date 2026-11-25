@@ -119,6 +119,9 @@ type Driver struct {
 
 	warmPool WarmPool
 	netns    NetnsHandoff
+	// claimLeftovers holds failed warm claims whose container the pool
+	// has not removed yet (claim_leftovers.go).
+	claimLeftovers claimLeftovers
 	// helper is the root helper in privilege mode split
 	// (privilege_split.go); nil in single mode. parts is its container
 	// parts (split_files.go), when the helper client has them.
