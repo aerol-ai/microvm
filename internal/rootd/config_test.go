@@ -853,6 +853,10 @@ func TestFirecrackerHostsFromEnv(t *testing.T) {
 func TestFirecrackerHostsValidate(t *testing.T) {
 	good := FirecrackerHostsConfig{JailerBinary: "/j", FirecrackerBinary: "/f", ChrootBase: "/srv/jailer", UID: 1500, GID: 1500,
 		Kernel: "/k", Mkfs4Bin: "/m", Shim: "/s", AgentUID: 65531, SocketWait: time.Second, TapBase: "172.16.0.0/20", TapPoolSize: 256}
+	// asInt makes an id past 32 bits without a constant that would not
+	// compile on a 32-bit build. There it wraps (to root, to the agent, or
+	// below zero), and every case must still be refused.
+	asInt := func(n int64) int { return int(n) }
 	for _, tc := range []struct {
 		name string
 		edit func(*FirecrackerHostsConfig)
@@ -865,9 +869,9 @@ func TestFirecrackerHostsValidate(t *testing.T) {
 		{"no socket wait", func(c *FirecrackerHostsConfig) { c.SocketWait = 0 }},
 		{"a TAP base too small", func(c *FirecrackerHostsConfig) { c.TapBase = "172.16.0.0/28" }},
 		// Ids that would wrap in a uint32: onto root, onto the agent.
-		{"a jailer uid that wraps onto root", func(c *FirecrackerHostsConfig) { c.UID = 1 << 32 }},
-		{"a jailer uid that wraps onto the agent", func(c *FirecrackerHostsConfig) { c.UID = 1<<32 + 65531 }},
-		{"a jailer gid that wraps onto root", func(c *FirecrackerHostsConfig) { c.GID = 1 << 32 }},
+		{"a jailer uid that wraps onto root", func(c *FirecrackerHostsConfig) { c.UID = asInt(1 << 32) }},
+		{"a jailer uid that wraps onto the agent", func(c *FirecrackerHostsConfig) { c.UID = asInt(1<<32 + 65531) }},
+		{"a jailer gid that wraps onto root", func(c *FirecrackerHostsConfig) { c.GID = asInt(1 << 32) }},
 		{"an agent uid past an int on a 32-bit build", func(c *FirecrackerHostsConfig) { c.AgentUID = 1 << 31 }},
 	} {
 		c := good

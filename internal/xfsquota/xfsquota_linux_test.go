@@ -39,10 +39,10 @@ func TestDiskQuotaABI(t *testing.T) {
 	// asm-generic/ioctl.h builds them (amd64 and arm64 share it).
 	ioc := func(dir, nr, size uintptr) uintptr { return dir<<30 | size<<16 | 'X'<<8 | nr }
 	if got := ioc(2, 31, unsafe.Sizeof(fsxattr{})); got != fsIocFsgetxattr {
-		t.Errorf("FS_IOC_FSGETXATTR = %#x, want %#x", fsIocFsgetxattr, got)
+		t.Errorf("FS_IOC_FSGETXATTR = %#x, want %#x", uintptr(fsIocFsgetxattr), got)
 	}
 	if got := ioc(1, 32, unsafe.Sizeof(fsxattr{})); got != fsIocFssetxattr {
-		t.Errorf("FS_IOC_FSSETXATTR = %#x, want %#x", fsIocFssetxattr, got)
+		t.Errorf("FS_IOC_FSSETXATTR = %#x, want %#x", uintptr(fsIocFssetxattr), got)
 	}
 	if got := qcmd(qXSetQLim, prjQuota); got != 0x580402 {
 		t.Errorf("QCMD(Q_XSETQLIM, PRJQUOTA) = %#x, want 0x580402", got)
