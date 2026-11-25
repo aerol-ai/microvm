@@ -272,7 +272,8 @@ func testHostsConfig(t testing.TB) HostsConfig {
 		Workerd: &WorkerdHostsConfig{
 			Jail: isolate.RootJail{ChrootBase: filepath.Join(dir, "jail"), WorkerdPath: "/usr/local/bin/workerd",
 				UID: 1000, GID: 1000, AgentUID: 65531, SeccompMode: isolate.SeccompEnforce, ShimPath: "/usr/local/bin/aerolvm-rootd"},
-			PidsMax: 512,
+			PidsMax:  512,
+			MaxJails: defaultMaxV8Jails,
 		},
 	}
 }

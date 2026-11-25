@@ -35,10 +35,22 @@ type workerdHosts struct {
 	// prepareBase and checkBase stand in for the kernel in tests.
 	prepareBase func() error
 	checkBase   func(string) error
+
+	// maxJails bounds the jails at once: a broken agent could otherwise
+	// name new groups without end, each two mounts in the node's table.
+	// making holds the groups whose jail is being made, which their
+	// folder may not show yet; jailsMu orders the count with them.
+	maxJails int
+	jailsMu  sync.Mutex
+	making   map[string]bool
+	// groups lists the jails there are (the jail's Groups); tests stand
+	// one in.
+	groups func() ([]string, error)
 }
 
 func newWorkerdHosts(c *WorkerdHostsConfig, logPath string) *workerdHosts {
-	w := &workerdHosts{jail: c.Jail, pidsMax: c.PidsMax, logPath: logPath}
+	w := &workerdHosts{jail: c.Jail, pidsMax: c.PidsMax, logPath: logPath, maxJails: c.MaxJails, making: map[string]bool{}}
+	w.groups = w.jail.Groups
 	w.prepareBase = w.jail.PrepareBase
 	w.checkBase = func(dir string) error {
 		fd, err := openFolder(dir)
@@ -81,6 +93,11 @@ func (w *workerdHosts) prepare(id string, running bool, _ *rootdpb.PrepareHostRe
 	if err := w.ensureBase(); err != nil {
 		return nil, err
 	}
+	done, err := w.reserveJail(id)
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	// A jail whose workerd is gone is made again, never reused: its run
 	// folder may hold what that workerd left there.
 	if err := w.jail.Teardown(id); err != nil {
@@ -91,6 +108,42 @@ func (w *workerdHosts) prepare(id string, running bool, _ *rootdpb.PrepareHostRe
 		return nil, err
 	}
 	return &rootdpb.PrepareHostResponse{RunDir: run}, nil
+}
+
+// reserveJail makes room for id's jail under maxJails, counting every
+// other jail there is or is being made: those of running groups, the warm
+// pool's, and any a stopped group left. id's own jail, if there is one,
+// is made again in its place and adds none. A full node is refused
+// ResourceExhausted with no refusal reason: a limit, not a broken
+// request, so the agent answers its caller to retry (or place the sandbox
+// elsewhere) once a group stops. done ends the reservation once the jail
+// is on disk, or is not.
+func (w *workerdHosts) reserveJail(id string) (done func(), err error) {
+	w.jailsMu.Lock()
+	defer w.jailsMu.Unlock()
+	have, err := w.groups()
+	if err != nil {
+		return nil, fmt.Errorf("root helper: list the V8 jails: %w", err)
+	}
+	others := map[string]bool{}
+	for _, g := range have {
+		others[g] = true
+	}
+	for g := range w.making {
+		others[g] = true
+	}
+	delete(others, id)
+	if len(others) >= w.maxJails {
+		return nil, &fileError{code: codes.ResourceExhausted, msg: fmt.Sprintf(
+			"root helper: this node keeps %d V8 jails, its limit (SB_ROOTD_ISOLATE_MAX_JAILS=%d); one is freed when a V8 group stops",
+			len(others), w.maxJails)}
+	}
+	w.making[id] = true
+	return func() {
+		w.jailsMu.Lock()
+		delete(w.making, id)
+		w.jailsMu.Unlock()
+	}, nil
 }
 
 func (w *workerdHosts) command(_ context.Context, id string, _ *rootdpb.SpawnHostRequest) (*exec.Cmd, func(), error) {

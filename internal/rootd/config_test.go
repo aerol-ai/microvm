@@ -89,6 +89,9 @@ func TestConfigFromEnv(t *testing.T) {
 			{Proto: "tcp", Port: 80}, {Proto: "tcp", Port: 443}}},
 		// sandboxd's host-port range and redirect listener, its defaults.
 		HostPorts: rootpolicy.HostPortBounds{RangeStart: 22000, RangeEnd: 23000, RedirectPort: 21215},
+		// sandboxd's own folders, its defaults: run, mounts, credentials,
+		// data.
+		AgentDirs: []string{"/var/lib/sandboxd/containerd", "/var/lib/sandboxd/mounts", "/run/sandboxd", "/var/lib/sandboxd"},
 	}
 	for _, tc := range []struct {
 		name string
@@ -129,6 +132,7 @@ func TestConfigFromEnv(t *testing.T) {
 			p.RunscConfigPaths = []string{"/data/rootd/runsc/config.toml", "/data/rootd/runsc/restore.toml"}
 			c.Files = FileDirs{Hosts: "/data/rootd/hosts", Ready: "/run/rootd-ready", Runsc: "/data/rootd/runsc", AgentReady: "/run/sbd/docker/ready",
 				Toolbox: "/opt/aerolvm/toolboxd", ImageRoot: "/data/rootd/imageroot"}
+			c.AgentDirs = []string{"/data/ctr", "/data/mounts", "/run/sbd", "/data/state"}
 		}},
 		// M1 PR 7: the agent's toolbox copy sits in a folder it writes (the
 		// chart's); the helper keeps its own copy, which specs bind.
@@ -618,7 +622,8 @@ func TestHostsFromEnv(t *testing.T) {
 		Workerd: &WorkerdHostsConfig{
 			Jail: isolate.RootJail{ChrootBase: "/srv/isolate-jail", WorkerdPath: "/usr/local/bin/workerd", UID: 2000, GID: 2001,
 				AgentUID: DefaultAgentUID, Jitless: true, SeccompMode: isolate.SeccompAudit, ShimPath: "/usr/local/bin/aerolvm-rootd"},
-			PidsMax: 300,
+			PidsMax:  300,
+			MaxJails: defaultMaxV8Jails,
 		},
 	}
 	if cfg.Hosts.CgroupParent != want.CgroupParent || cfg.Hosts.LogPath != want.LogPath || *cfg.Hosts.Workerd != *want.Workerd {
@@ -629,6 +634,44 @@ func TestHostsFromEnv(t *testing.T) {
 		"SB_CONTAINERD_CGROUP_PARENT": "/a", "SB_HOST_PROCESS_CGROUP_PARENT": "/b"}))
 	if err != nil || cfg.Hosts.CgroupParent != "/b" {
 		t.Fatalf("parent %q, %v", cfg.Hosts.CgroupParent, err)
+	}
+	// The V8 jail limit: the default, a value of the operator's, and
+	// values that are no limit.
+	for _, tc := range []struct {
+		v    string
+		want int
+		err  string
+	}{{"", defaultMaxV8Jails, ""}, {"8", 8, ""}, {"32768", 32768, ""}, {"x", 0, "SB_ROOTD_ISOLATE_MAX_JAILS"},
+		{"0", 0, "want 1 to 32768"}, {"-1", 0, "want 1 to 32768"}, {"32769", 0, "want 1 to 32768"}} {
+		cfg, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true", "SB_ROOTD_ISOLATE_MAX_JAILS": tc.v}))
+		if tc.err != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("SB_ROOTD_ISOLATE_MAX_JAILS=%q: %v, want an error naming %q", tc.v, err, tc.err)
+			}
+			continue
+		}
+		if err != nil || cfg.Hosts.Workerd.MaxJails != tc.want {
+			t.Errorf("SB_ROOTD_ISOLATE_MAX_JAILS=%q: %v, want %d jails", tc.v, err, tc.want)
+		}
+	}
+	// Root links, mounts and removes in the jail base, and reads and
+	// copies workerd: neither may be in a folder the agent writes.
+	for _, tc := range []struct{ k, v string }{
+		{"SB_ISOLATE_JAIL_CHROOT_BASE", "/var/lib/sandboxd/isolate-jail"},
+		{"SB_ISOLATE_WORKERD_PATH", "/var/lib/sandboxd/bin/workerd"},
+		{"SB_ISOLATE_WORKERD_PATH", "/run/sandboxd/workerd"},
+	} {
+		_, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true", tc.k: tc.v}))
+		if err == nil || !strings.Contains(err.Error(), tc.k) || !strings.Contains(err.Error(), "which the agent writes") {
+			t.Errorf("%s=%s: %v, want a refusal naming it", tc.k, tc.v, err)
+		}
+	}
+	// Nor through a merged /usr's link.
+	for _, tc := range []struct{ k, v string }{{"SB_ISOLATE_WORKERD_PATH", "/bin/workerd"}} {
+		_, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true", tc.k: tc.v}))
+		if err == nil || !strings.Contains(err.Error(), tc.k) || !strings.Contains(err.Error(), "under /bin") {
+			t.Errorf("%s=%s: %v, want a refusal naming it", tc.k, tc.v, err)
+		}
 	}
 	selfExecutable = func() (string, error) { return "", errors.New("no /proc/self/exe") }
 	if _, err := ConfigFromEnv(env(map[string]string{"SB_ROOTD_SOCKET_GROUP": gid, "SB_ENABLE_ISOLATE": "true"})); err == nil ||
@@ -766,7 +809,7 @@ func TestFirecrackerHostsFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := FirecrackerHostsConfig{JailerBinary: "/usr/local/bin/jailer", FirecrackerBinary: "/usr/local/bin/firecracker",
-		ChrootBase: "/srv/jailer", UID: 1500, GID: 1501, Kernel: "/var/lib/aerolvm-rootd/vmlinux", Mkfs4Bin: "/sbin/mkfs.ext4",
+		ChrootBase: "/srv/jailer", UID: 1500, GID: 1501, Kernel: "/var/lib/aerolvm-rootd/vmlinux", Mkfs4Bin: "/usr/sbin/mkfs.ext4",
 		Shim: "/usr/local/bin/aerolvm-rootd", AgentUID: 65531, SocketWait: 5 * time.Second, IPBinary: "/usr/sbin/ip",
 		TapBase: "172.16.0.0/20", TapPoolSize: 256}
 	if *c != want {
@@ -787,6 +830,15 @@ func TestFirecrackerHostsFromEnv(t *testing.T) {
 		{"a pool size that is no number", map[string]string{"SB_FIRECRACKER_TAP_POOL_SIZE": "x"}, "SB_FIRECRACKER_TAP_POOL_SIZE"},
 		{"a jailer flag that is no bool", map[string]string{"SB_FIRECRACKER_USE_JAILER": "maybe"}, "SB_FIRECRACKER_USE_JAILER"},
 		{"a kernel in the agent's folder (sandboxd's default)", map[string]string{"SB_FIRECRACKER_KERNEL": ""}, "SB_FIRECRACKER_KERNEL"},
+		// Root runs each of these (the jailer copies firecracker).
+		{"a jailer in the agent's folder", map[string]string{"SB_JAILER_BINARY": "/var/lib/sandboxd/bin/jailer"}, "SB_JAILER_BINARY"},
+		{"a firecracker in the agent's folder", map[string]string{"SB_FIRECRACKER_BINARY": "/run/sandboxd/firecracker"}, "SB_FIRECRACKER_BINARY"},
+		{"a mkfs.ext4 in the agent's folder", map[string]string{"SB_FIRECRACKER_MKFS_BIN": "/var/lib/sandboxd/mkfs.ext4"}, "SB_FIRECRACKER_MKFS_BIN"},
+		{"an ip in the agent's folder", map[string]string{"SB_FIRECRACKER_IP_BINARY": "/var/lib/sandboxd/ip"}, "SB_FIRECRACKER_IP_BINARY"},
+		// sandboxd's own default, through a merged /usr's link.
+		{"mkfs.ext4 through /sbin", map[string]string{"SB_FIRECRACKER_MKFS_BIN": "/sbin/mkfs.ext4"}, "SB_FIRECRACKER_MKFS_BIN: /sbin/mkfs.ext4 is under /sbin"},
+		{"ip through /bin", map[string]string{"SB_FIRECRACKER_IP_BINARY": "/bin/ip"}, "SB_FIRECRACKER_IP_BINARY: /bin/ip is under /bin"},
+		{"a jailer through /lib", map[string]string{"SB_JAILER_BINARY": "/lib/firecracker/jailer"}, "SB_JAILER_BINARY"},
 	} {
 		if _, err := read(tc.m); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)
@@ -826,7 +878,7 @@ func TestFirecrackerHostsValidate(t *testing.T) {
 	}
 	// The jailer shares no user with the V8 jail or the WASM worker.
 	h := HostsConfig{LogPath: "/var/lib/aerolvm-rootd/hosts.log", Firecracker: &good,
-		Workerd: &WorkerdHostsConfig{Jail: testHostsConfig(t).Workerd.Jail, PidsMax: 512}}
+		Workerd: &WorkerdHostsConfig{Jail: testHostsConfig(t).Workerd.Jail, PidsMax: 512, MaxJails: defaultMaxV8Jails}}
 	h.Workerd.Jail.UID = good.UID
 	if err := h.validate(); err == nil || !strings.Contains(err.Error(), "V8 jail") {
 		t.Errorf("the jailer as the V8 jail's user: %v", err)

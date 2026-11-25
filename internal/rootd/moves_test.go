@@ -638,6 +638,7 @@ func TestMovesFromEnv(t *testing.T) {
 		{"a size past int64", map[string]string{"SB_GVISOR_CHECKPOINT_MOVES": "true", "SB_ROOTD_MOVE_MAX_BYTES": "9223372036854775808"}, nil, "SB_ROOTD_MOVE_MAX_BYTES"},
 		{"a bad count", map[string]string{"SB_GVISOR_CHECKPOINT_MOVES": "true", "SB_ROOTD_MOVE_MAX_STAGED": "many"}, nil, "SB_ROOTD_MOVE_MAX_STAGED"},
 		{"runsc in the agent's folder", map[string]string{"SB_GVISOR_CHECKPOINT_MOVES": "true", "SB_ROOTD_RUNSC": "/var/lib/sandboxd/bin/runsc"}, nil, "which the agent writes"},
+		{"runsc through a merged /usr's link", map[string]string{"SB_GVISOR_CHECKPOINT_MOVES": "true", "SB_ROOTD_RUNSC": "/sbin/runsc"}, nil, "SB_ROOTD_RUNSC: /sbin/runsc is under /sbin"},
 		{"runsc's state in the agent's folder", map[string]string{"SB_GVISOR_CHECKPOINT_MOVES": "true", "SB_ROOTD_RUNSC_ROOT": "/var/lib/sandboxd"}, nil, "which the agent writes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

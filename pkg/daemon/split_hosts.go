@@ -8,10 +8,13 @@ import (
 	"math"
 	"os"
 
+	"google.golang.org/grpc/status"
+
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	wasmruntime "github.com/aerol-ai/microvm/internal/runtime/wasm"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/egresspolicy"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
 	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
@@ -49,7 +52,20 @@ type splitWorkerdLauncher struct{ h hostHelper }
 const workerdKind = rootdpb.HostKind_HOST_KIND_WORKERD
 
 func (l splitWorkerdLauncher) Prepare(ctx context.Context, group string) (string, error) {
-	return l.h.PrepareHost(ctx, workerdKind, group)
+	run, err := l.h.PrepareHost(ctx, workerdKind, group)
+	if errors.Is(err, rootclient.ErrBusy) {
+		// The helper keeps as many V8 jails as it may
+		// (SB_ROOTD_ISOLATE_MAX_JAILS): the node is full for V8 groups, as
+		// for a full slot pool, so the caller gets a capacity answer (503,
+		// retry), not the client's text for a busy helper.
+		msg := "the root helper keeps as many V8 jails as it may"
+		var gs interface{ GRPCStatus() *status.Status }
+		if errors.As(err, &gs) {
+			msg = gs.GRPCStatus().Message()
+		}
+		return "", fmt.Errorf("%w: %s", capacity.NewSlotPoolExhausted("V8 jails"), msg)
+	}
+	return run, err
 }
 
 func (l splitWorkerdLauncher) Start(ctx context.Context, group string, lim pkgisolate.Limits) (hostproc.Process, error) {

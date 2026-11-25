@@ -128,6 +128,10 @@ type Config struct {
 	// Moves is gVisor checkpoint moves (moves.go); nil when this node
 	// takes none, and the helper serves no move call.
 	Moves *MovesConfig
+	// AgentDirs are the agent's own folders (its run, mounts, credential
+	// and data folders): nothing root runs may be in one, nor be a link to
+	// a file in one (checkRootBinaries).
+	AgentDirs []string
 }
 
 // HostsConfig is what the helper starts host processes with (M1 PR 9),
@@ -183,7 +187,23 @@ type WorkerdHostsConfig struct {
 	// PidsMax is SB_ISOLATE_JAIL_PIDS_MAX: every group's pids limit, at
 	// most.
 	PidsMax uint32
+	// MaxJails is SB_ROOTD_ISOLATE_MAX_JAILS: how many V8 jails the helper
+	// keeps at once. Each is two tmpfs mounts in the node's mount table
+	// (on Kubernetes, the machine's too).
+	MaxJails int
 }
+
+// V8 jails: the default and the most SB_ROOTD_ISOLATE_MAX_JAILS may name.
+// A jail is a group: one per tenant (SB_ISOLATE_GROUP_GRANULARITY's
+// default), or one per sandbox, plus the warm pool's blank groups. At the
+// default 1024 MB a sandbox, admission takes about 540 sandboxes on a 64
+// GiB node, so 4096 is far above a node's groups. The most, 32768, is
+// 65536 mounts: under the kernel's 100000 a mount namespace may hold
+// (fs.mount-max), with room for the node's own.
+const (
+	defaultMaxV8Jails = 4096
+	maxV8Jails        = 32768
+)
 
 // any reports whether the helper serves a host kind.
 func (h HostsConfig) any() bool { return h.Workerd != nil || h.Wasm != nil || h.Firecracker != nil }
@@ -204,6 +224,9 @@ func (h HostsConfig) validate() error {
 		}
 		if w.PidsMax == 0 {
 			return errors.New("root helper: SB_ISOLATE_JAIL_PIDS_MAX must be above 0: the V8 jail lets workerd make threads")
+		}
+		if w.MaxJails < 1 || w.MaxJails > maxV8Jails {
+			return fmt.Errorf("root helper: SB_ROOTD_ISOLATE_MAX_JAILS=%d: want 1 to %d V8 jails", w.MaxJails, maxV8Jails)
 		}
 	}
 	if w := h.Wasm; w != nil {
@@ -497,6 +520,9 @@ func movesFromEnv(getenv func(string) string, path func(k, def string) string, l
 	}
 	m := &MovesConfig{Runsc: path("SB_ROOTD_RUNSC", defaultRunsc), StateRoot: path("SB_ROOTD_RUNSC_ROOT", defaultRunscStateRoot),
 		MaxBundleBytes: size, MaxStaged: staged}
+	if err := checkRootPrograms(agentDirs, settingPath{"SB_ROOTD_RUNSC", m.Runsc}); err != nil {
+		return nil, err
+	}
 	for _, a := range agentDirs {
 		for _, p := range []struct{ name, dir string }{{"SB_ROOTD_RUNSC", filepath.Dir(m.Runsc)}, {"SB_ROOTD_RUNSC_ROOT", m.StateRoot}} {
 			if p.dir == a || strings.HasPrefix(p.dir, a+"/") {
@@ -744,6 +770,7 @@ func ConfigFromEnv(getenv func(string) string) (Config, error) {
 		},
 		Firewall:  FirewallConfig{Backend: strings.ToLower(get("SB_NETRULES_BACKEND", "netlink")), Interconnect: interconnect, NodePorts: nodePorts},
 		HostPorts: hostPorts,
+		AgentDirs: []string{runDir, mountsRoot, credDir, dataDir},
 	}
 	if cfg.Mounts, err = mountsFromEnv(getenv, uid, mountsDir, mountCredDir, filepath.Join(stateDir, "mountcache")); err != nil {
 		return Config{}, err
@@ -837,6 +864,10 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 	if pids <= 0 || pids > math.MaxUint32 {
 		return h, fmt.Errorf("SB_ISOLATE_JAIL_PIDS_MAX=%d: want a limit above 0", pids)
 	}
+	jails, err := envInt(getenv, "SB_ROOTD_ISOLATE_MAX_JAILS", defaultMaxV8Jails)
+	if err != nil {
+		return h, err
+	}
 	shim, err := selfExecutable()
 	if err != nil {
 		return h, fmt.Errorf("root helper: its own binary, the V8 jail's shim: %w", err)
@@ -847,15 +878,18 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 		return h, fmt.Errorf("SB_ROOTD_AGENT_UID=%d: the V8 jail takes uids up to %d", agentUID, math.MaxInt32)
 	}
 	base := path("SB_ISOLATE_JAIL_CHROOT_BASE", "/srv/isolate-jail")
-	for _, a := range agentDirs {
-		if base == a || strings.HasPrefix(base, a+"/") {
-			return h, fmt.Errorf("SB_ISOLATE_JAIL_CHROOT_BASE: %s is inside %s, which the agent writes", base, a)
-		}
+	// Root reads workerd's libraries (ldd) and copies it into every jail.
+	workerd := path("SB_ISOLATE_WORKERD_PATH", "/usr/local/bin/workerd")
+	if err := outsideAgentFolders(agentDirs, settingPath{"SB_ISOLATE_JAIL_CHROOT_BASE", base}); err != nil {
+		return h, err
+	}
+	if err := checkRootPrograms(agentDirs, settingPath{"SB_ISOLATE_WORKERD_PATH", workerd}); err != nil {
+		return h, err
 	}
 	h.Workerd = &WorkerdHostsConfig{
 		Jail: isolate.RootJail{
 			ChrootBase:  base,
-			WorkerdPath: path("SB_ISOLATE_WORKERD_PATH", "/usr/local/bin/workerd"),
+			WorkerdPath: workerd,
 			UID:         jailUID,
 			GID:         jailGID,
 			AgentUID:    int(agentUID),
@@ -863,7 +897,8 @@ func hostsFromEnv(getenv func(string) string, path func(k, def string) string, s
 			SeccompMode: strings.ToLower(get("SB_ISOLATE_SECCOMP_MODE", isolate.SeccompEnforce)),
 			ShimPath:    filepath.Clean(shim),
 		},
-		PidsMax: uint32(pids),
+		PidsMax:  uint32(pids),
+		MaxJails: jails,
 	}
 	return h, nil
 }
@@ -895,10 +930,8 @@ func wasmHostsFromEnv(getenv func(string) string, path func(k, def string) strin
 		return nil, fmt.Errorf("root helper: its own binary, the WASM hosts': %w", err)
 	}
 	socketDir := path("SB_ROOTD_WASM_SOCKET_DIR", DefaultWasmSocketDir)
-	for _, a := range agentDirs {
-		if socketDir == a || strings.HasPrefix(socketDir, a+"/") {
-			return nil, fmt.Errorf("SB_ROOTD_WASM_SOCKET_DIR: %s is inside %s, which the agent writes", socketDir, a)
-		}
+	if err := outsideAgentFolders(agentDirs, settingPath{"SB_ROOTD_WASM_SOCKET_DIR", socketDir}); err != nil {
+		return nil, err
 	}
 	w := &WasmHostsConfig{
 		Binary: filepath.Clean(shim), UID: uid, GID: gid, SocketDir: socketDir, SocketGID: agentGID,
@@ -939,6 +972,11 @@ func wasmCacheRoot(getenv func(string) string, path func(k, def string) string) 
 	return filepath.Join(cache, "wazero-compile")
 }
 
+// defaultMkfs4Bin is not sandboxd's /sbin/mkfs.ext4: on a host with a
+// merged /usr (Ubuntu, Debian 12, Amazon Linux 2023) /sbin is a link, and
+// root runs no program through one (checkRootBinaries).
+const defaultMkfs4Bin = "/usr/sbin/mkfs.ext4"
+
 // firecrackerHostsFromEnv is the Firecracker VMs' settings, under sandboxd's
 // names. The helper always runs the jailer: an unjailed VM would be root.
 // The chroot base must not be inside a folder the agent writes: root
@@ -975,7 +1013,7 @@ func firecrackerHostsFromEnv(getenv func(string) string, path func(k, def string
 		UID:               uid,
 		GID:               gid,
 		Kernel:            path("SB_FIRECRACKER_KERNEL", "/var/lib/sandboxd/firecracker/vmlinux"),
-		Mkfs4Bin:          path("SB_FIRECRACKER_MKFS_BIN", "/sbin/mkfs.ext4"),
+		Mkfs4Bin:          path("SB_FIRECRACKER_MKFS_BIN", defaultMkfs4Bin),
 		Shim:              filepath.Clean(shim),
 		AgentUID:          agentUID,
 		SocketWait:        5 * time.Second,
@@ -988,10 +1026,20 @@ func firecrackerHostsFromEnv(getenv func(string) string, path func(k, def string
 	if v := strings.TrimSpace(getenv("SB_FIRECRACKER_IP_BINARY")); v != "" {
 		c.IPBinary = path("SB_FIRECRACKER_IP_BINARY", "")
 	}
+	if err := outsideAgentFolders(agentDirs, settingPath{"SB_JAILER_CHROOT_BASE", c.ChrootBase}); err != nil {
+		return nil, err
+	}
+	// Root runs the jailer, ip and mkfs.ext4, and the jailer copies
+	// firecracker into each jail.
+	programs := []settingPath{{"SB_JAILER_BINARY", c.JailerBinary}, {"SB_FIRECRACKER_BINARY", c.FirecrackerBinary},
+		{"SB_FIRECRACKER_MKFS_BIN", c.Mkfs4Bin}}
+	if c.IPBinary != "" {
+		programs = append(programs, settingPath{"SB_FIRECRACKER_IP_BINARY", c.IPBinary})
+	}
+	if err := checkRootPrograms(agentDirs, programs...); err != nil {
+		return nil, err
+	}
 	for _, a := range agentDirs {
-		if c.ChrootBase == a || strings.HasPrefix(c.ChrootBase, a+"/") {
-			return nil, fmt.Errorf("SB_JAILER_CHROOT_BASE: %s is inside %s, which the agent writes", c.ChrootBase, a)
-		}
 		// Root links the kernel into every VM's jail and gives it to the
 		// jailer's group: one the agent could swap would be any file.
 		if strings.HasPrefix(c.Kernel, a+"/") {
@@ -1010,6 +1058,22 @@ var lookupEnv = func(getenv func(string) string, k string) (string, bool) {
 		return v, true
 	}
 	return os.LookupEnv(k)
+}
+
+// outsideAgentFolders refuses a folder root trusts (each under its
+// setting's name) at or inside a folder the agent writes: the agent can
+// rename anything below its own folders, a folder root made included.
+// Programs go through checkRootPrograms, which applies the same rule and
+// more.
+func outsideAgentFolders(agentDirs []string, paths ...settingPath) error {
+	for _, p := range paths {
+		for _, a := range agentDirs {
+			if p.path == a || strings.HasPrefix(p.path, a+"/") {
+				return fmt.Errorf("%s: %s is inside %s, which the agent writes", p.setting, p.path, a)
+			}
+		}
+	}
+	return nil
 }
 
 // hostPortsFromEnv is Config.HostPorts, checked as sandboxd checks the

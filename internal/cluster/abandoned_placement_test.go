@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -243,6 +244,61 @@ func TestEvictionFinishesOnlyADeletedNodesDeletes(t *testing.T) {
 				t.Fatalf("running placement = %+v, want orphaned", p)
 			}
 		})
+	}
+}
+
+// One delete the eviction cannot finish does not stop the rest. A deleting
+// placement with no lifetime ID cannot take the exact delete, so finishing
+// it fails every time; before, that error ended the eviction, and the
+// node's other sandboxes were never handed off (and the operator's node
+// delete failed on every retry). Now that one sandbox is logged and left,
+// and the rest of the hand-off runs. It sorts first, so it is tried first.
+func TestEvictionSkipsADeleteItCannotFinish(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test: requires real raft socket")
+	}
+	c, cleanup := newEvictFenceCluster(t, "srv-abandoned-skip")
+	defer cleanup()
+	const owner, stuck = "wkr-skip-deleted", "sb-0-no-lifetime"
+	applyRaftCommand(t, c, command{Op: opPlace, SandboxID: stuck, OwnerNodeID: owner, OwnerAPIURL: "http://" + owner,
+		Spec: &models.CreateSandboxRequest{Image: "alpine"}})
+	applyRaftCommand(t, c, command{Op: opBeginDelete, SandboxID: stuck, ExpectedOwnerNodeID: owner, ExpectedOwnerNodeIDSet: true,
+		ExpiresUnix: placementDeleteExpiryUnix()})
+	if p, _ := c.fsm.get(stuck); !p.IsDeleting() || p.IncarnationID != "" {
+		t.Fatalf("precondition: %+v, want a deleting placement with no lifetime ID", p)
+	}
+	abandonedDeleting(t, c, "sb-1-deleting", owner)
+	abandonedPlace(t, c, "sb-2-running", owner)
+	var mu sync.Mutex
+	var steps []string
+	c.evictDeadOwnerStepHook = func(step evictDeadOwnerStep, id string) {
+		mu.Lock()
+		defer mu.Unlock()
+		steps = append(steps, fmt.Sprintf("%v:%s", step, id))
+	}
+
+	res, err := c.DeleteNode(context.Background(), owner, true)
+	if err != nil {
+		t.Fatalf("DeleteNode: %v: one delete it cannot finish stopped the hand-off", err)
+	}
+	if res.Orphaned != 1 {
+		t.Fatalf("DeleteNode = %+v, want the running sandbox orphaned", res)
+	}
+	if p, ok := c.fsm.get(stuck); !ok || !p.IsDeleting() || p.OwnerNodeID != owner {
+		t.Fatalf("skipped placement = %+v (found %v), want it left deleting on %s", p, ok, owner)
+	}
+	requireHandOff(t, c, "deleting", "sb-1-deleting", owner, handOffGone)
+	requireHandOff(t, c, "running", "sb-2-running", owner, handOffOrphaned)
+	// The stuck one was tried first, and the hand-off went on past it.
+	mu.Lock()
+	got := strings.Join(steps, " ")
+	mu.Unlock()
+	want := fmt.Sprintf("%v:%s %v:sb-1-deleting %v:", evictStepFinishDelete, stuck, evictStepFinishDelete, evictStepOrphan)
+	if !strings.HasPrefix(got, want) {
+		t.Fatalf("eviction steps = %q, want them to start %q", got, want)
+	}
+	if bad := checkFSMInvariants(c.nodeID, c.fsm, time.Now().Unix()); len(bad) > 0 {
+		t.Fatalf("FSM invariants broken: %v", bad)
 	}
 }
 
@@ -563,10 +619,11 @@ func serveAuthoritativeByIDs(c *Cluster) {
 	c.AttachInternalHandler(mux)
 }
 
-// With no leader to take the write, both the eviction's finish step and the
-// server-side delete return the error and change nothing: the placement
-// stays for the retry (the operator's, the dead-owner loop's or the
-// client's), and the eviction stops before it orphans anything.
+// With no leader to take the write, the eviction's finish step and the
+// server-side delete change nothing: the placement stays for the retry (the
+// operator's, the dead-owner loop's or the client's). The finish step skips
+// that one sandbox, and the orphan step after it fails the same way, so the
+// eviction reports the error and orphans nothing.
 func TestAbandonedDeletesFailClosedWithoutALeader(t *testing.T) {
 	if testing.Short() {
 		t.Skip("starts a raft node")
@@ -587,7 +644,7 @@ func TestAbandonedDeletesFailClosedWithoutALeader(t *testing.T) {
 		t.Fatalf("deleting placement = %+v (found %v), want it kept for the retry", p, ok)
 	}
 	if p, _ := lone.fsm.get("sb-lone-running"); p.IsOrphaned() {
-		t.Fatal("the eviction went on to orphan after a failed finish")
+		t.Fatal("the eviction orphaned a placement with no leader")
 	}
 	p, _ := lone.fsm.get("sb-lone-running")
 	if err := lone.DeleteAbandonedPlacement(ctx, p); err == nil {

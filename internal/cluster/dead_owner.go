@@ -314,7 +314,10 @@ var errOwnerRejoined = errors.New("cluster: owner rejoined during eviction")
 // until its delete fence's TTL (reconcileReservations). The dead-owner
 // loop and an operator's node delete (node_lifecycle.go) share it. A failure
 // is logged and returned after the steps that succeeded; every step is
-// idempotent, so the caller's retry finishes the job.
+// idempotent, so the caller's retry finishes the job. The one exception is
+// finishing a deleted node's delete: a failure there is logged and skips
+// only that sandbox, which stays on the node for the dead-owner loop's next
+// try, so one bad placement cannot stop the rest of the hand-off.
 //
 // Every write is fenced on the owner, because each step is a Raft round trip
 // and the world moves while the loop runs. A reassign carries nodeID as its
@@ -350,10 +353,11 @@ func (c *Cluster) evictOwnerPlacements(ctx context.Context, nodeID string) (reas
 			// delete, so its fence waits for the TTL (reconcileReservations).
 			// A deleted node can finish nothing (abandoned_placement.go):
 			// the delete is finished here, or it would stay on the node.
-			if c.fsm.isNodeDenied(nodeID) {
-				if err := c.finishDeletedNodeDelete(ctx, nodeID, p); err != nil {
-					return reassigned, 0, err
-				}
+			// One delete that cannot finish (a placement with no lifetime
+			// ID cannot take the exact delete) must not hold up the rest of
+			// the node's hand-off: it is logged and left on the node, and
+			// the dead-owner loop tries it again while the node owns it.
+			if c.fsm.isNodeDenied(nodeID) && c.finishDeletedNodeDelete(ctx, nodeID, p) == nil {
 				finished++
 			}
 			continue

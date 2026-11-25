@@ -468,6 +468,7 @@ No single guard is perfect. Security comes from layers, so one failure does not 
 | If this happens | What still protects you |
 |---|---|
 | Code in a sandbox turns hostile | The runtime's walls, the network policy, and inject rules that keep real keys out |
+| A bug in the server code that reads requests | With [privilege mode split](/enterprise/privilege-mode/), that code runs with no rights. A small helper does the root work and checks every request. |
 | A visitor tries a port you never shared | Caddy has no route for it, so nothing answers |
 | Someone copies the database file | Secrets in it are sealed. Without the key, they cannot be read. |
 | A stranger tries to join the cluster | No signed badge and no gossip key, so the cluster refuses it |

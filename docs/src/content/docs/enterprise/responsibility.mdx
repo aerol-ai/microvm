@@ -98,7 +98,7 @@ Each limit has a workaround you can use today. Where a fix is planned, the last 
 
 ## Out of scope by design
 
-- **The server.** `sandboxd` runs as root, because it manages containers, virtual machines, firewall rules and mounts. Whoever controls the server, or holds its server token, is on the trusted side.
+- **The server.** By default `sandboxd` runs as root, because it manages containers, virtual machines, firewall rules and mounts. [Privilege mode split](/enterprise/privilege-mode/) runs it with no rights, but a small root helper, containerd and the runtimes still run as root. Whoever controls the server, or holds its server token, is on the trusted side.
 - **Your identity provider.** AerolVM trusts what it signs. Whoever controls it can sign in as anyone it lists.
 - **The kernel, the hypervisor and the CPU.** A bug below the boundary is below the model.
 - **What an allowed site does with your data.** The filter controls where traffic goes, not what the far side does with it.

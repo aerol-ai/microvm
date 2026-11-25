@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/config"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // tokenForwardServer is a TLS server presenting a node cert the cluster CA
@@ -319,6 +320,45 @@ func TestForwardToServerOnce(t *testing.T) {
 		}
 		if rr.Code != tc.want || got != want {
 			t.Errorf("%s: %d after %q, want %d after %v", tc.name, rr.Code, got, tc.want, tc.wantHits)
+		}
+	}
+}
+
+// kubectl delete sandbox on a gateway, for a sandbox left on a deleted node
+// (pkg/api/clusterroute abandoned.go): the agent-sandbox API's in-process
+// call has no credential, and the forward to a server speaks for the
+// Kubernetes user by name. The server grants it only that user's owner
+// (pkg/api onBehalfAccess), so nothing here carries this node's own power.
+func TestForwardToServerSpeaksForAKubernetesCaller(t *testing.T) {
+	ca, base := tokenForwardCA(t)
+	var got http.Header
+	srv := tokenForwardServer(t, ca, "srv-a", JoinRoleServer, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	index := newGossipMemberIndex()
+	index.upsert(Member{NodeID: "srv-a", InternalURL: srv.URL, Alive: true, Role: config.NodeRoleServer})
+	a := &Agent{logger: slog.New(slog.NewTextHandler(io.Discard, nil)), nodeID: "gw-1", internalClient: base,
+		gossip: &gossipNode{memberIndex: index}}
+	kube := controlplane.Access{
+		Identity:  controlplane.Identity{OwnerRef: "team:dev", Role: controlplane.RoleRunner},
+		Role:      controlplane.RoleRunner,
+		Principal: controlplane.Principal{Kind: controlplane.PrincipalKubernetes, ID: "kubernetes:alice"},
+	}
+	req := httptest.NewRequest(http.MethodDelete, "/v1/sandboxes/sb-1", nil)
+	req = req.WithContext(controlplane.ContextWithAccess(req.Context(), kube))
+	rr := httptest.NewRecorder()
+	a.ForwardToServer(rr, req)
+	if rr.Code != http.StatusNoContent || got == nil {
+		t.Fatalf("forward = %d (server reached: %v), want the server's 204", rr.Code, got != nil)
+	}
+	for k, v := range map[string]string{
+		HeaderForwarded: "1", HeaderCaller: CallerNode,
+		HeaderOnBehalfOf: "kubernetes:alice", HeaderOnBehalfOwner: "team:dev",
+		"Authorization": "",
+	} {
+		if got.Get(k) != v {
+			t.Errorf("%s = %q, want %q", k, got.Get(k), v)
 		}
 	}
 }
