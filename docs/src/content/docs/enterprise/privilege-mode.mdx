@@ -13,8 +13,8 @@ Use split when you run code from people you do not trust. Use it too when your s
 
 ## Before you start
 
-- **AerolVM v0.7.8 or later, with a signed helper.** Split runs only a helper signed with an AerolVM release key. See [Limits](#limits).
-- **The containerd engine.** Docker, and so every local install (`--local`), runs in `single` only. Split also needs containerd's pool of network namespaces turned on. The installer and the Helm chart turn both on. Terraform and Ansible refuse a config without them.
+- **AerolVM v0.7.8 or later, with a signed helper.** Split runs only a helper signed with an AerolVM release key. The one exception is an install with `--build-from-source`: it runs the helper built from that checkout, which has no signature. See [Limits](#limits).
+- **The containerd engine.** Docker, and so every local install (`--local`), runs in `single` only. Split also needs containerd's pool of network namespaces turned on. The installer turns both on with `--with-containerd-engine`, and refuses split without that flag. The Helm chart turns both on. Terraform and Ansible refuse a config without them.
 - **The runtimes' fences left on.** Firecracker runs through its jailer, and V8 isolates in their jail. WebAssembly runs on the default engine, wazero, with each worker dropped to its own user. All three are the defaults.
 - **On Kubernetes, Firecracker off.** The chart does not run Firecracker in a split worker pod yet.
 - **On Terraform, the module's one-line join.** See [A Terraform cluster](#a-terraform-cluster). The plan lists anything else split cannot run with.
@@ -189,7 +189,7 @@ Add `--with-containerd-engine --privilege-mode split` to the [install command](/
 
 - the `sandboxd` user (uid 65531), which the server runs as;
 - `aerolvm-rootd.service`, which runs the helper as root;
-- a locked-down `sandboxd.service`, with no capabilities, `NoNewPrivileges=yes`, `ProtectSystem=strict`, and write access only to its own data, run and certificate folders.
+- a locked-down `sandboxd.service`, with no capabilities, `NoNewPrivileges=yes`, `ProtectSystem=strict`, and write access only to its own data, run and certificate folders. With `--with-firecracker`, it can also write under `/srv/jailer`. There the helper makes one stage folder for each VM that `sandboxd` owns. `sandboxd` cannot write in the jails themselves.
 
 Split also runs image builds in rootless BuildKit: the image builder runs as a normal user too. It works with `--with-isolate` and `--with-firecracker`. [Run the server without root](/getting-started/installer-options/#run-the-server-without-root) on the installer page lists every file and user it makes.
 
@@ -274,7 +274,7 @@ We timed creates in both modes on EKS, on 24 November 2026. The cluster had thre
 ## Limits
 
 - **The default stays `single`.** The chart's default will change to `auto` once release signing is in place and a new speed check passes.
-- **Split needs a signed helper.** A release built without AerolVM's release key ships its helper unsigned, and split will not start with it. The installer stops. On Kubernetes, the `agent` container stops and says `privilege mode split needs a signed root helper`.
+- **Split needs a signed helper.** A release built without AerolVM's release key ships its helper unsigned, and split will not start with it. The installer stops. An install with `--build-from-source` is the exception: you trust the checkout you build, so the installer runs its unsigned helper, as it runs its `sandboxd`. On Kubernetes, the `agent` container stops and says `privilege mode split needs a signed root helper`.
 - **Some parts still run as root.** The helper, containerd, runc, gVisor (`runsc`) and the Firecracker jailer still run as root. On Kubernetes, the `runtime` container stays privileged in both modes.
 - **`sandboxd` still holds its sandboxes' secrets.** On its machine, it holds three things:
   - each sandbox's toolbox token, which lets it run commands there;
