@@ -12,6 +12,13 @@ import (
 // devbox. Exec, file, and snapshot calls all dial the sandbox's toolbox or
 // runtime, which only exist on the owner, so serving them locally on a
 // non-owner would 404 or hit the wrong host.
+//
+// Shutdown does not set clusterroute.Options.Destroy, as the v1 and E2B
+// deletes do, so a devbox left on a deleted node still answers 503 or 410
+// here. The server that would take that delete holds no row for it, and
+// shutdownDevbox needs the row to build the devbox view it answers with and
+// records as the tombstone. With Destroy set it would answer 404 and leave
+// the placement (TODOS.md).
 func (h *handlers) clusterForwardWrap(local http.Handler) http.Handler {
 	return clusterroute.Wrap(h.deps.Service, clusterroute.Options{WriteError: WriteError}, local)
 }

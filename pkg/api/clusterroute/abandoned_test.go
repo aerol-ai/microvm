@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // Routing for a sandbox left on a node an operator deleted (abandoned.go).
@@ -48,6 +49,17 @@ func TestWrapSandboxOnADeletedNode(t *testing.T) {
 	ownedBy := func(node string) cluster.Placement {
 		return cluster.Placement{SandboxID: "sb", IncarnationID: "inc", OwnerNodeID: node}
 	}
+	// The agent-sandbox API's caller (pkg/api KubeBackend): an in-process
+	// call with no credential, for one owner.
+	kube := &controlplane.Access{
+		Identity:  controlplane.Identity{OwnerRef: "team:dev", Role: controlplane.RoleRunner},
+		Role:      controlplane.RoleRunner,
+		Principal: controlplane.Principal{Kind: controlplane.PrincipalKubernetes, ID: "kubernetes:alice"},
+	}
+	ofTenant := func(p cluster.Placement, owner string) cluster.Placement {
+		p.OwnerRef = owner
+		return p
+	}
 	const (
 		ranLocal = "local"     // the local handler ran (a server deletes it)
 		toServer = "to-server" // sent to a server
@@ -62,6 +74,7 @@ func TestWrapSandboxOnADeletedNode(t *testing.T) {
 		destroy   bool
 		noBearer  bool
 		forwarded bool
+		access    *controlplane.Access
 		want      string
 		status    int
 	}{
@@ -73,6 +86,15 @@ func TestWrapSandboxOnADeletedNode(t *testing.T) {
 		// A gateway never sends the call as itself, and never makes a second hop.
 		{name: "DELETE with no credential, at a gateway", ownerErr: cluster.ErrOrphaned, place: orphanOf(deleted), destroy: true, noBearer: true, status: http.StatusGone},
 		{name: "DELETE already forwarded once, at a gateway", ownerErr: cluster.ErrOrphaned, place: orphanOf(deleted), destroy: true, forwarded: true, status: http.StatusGone},
+		// kubectl delete sandbox: no credential, but the forward speaks for
+		// the Kubernetes user by name, so a gateway sends it to a server.
+		{name: "Kubernetes DELETE, orphaned from the deleted node, at a gateway", ownerErr: cluster.ErrOrphaned, place: ofTenant(orphanOf(deleted), "team:dev"), destroy: true, noBearer: true, access: kube, want: toServer},
+		{name: "Kubernetes DELETE, still on the deleted node, at a gateway", owner: onDeleted, place: ofTenant(ownedBy(deleted), "team:dev"), destroy: true, noBearer: true, access: kube, want: toServer},
+		{name: "Kubernetes DELETE already forwarded once, at a gateway", ownerErr: cluster.ErrOrphaned, place: ofTenant(orphanOf(deleted), "team:dev"), destroy: true, noBearer: true, forwarded: true, access: kube, status: http.StatusGone},
+		// Another tenant's sandbox is never sent on: the local handler
+		// answers it, with the 404 it gives an unknown id.
+		{name: "Kubernetes DELETE of another tenant's sandbox, at a gateway", ownerErr: cluster.ErrOrphaned, place: ofTenant(orphanOf(deleted), "team:other"), destroy: true, noBearer: true, access: kube, want: ranLocal},
+		{name: "Kubernetes GET, orphaned from the deleted node", ownerErr: cluster.ErrOrphaned, place: ofTenant(orphanOf(deleted), "team:dev"), noBearer: true, access: kube, status: http.StatusGone},
 		// What keeps its answer.
 		{name: "DELETE, orphan of a node that only died", server: true, ownerErr: cluster.ErrOrphaned, place: orphanOf(died), destroy: true, status: http.StatusGone},
 		{name: "GET, orphaned from the deleted node", server: true, ownerErr: cluster.ErrOrphaned, place: orphanOf(deleted), status: http.StatusGone},
@@ -106,6 +128,9 @@ func TestWrapSandboxOnADeletedNode(t *testing.T) {
 			}
 			if tc.forwarded {
 				r.Header.Set(cluster.HeaderForwarded, "1")
+			}
+			if tc.access != nil {
+				r = r.WithContext(controlplane.ContextWithAccess(r.Context(), *tc.access))
 			}
 			rr := httptest.NewRecorder()
 			Wrap(svcWith(t, c), Options{WriteError: writeErr, Destroy: tc.destroy}, lh).ServeHTTP(rr, r)
