@@ -20,6 +20,12 @@ resources:
         - get
         - describe
         - delete
+    - kind: Runtime
+      name: runtimes
+      short_names: null
+      singular_name: runtime
+      verbs:
+        - get
     - kind: Sandbox
       name: sandboxes
       short_names:

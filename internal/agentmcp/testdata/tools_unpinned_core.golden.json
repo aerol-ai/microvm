@@ -236,6 +236,100 @@
       "idempotentHint": false,
       "openWorldHint": false,
       "readOnlyHint": true,
+      "title": "List runtimes"
+    },
+    "description": "List the runtimes sandbox_create can use on this server, as {name, isolation, backend, available, features, limits}. Pick one with available true and pass its name as sandbox_create's runtime. isolation is what separates the sandbox from the server: container (shared kernel), user-space-kernel (gVisor) or hardware-vm (its own kernel). features say what it can do: snapshots, pause (a stop keeps memory), moves and warm_pool.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_runtimes",
+    "outputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "runtimes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "backend": {
+                "type": "string"
+              },
+              "features": {
+                "additionalProperties": false,
+                "properties": {
+                  "confidential": {
+                    "type": "boolean"
+                  },
+                  "moves": {
+                    "type": "string"
+                  },
+                  "pause": {
+                    "type": "boolean"
+                  },
+                  "snapshots": {
+                    "type": "boolean"
+                  },
+                  "warm_pool": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "snapshots",
+                  "pause",
+                  "moves",
+                  "warm_pool",
+                  "confidential"
+                ],
+                "type": "object"
+              },
+              "isolation": {
+                "type": "string"
+              },
+              "limits": {
+                "additionalProperties": false,
+                "properties": {
+                  "max_checkpoint_memory_mb": {
+                    "type": "integer"
+                  }
+                },
+                "type": [
+                  "null",
+                  "object"
+                ]
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "isolation",
+              "available",
+              "features"
+            ],
+            "type": "object"
+          },
+          "type": [
+            "null",
+            "array"
+          ]
+        }
+      },
+      "required": [
+        "runtimes"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "idempotentHint": false,
+      "openWorldHint": false,
+      "readOnlyHint": true,
       "title": "Read file"
     },
     "description": "Read a text file from the sandbox: up to 2,000 lines or 256 KiB per call, starting at offset_line (1-based). If next_offset is set, call again with offset_line=next_offset for the rest. Binary files are refused; inspect them with exec.",

@@ -3,6 +3,7 @@ exit 0
 NAME         SHORTNAMES                  KIND
 jointokens   jt,join-token,join-tokens   JoinToken
 nodes        no                          Node
+runtimes                                 Runtime
 sandboxes    sb                          Sandbox
 snapshots    snap                        Snapshot
 tokens       tok                         Token
