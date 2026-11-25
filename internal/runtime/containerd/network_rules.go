@@ -131,6 +131,37 @@ func (d *Driver) ClearNetworkRules(containerIP string) error {
 	return d.networkRules.ClearBlockAllIngress(containerIP)
 }
 
+// addressClearer is a HostFirewall that clears every rule keyed by one
+// address in one call (netrules.Manager.ClearAddress): block-all, the
+// ingress block, the hold, and the allow and deny lists, whatever lists
+// they were. The root helper's firewall (privilege mode split) has none:
+// its slot release clears every rule of the address
+// (CreateRules.ClearsOnRelease).
+type addressClearer interface {
+	ClearAddress(ip string) error
+}
+
+var _ addressClearer = (*netrules.Manager)(nil)
+
+// clearAddressRules clears every rule keyed by containerIP, for an address
+// whose holder is gone and whose own lists no row records: a parked slot,
+// or a failed warm claim's leftover (claim_leftovers.go). A claim that
+// failed after it put the request's allow or deny lists on the address
+// left them there, and ClearNetworkRules clears only the block rules, so
+// the next sandbox given the address would start with them. Call it only
+// once the container is gone and while the netns slot still holds the
+// address, so the rules cannot be the next holder's. A firewall without
+// ClearAddress clears the block rules, as before.
+func (d *Driver) clearAddressRules(containerIP string) error {
+	if d.networkRules == nil {
+		return nil
+	}
+	if c, ok := d.networkRules.(addressClearer); ok {
+		return c.ClearAddress(containerIP)
+	}
+	return d.ClearNetworkRules(containerIP)
+}
+
 // hasCreateNetRules reports whether a create asks for host firewall rules.
 func hasCreateNetRules(req models.CreateSandboxRequest) bool {
 	return req.NetworkBlockAll || len(req.NetworkAllowOut) > 0 || len(req.NetworkDenyOut) > 0

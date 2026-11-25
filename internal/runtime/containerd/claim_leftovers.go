@@ -24,7 +24,12 @@ import (
 //     removes it as its leftover, or the daemon restarts. So when the
 //     pool's retry finally removes the container, the driver frees it
 //     too, once it is sure no container of the sandbox is left in it
-//     (finishClaimLeftover).
+//     (finishClaimLeftover). When a retried create removes it first
+//     (Destroy), the id is forgotten there (forgetClaimLeftoverIfGone).
+//
+// No row ever held the failed claim's allow and deny lists, so each of
+// these paths clears every rule of the address (clearAddressRules), not
+// only the block rules.
 //
 // It lives only in memory: a restart drops the pool's retry list as well,
 // and the boot purge and the netns reconcile cover both.
@@ -87,6 +92,19 @@ func (l *claimLeftovers) of(slotID string) (claimLeftover, bool) {
 	defer l.mu.Unlock()
 	c, ok := l.bySlot[slotID]
 	return c, ok
+}
+
+// forgetSandbox drops every failed claim of sandboxID: a retried create
+// removed the leftover container itself (Driver.Destroy).
+func (l *claimLeftovers) forgetSandbox(sandboxID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for slotID, c := range l.bySlot {
+		if c.sandboxID == sandboxID {
+			delete(l.bySlot, slotID)
+			l.n.Add(-1)
+		}
+	}
 }
 
 // forget drops slotID once its container is gone.
@@ -160,7 +178,7 @@ func (d *Driver) freeClaimLeftoverNetns(ctx context.Context, leftover claimLefto
 		return nil
 	}
 	if !d.clearsOnRelease() {
-		_ = d.ClearNetworkRules(held)
+		_ = d.clearAddressRules(held)
 	}
 	if err := d.netns.Release(ctx, leftover.sandboxID); err != nil {
 		return err
@@ -168,6 +186,27 @@ func (d *Driver) freeClaimLeftoverNetns(ctx context.Context, leftover claimLefto
 	d.logger.Info("containerd warm claim: freed the network namespace a failed claim left under the sandbox id",
 		"sandbox_id", leftover.sandboxID, "container_ip", held)
 	return nil
+}
+
+// forgetClaimLeftoverIfGone runs after Destroy removed sandboxID's
+// leftover and freed its namespace: a retried create of the id took a warm
+// slot, met the failed claim's container by its label, and had it removed
+// (service create_leftover.go). Once containerd has no container of the id,
+// nothing of the failed claim is left, and a cold create of the id no
+// longer waits for the pool's retry (up to its 5-minute backoff). The
+// pool's retry still removes the slot's files; it finds the id forgotten
+// and frees nothing more. A list that fails, or a container still there,
+// keeps the id remembered: the pool's retry ends it.
+func (d *Driver) forgetClaimLeftoverIfGone(ctx context.Context, sandboxID string) {
+	client, err := d.ensureClient()
+	if err != nil {
+		return
+	}
+	found, err := client.ListContainers(ctx, "id=="+sandboxID, "labels."+sandboxIDLabelKey+"=="+sandboxID)
+	if err != nil || len(found) > 0 {
+		return
+	}
+	d.claimLeftovers.forgetSandbox(sandboxID)
 }
 
 // refusesClaimLeftover reports whether a create of sandboxID must not go
