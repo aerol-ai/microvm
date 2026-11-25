@@ -113,6 +113,10 @@ jobs:
               - '.github/workflows/test.yml'
               - 'scripts/scale-gates.sh'
               - 'scripts/go-test-split.sh'
+              # Go tests run install.sh itself: pkg/caddy's run rig (whole
+              # installs, a switch to split and back), internal/rootd and
+              # internal/runtime/firecracker.
+              - 'scripts/install.sh'
               # cmd/aerolvm and the MCP packages build on the Go SDK, and
               # cmd/aerolvm/distribution_test.go checks what ships around
               # the aerolvm binary.
