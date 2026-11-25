@@ -3,6 +3,7 @@ exit 0
 NAME         SHORTNAMES                  KIND        VERBS
 jointokens   jt,join-token,join-tokens   JoinToken   get,delete
 nodes        no                          Node        get,describe,delete
+runtimes                                 Runtime     get
 sandboxes    sb                          Sandbox     get,describe,delete
 snapshots    snap                        Snapshot    get,describe,delete
 tokens       tok                         Token       get,describe,delete

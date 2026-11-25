@@ -15,6 +15,7 @@ from .client import (
     MicroVMNotFoundError,
     MicroVMTimeoutError,
     MicroVMUnsupportedFeatureError,
+    Runtimes,
     Tokens,
 )
 from .image import Image
@@ -24,6 +25,9 @@ from .types import (
     CreateAPITokenOptions,
     CreatedAPIToken,
     RevokeSandboxTokensResult,
+    RuntimeFeatures,
+    RuntimeInfo,
+    RuntimeLimits,
     SandboxToken,
     WhoAmI,
     WhoAmIPrincipal,
@@ -95,11 +99,16 @@ __all__ = [
     "AsyncSandbox",
     "AsyncSessionAttachHandle",
     "AsyncTokens",
+    "AsyncRuntimes",
     "APIToken",
     "APITokenList",
     "CreateAPITokenOptions",
     "CreatedAPIToken",
     "RevokeSandboxTokensResult",
+    "Runtimes",
+    "RuntimeFeatures",
+    "RuntimeInfo",
+    "RuntimeLimits",
     "SandboxToken",
     "Tokens",
     "WhoAmI",
@@ -190,6 +199,7 @@ _ASYNC_NAMES = (
     "AsyncSandbox",
     "AsyncSessionAttachHandle",
     "AsyncTokens",
+    "AsyncRuntimes",
 )
 
 if TYPE_CHECKING:  # pragma: no cover - for type checkers only
@@ -201,6 +211,7 @@ if TYPE_CHECKING:  # pragma: no cover - for type checkers only
         AsyncSandbox,
         AsyncSessionAttachHandle,
         AsyncTokens,
+        AsyncRuntimes,
     )
 
 

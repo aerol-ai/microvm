@@ -119,6 +119,8 @@ import type {
   SetNetworkLimitsOptions,
   ResizeOptions,
   RunCodeOptions,
+  RuntimeInfo,
+  RuntimeLimits,
   Sandbox,
   SandboxSnapshot,
   Session,
@@ -273,6 +275,49 @@ function fromApiAPIToken(t: ApiAPIToken): APIToken {
     expiresAt: t.expires_at,
     expired: t.expired === true,
   };
+}
+
+interface ApiRuntimeInfo {
+  name: string;
+  isolation: string;
+  backend?: string;
+  features?: {
+    snapshots?: boolean;
+    pause?: boolean;
+    moves?: string;
+    warm_pool?: string;
+    confidential?: boolean;
+  } | null;
+  limits?: { max_checkpoint_memory_mb?: number } | null;
+  available?: boolean;
+  nodes?: number | null;
+}
+
+function fromApiRuntimeInfo(r: ApiRuntimeInfo): RuntimeInfo {
+  const features = r.features ?? {};
+  const out: RuntimeInfo = {
+    name: r.name,
+    isolation: r.isolation ?? "",
+    features: {
+      snapshots: features.snapshots === true,
+      pause: features.pause === true,
+      moves: features.moves ?? "",
+      warmPool: features.warm_pool ?? "",
+      confidential: features.confidential === true,
+    },
+    available: r.available === true,
+  };
+  if (r.backend) out.backend = r.backend;
+  if (r.limits) {
+    const limits: RuntimeLimits = {};
+    if (typeof r.limits.max_checkpoint_memory_mb === "number") {
+      limits.maxCheckpointMemoryMB = r.limits.max_checkpoint_memory_mb;
+    }
+    out.limits = limits;
+  }
+  // Only fleet admins get node counts; anyone else gets none at all.
+  if (typeof r.nodes === "number") out.nodes = r.nodes;
+  return out;
 }
 
 interface ApiExposedPort {
@@ -2322,6 +2367,15 @@ export class APIClient {
   async listAPITokens(): Promise<APITokenList> {
     const response = await this.doJSON<{ tokens: ApiAPIToken[] | null }>("GET", this.versioned("/tokens"));
     return { tokens: (response.tokens ?? []).map(fromApiAPIToken) };
+  }
+
+  /**
+   * Every runtime name a create accepts, what it can do and whether this
+   * deployment offers it now (GET /v1/runtimes). A read, so retries are safe.
+   */
+  async listRuntimes(): Promise<RuntimeInfo[]> {
+    const response = await this.doJSON<{ runtimes?: ApiRuntimeInfo[] | null } | null>("GET", this.versioned("/runtimes"));
+    return (response?.runtimes ?? []).map(fromApiRuntimeInfo);
   }
 
   async revokeAPIToken(id: string): Promise<void> {

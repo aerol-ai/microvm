@@ -50,6 +50,7 @@ import type {
   SnapshotList,
   ResizeOptions,
   RunCodeOptions,
+  RuntimeInfo,
   Sandbox as SandboxData,
   SandboxSnapshot,
   Session,
@@ -79,6 +80,17 @@ export interface Tokens {
   list(call?: CallOptions): Promise<APITokenList>;
   /** Revoke a token by id (admin only). Revoking one already gone succeeds. */
   revoke(id: string, call?: CallOptions): Promise<void>;
+}
+
+/** The runtimes a create can ask for, reached as `microvm.runtimes`. */
+export interface Runtimes {
+  /**
+   * List every runtime name a create accepts, what each can do, and
+   * whether this deployment offers it now (`available`). Pick an available
+   * one and pass its `name` as `runtime` to `create`. Any caller that can
+   * read sandboxes may ask. It is a read, so a retry is safe.
+   */
+  list(call?: CallOptions): Promise<RuntimeInfo[]>;
 }
 
 /** What {@link MicroVM.getOrCreate} found or made. */
@@ -629,6 +641,17 @@ export class MicroVM {
       create: (options, call) => client.withSignal(call?.signal).createAPIToken(options),
       list: (call) => client.withSignal(call?.signal).listAPITokens(),
       revoke: (id, call) => client.withSignal(call?.signal).revokeAPIToken(id),
+    };
+  }
+
+  /**
+   * The runtimes this deployment knows, as `microvm.runtimes.list()`. Same
+   * namespaced shape as {@link MicroVM.tokens}.
+   */
+  get runtimes(): Runtimes {
+    const client = this.client;
+    return {
+      list: (call) => client.withSignal(call?.signal).listRuntimes(),
     };
   }
 

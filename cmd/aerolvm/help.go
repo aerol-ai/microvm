@@ -111,19 +111,23 @@ Examples:
   aerolvm list --limit 20 --json
 `
 
-const getHelp = `List or show sandboxes, snapshots, tokens, join tokens or nodes, like kubectl get.
+const getHelp = `List or show sandboxes, snapshots, tokens, join tokens, nodes or runtimes, like kubectl get.
 
 Usage: aerolvm get <sandbox>
        aerolvm get <kind> [<name>...] [-o wide|json|yaml|name] [-l SELECTOR]
 
 Kinds and their short names: sandboxes (sb), snapshots (snap), tokens
-(tok), nodes (no), jointokens (jt). "aerolvm api-resources" lists them. After get, a kind
+(tok), nodes (no), jointokens (jt), runtimes. "aerolvm api-resources" lists them. After get, a kind
 lists that kind; any other word is a sandbox, as always, so
 "aerolvm get build-box" prints what it always did. A sandbox named like a
 kind is reached with "aerolvm get sb <name>".
 
 Nodes show STATUS like kubectl: Ready or NotReady, plus SchedulingDisabled
 when cordoned and Leader for the Raft leader. Listing nodes needs an admin.
+
+Runtimes are the values "aerolvm create --runtime" takes: what each one
+isolates with, what it can do, and AVAILABLE when a node offers it now.
+-o wide adds NODES (how many nodes offer it) for fleet admins only.
 
   --json        print JSON: for "get <sandbox>" the sandbox object, as
                 always; for a kind the same as -o json
@@ -140,6 +144,7 @@ Examples:
   aerolvm get sb build-box -o yaml
   aerolvm get snapshots
   aerolvm get nodes -o wide
+  aerolvm get runtimes
 `
 
 const execHelp = `Run a command in a sandbox and stream its output.

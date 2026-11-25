@@ -2227,6 +2227,88 @@ class MicroVMClientTest {
     }
 
     @Test
+    void runtimesListReadsEveryFieldTheServerSends() throws Exception {
+        List<String> requests = new ArrayList<>();
+        // Two rows as GET /v1/runtimes sends them: a VM with a backend and
+        // a fleet admin's node count, and a WASM row with limits and no
+        // backend, as a tenant sees it (no nodes).
+        String body = "{\"runtimes\":["
+            + "{\"name\":\"firecracker\",\"isolation\":\"hardware-vm\",\"backend\":\"kvm\","
+            + "\"features\":{\"snapshots\":true,\"pause\":true,\"moves\":\"memory\",\"warm_pool\":\"snapshot\",\"confidential\":false},"
+            + "\"available\":true,\"nodes\":3},"
+            + "{\"name\":\"wasm\",\"isolation\":\"wasm\","
+            + "\"features\":{\"snapshots\":false,\"pause\":false,\"moves\":\"memory\",\"warm_pool\":\"parked\",\"confidential\":false},"
+            + "\"limits\":{\"max_checkpoint_memory_mb\":1024},\"available\":false,\"future_field\":\"ignored\"}"
+            + "]}";
+        HttpServer server = startServer(exchange -> {
+            requests.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getRawPath()
+                + " team=" + exchange.getRequestHeaders().getFirst(MicroVMClient.TEAM_HEADER));
+            writeResponse(exchange, 200, "application/json", body.getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            MicroVMClient client = new MicroVMClient(
+                new MicroVMConfig().setApiUrl(serverUrl(server)).setPatToken("pat").setTeam("payments"),
+                HttpClient.newHttpClient(),
+                new FakeWebSocketConnector(),
+                name -> null
+            );
+            List<ai.aerol.microvm.model.RuntimeInfo> runtimes = client.runtimes().list();
+            assertEquals(List.of("GET /v1/runtimes team=payments"), requests);
+            assertEquals(2, runtimes.size());
+
+            ai.aerol.microvm.model.RuntimeInfo fc = runtimes.get(0);
+            assertEquals("firecracker", fc.name);
+            assertEquals("hardware-vm", fc.isolation);
+            assertEquals("kvm", fc.backend);
+            assertTrue(fc.features.snapshots);
+            assertTrue(fc.features.pause);
+            assertEquals("memory", fc.features.moves);
+            assertEquals("snapshot", fc.features.warmPool);
+            assertFalse(fc.features.confidential);
+            assertNull(fc.limits);
+            assertTrue(fc.available);
+            assertEquals(Integer.valueOf(3), fc.nodes);
+
+            ai.aerol.microvm.model.RuntimeInfo wasm = runtimes.get(1);
+            assertEquals("wasm", wasm.name);
+            assertNull(wasm.backend);
+            assertEquals("parked", wasm.features.warmPool);
+            assertEquals(Integer.valueOf(1024), wasm.limits.maxCheckpointMemoryMb);
+            assertFalse(wasm.available);
+            assertNull(wasm.nodes);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void runtimesListNormalizesNullListsAndFeatures() throws Exception {
+        AtomicInteger calls = new AtomicInteger();
+        HttpServer server = startServer(exchange -> {
+            String[] replies = {
+                "{\"runtimes\":null}",
+                "{}",
+                "{\"runtimes\":[null,{\"name\":\"docker\",\"isolation\":\"container\",\"features\":null,\"available\":true}]}",
+            };
+            String reply = replies[Math.min(calls.getAndIncrement(), replies.length - 1)];
+            writeResponse(exchange, 200, "application/json", reply.getBytes(StandardCharsets.UTF_8));
+        });
+        try {
+            MicroVMClient client = clientFor(server);
+            assertTrue(client.runtimes().list().isEmpty());
+            assertTrue(client.runtimes().list().isEmpty());
+            List<ai.aerol.microvm.model.RuntimeInfo> runtimes = client.runtimes().list();
+            assertEquals(1, runtimes.size());
+            assertEquals("docker", runtimes.get(0).name);
+            assertNotNull(runtimes.get(0).features);
+            assertFalse(runtimes.get(0).features.snapshots);
+            assertNull(runtimes.get(0).features.moves);
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void webSocketHandshakesCarryTheTeam() {
         FakeWebSocketConnector withTeam = new FakeWebSocketConnector();
         new MicroVMClient(

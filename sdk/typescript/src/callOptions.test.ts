@@ -86,6 +86,7 @@ test("sandbox calls and the namespaced helpers take a signal too", async () => {
   await assert.rejects(sandbox.uploadFile("/f", "x", {}, { signal: signal() }), { name: "TimeoutError" });
   await assert.rejects(sandbox.customDomains.list({ signal: signal() }), { name: "TimeoutError" });
   await assert.rejects(sdk.tokens.list({ signal: signal() }), { name: "TimeoutError" });
+  await assert.rejects(sdk.runtimes.list({ signal: signal() }), { name: "TimeoutError" });
   await assert.rejects(sdk.dns.target({ signal: signal() }), { name: "TimeoutError" });
   await assert.rejects(sdk.destroyAll({ tags: { a: "b" } }, { signal: signal() }), { name: "TimeoutError" });
 });
