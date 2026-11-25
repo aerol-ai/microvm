@@ -25,3 +25,21 @@ func TestWarmStartMarker(t *testing.T) {
 		t.Fatal("markers are shared between creates")
 	}
 }
+
+// TestWarmStarted: the create sees its own marker, cold until marked; a
+// context no create set up reports unmeasured.
+func TestWarmStarted(t *testing.T) {
+	ctx, _ := WithWarmStart(context.Background())
+	if warm, measured := WarmStarted(ctx); warm || !measured {
+		t.Fatalf("fresh marker = (%v, %v), want cold and measured", warm, measured)
+	}
+	MarkWarmStart(ctx)
+	if warm, measured := WarmStarted(ctx); !warm || !measured {
+		t.Fatalf("marked = (%v, %v), want warm and measured", warm, measured)
+	}
+	for _, c := range []context.Context{context.Background(), nil} {
+		if warm, measured := WarmStarted(c); warm || measured {
+			t.Fatalf("no marker = (%v, %v), want unmeasured", warm, measured)
+		}
+	}
+}

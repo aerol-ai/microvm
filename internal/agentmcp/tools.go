@@ -46,7 +46,7 @@ func (s *Server) register() {
 		toolset: ToolsetCore, fleet: true, readOnly: true,
 		tool: &mcp.Tool{
 			Name:        "list_runtimes",
-			Description: "List the runtimes sandbox_create can use on this server, as {name, isolation, backend, available, features, limits}. Pick one with available true and pass its name as sandbox_create's runtime. isolation is what separates the sandbox from the server: container (shared kernel), user-space-kernel (gVisor) or hardware-vm (its own kernel). features say what it can do: snapshots, pause (a stop keeps memory), moves and warm_pool.",
+			Description: s.listRuntimesDescription(),
 			Annotations: &mcp.ToolAnnotations{Title: "List runtimes", ReadOnlyHint: true, OpenWorldHint: boolPtr(false)},
 		},
 	}, s.listRuntimes)
@@ -263,6 +263,19 @@ func (s *Server) sandboxList(ctx context.Context, in listIn) (listOut, string, e
 }
 
 type listRuntimesIn struct{}
+
+// listRuntimesDescription tells the model what the rows mean and what to
+// do with them. With --read-only there is no sandbox_create to pass a name
+// to, so the last sentence says what the list is for there instead.
+func (s *Server) listRuntimesDescription() string {
+	const rows = "List the runtimes sandbox_create can use on this server, as {name, isolation, backend, available, features, limits}. " +
+		"isolation is what separates the sandbox from the server: container (shared kernel), user-space-kernel (gVisor), hardware-vm (its own kernel) or wasm (one WebAssembly module, no Linux inside). " +
+		"features say what it can do: snapshots, pause (a stop keeps memory), moves and warm_pool."
+	if s.opts.ReadOnly {
+		return rows + " This server is read-only, so it cannot create sandboxes: use the list to see what the runtime of a sandbox from sandbox_list can do."
+	}
+	return rows + " Pick one with available true and pass its name as sandbox_create's runtime."
+}
 
 // RuntimeRow is one runtime as list_runtimes shows it to the model. It
 // keeps what helps pick a runtime and drops the node count a fleet admin's

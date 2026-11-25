@@ -1211,6 +1211,30 @@ class MicroVMClientTest {
     }
 
     @Test
+    void getReadsBackendAndWarm() throws Exception {
+        HttpServer server = startServer(exchange -> {
+            if ("/v1/sandboxes/sb-vm".equals(exchange.getRequestURI().getPath())) {
+                writeJson(exchange, 200, mapOf("id", "sb-vm", "image", "alpine", "status", "started",
+                    "runtime", "firecracker", "backend", "kvm", "warm", "snapshot"));
+                return;
+            }
+            writeJson(exchange, 200, mapOf("id", "sb-old", "image", "alpine", "status", "started", "runtime", "docker"));
+        });
+        try {
+            Sandbox vm = clientFor(server).get("sb-vm");
+            assertEquals("kvm", vm.backend);
+            assertEquals("snapshot", vm.warm);
+            assertEquals("kvm", vm.toData().backend, "copy keeps the backend");
+            assertEquals("snapshot", vm.toData().warm, "copy keeps warm");
+            Sandbox old = clientFor(server).get("sb-old");
+            assertNull(old.backend, "absent backend stays null");
+            assertNull(old.warm, "absent warm stays null");
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void setNetworkPolicyPutsWholePolicyAndUpdatesSandbox() throws Exception {
         AtomicReference<Map<String, Object>> body = new AtomicReference<>();
         HttpServer server = startServer(exchange -> {

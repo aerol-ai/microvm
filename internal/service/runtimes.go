@@ -1,11 +1,15 @@
 package service
 
 import (
+	"errors"
 	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/pkg/models"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -78,6 +82,34 @@ func (s *Service) RuntimeOffers() map[string]int {
 		return s.localRuntimeOffers()
 	}
 	return s.runtimeOffers.get(func() map[string]int { return clusterRuntimeOffers(c) })
+}
+
+// ExplainRuntimeRefusal names the runtimes this deployment offers on a
+// refused create that asked for one it does not offer
+// (plans/security-gaps-m1-m4.md §11, R18). The create still fails as it
+// did: the result unwraps to err, so its HTTP status and every errors.Is
+// check are unchanged, and nothing is swapped for the runtime asked for.
+// The names come from RuntimeOffers, the data GET /v1/runtimes reads, and
+// are names only: never a node or a count.
+//
+// It runs only after a create has failed, so a create that succeeds does
+// no extra work. A refusal of a runtime that is offered (a full cluster, a
+// bad image) is returned as it is. On a cluster node RuntimeOffers is one
+// cached Members() read at most every runtimeOffersTTL.
+func (s *Service) ExplainRuntimeRefusal(runtime string, err error) error {
+	runtime = strings.TrimSpace(runtime)
+	if err == nil || runtime == "" {
+		return err
+	}
+	var explained *models.RuntimeNotOfferedError
+	if errors.As(err, &explained) {
+		return err
+	}
+	offered := models.OfferedRuntimes(s.RuntimeOffers())
+	if slices.Contains(offered, runtime) {
+		return err
+	}
+	return &models.RuntimeNotOfferedError{Runtime: runtime, Offered: offered, Err: err}
 }
 
 // localRuntimeOffers is a single node's offers: what its admitter admits.

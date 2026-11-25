@@ -168,7 +168,7 @@
       "readOnlyHint": true,
       "title": "List runtimes"
     },
-    "description": "List the runtimes sandbox_create can use on this server, as {name, isolation, backend, available, features, limits}. Pick one with available true and pass its name as sandbox_create's runtime. isolation is what separates the sandbox from the server: container (shared kernel), user-space-kernel (gVisor) or hardware-vm (its own kernel). features say what it can do: snapshots, pause (a stop keeps memory), moves and warm_pool.",
+    "description": "List the runtimes sandbox_create can use on this server, as {name, isolation, backend, available, features, limits}. isolation is what separates the sandbox from the server: container (shared kernel), user-space-kernel (gVisor), hardware-vm (its own kernel) or wasm (one WebAssembly module, no Linux inside). features say what it can do: snapshots, pause (a stop keeps memory), moves and warm_pool. This server is read-only, so it cannot create sandboxes: use the list to see what the runtime of a sandbox from sandbox_list can do.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {},

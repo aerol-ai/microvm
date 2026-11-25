@@ -1,5 +1,10 @@
 package models
 
+import (
+	"fmt"
+	"strings"
+)
+
 // The runtime feature table (plans/security-gaps-m1-m4.md §11): what each
 // runtime name a create accepts can do. It is the one place this is
 // written down. GET /v1/runtimes reads it today; the create error that
@@ -187,6 +192,76 @@ func (r RuntimeInfo) clone() RuntimeInfo {
 		r.Limits = &limits
 	}
 	return r
+}
+
+// RuntimeBackend is the backend a sandbox of this runtime runs on, from the
+// table: "kvm" for firecracker, "" for runtimes that are not VMs and for
+// names the table does not hold.
+func RuntimeBackend(name string) string {
+	for _, row := range runtimeTable {
+		if row.Name == name {
+			return row.Backend
+		}
+	}
+	return ""
+}
+
+// WarmStartKind is the Sandbox.Warm value for a create of runtime that a
+// warm pool served (warm) or not: the table's warm-pool kind for the
+// runtime, or WarmPoolKindNone. A runtime the table says has no warm pool
+// but that was still served warm is reported as parked: something was
+// running before the create asked for it.
+func WarmStartKind(runtime string, warm bool) string {
+	if !warm {
+		return WarmPoolKindNone
+	}
+	for _, row := range runtimeTable {
+		if row.Name == runtime && row.Features.WarmPool != WarmPoolKindNone {
+			return row.Features.WarmPool
+		}
+	}
+	return WarmPoolKindParked
+}
+
+// RuntimeNotOfferedError is a refused create that asked for a runtime this
+// deployment does not offer now (plans/security-gaps-m1-m4.md §11, R18).
+// It names the runtimes that are offered, so the caller can pick one;
+// nothing is swapped for them. Offered holds names only: never a node or a
+// count. It unwraps to the refusal it explains, so the HTTP status and every
+// errors.Is check stay what they were.
+type RuntimeNotOfferedError struct {
+	Runtime string
+	// Offered is every available runtime, in the table's order.
+	Offered []string
+	Err     error
+}
+
+// Error puts the offered runtimes first: some refusals are cut to 200
+// characters on the way out (apihttp.Classify), and the list is the part a
+// caller acts on.
+func (e *RuntimeNotOfferedError) Error() string {
+	offered := "none"
+	if len(e.Offered) > 0 {
+		offered = strings.Join(e.Offered, ", ")
+	}
+	if e.Err == nil {
+		return fmt.Sprintf("runtime %q is not offered here (offered: %s)", e.Runtime, offered)
+	}
+	return fmt.Sprintf("runtime %q is not offered here (offered: %s): %v", e.Runtime, offered, e.Err)
+}
+
+func (e *RuntimeNotOfferedError) Unwrap() error { return e.Err }
+
+// OfferedRuntimes is the names ListRuntimes marks available for offers, in
+// the table's order.
+func OfferedRuntimes(offers map[string]int) []string {
+	var out []string
+	for _, entry := range ListRuntimes(offers, false).Runtimes {
+		if entry.Available {
+			out = append(out, entry.Name)
+		}
+	}
+	return out
 }
 
 // RuntimeListEntry is one runtime in GET /v1/runtimes.

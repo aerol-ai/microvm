@@ -44,3 +44,32 @@ func TestRuntimesList(t *testing.T) {
 		t.Fatalf("wasm = %+v", wasm)
 	}
 }
+
+// TestSandboxBackendAndWarm: a sandbox carries the backend it runs on and
+// how its create started; a server that sends neither leaves both empty.
+func TestSandboxBackendAndWarm(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sandboxes/sb-vm":
+			_, _ = w.Write([]byte(`{"id":"sb-vm","status":"started","runtime":"firecracker","backend":"kvm","warm":"snapshot"}`))
+		case "/v1/sandboxes/sb-old":
+			_, _ = w.Write([]byte(`{"id":"sb-old","status":"started","runtime":"docker"}`))
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClientWithConfig(&sdktypes.MicroVMConfig{PATToken: "pat", APIUrl: server.URL})
+	if err != nil {
+		t.Fatalf("NewClientWithConfig: %v", err)
+	}
+	vm, err := client.Get(context.Background(), "sb-vm")
+	if err != nil || vm.Backend != "kvm" || vm.Warm != "snapshot" {
+		t.Fatalf("Get(sb-vm) = %+v, %v; want backend kvm and warm snapshot", vm, err)
+	}
+	old, err := client.Get(context.Background(), "sb-old")
+	if err != nil || old.Backend != "" || old.Warm != "" {
+		t.Fatalf("Get(sb-old) = %+v, %v; want both empty", old, err)
+	}
+}

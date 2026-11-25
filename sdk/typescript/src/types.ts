@@ -827,6 +827,19 @@ export interface Sandbox {
    * a pre-migration row that resolves to the host default at start time.
    */
   runtime: "" | "docker" | "gvisor" | "kata" | "firecracker" | "wasm" | "isolate";
+  /**
+   * The hardware a VM runtime runs on: `"kvm"` for `firecracker`. Absent for
+   * runtimes that are not VMs.
+   */
+  backend?: string;
+  /**
+   * How the create that made this sandbox started: `"snapshot"` (a
+   * Firecracker VM the warm pool had already restored), `"parked"` (a
+   * container, WASM worker or workerd host started ahead of time) or
+   * `"none"` (nothing was waiting). Absent on sandboxes made before the
+   * server recorded it, or moved between nodes.
+   */
+  warm?: string;
   /** Survival class this sandbox was created with. */
   durability?: Durability;
   /** Resolved WASM module / isolate bundle reference when runtime is wasm or isolate. */

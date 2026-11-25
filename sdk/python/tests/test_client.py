@@ -1084,6 +1084,23 @@ class ClientTests(unittest.TestCase):
         self.assertNotIn("statusReason", plain)
         self.assertNotIn("exitCode", plain)
 
+    def test_sandbox_maps_backend_and_warm(self):
+        from microvm.client import Sandbox, _from_api_sandbox
+
+        vm = _from_api_sandbox({"id": "sb", "runtime": "firecracker", "backend": "kvm", "warm": "snapshot"})
+        self.assertEqual((vm["backend"], vm["warm"]), ("kvm", "snapshot"))
+        sandbox = Sandbox(None, vm)
+        self.assertEqual((sandbox.backend, sandbox.warm), ("kvm", "snapshot"))
+        # A container has no backend; an older server sends neither field.
+        for wire in ({"id": "sb", "runtime": "docker", "warm": "parked"}, {"id": "sb", "runtime": "docker"}):
+            data = _from_api_sandbox(wire)
+            self.assertNotIn("backend", data)
+            self.assertEqual(Sandbox(None, data).backend, None)
+        self.assertEqual(Sandbox(None, _from_api_sandbox({"id": "sb", "warm": "parked"})).warm, "parked")
+        old = _from_api_sandbox({"id": "sb", "runtime": "docker", "backend": "", "warm": ""})
+        self.assertNotIn("warm", old)
+        self.assertIsNone(Sandbox(None, old).warm)
+
     def test_get_audit_sends_filters_and_maps_page(self):
         client = RecordingMicroVM()
 

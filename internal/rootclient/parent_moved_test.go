@@ -3,12 +3,15 @@ package rootclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	cntr "github.com/containerd/containerd/v2/client"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -153,15 +156,19 @@ func TestParentChecked(t *testing.T) {
 	}
 }
 
-// TestContainerdRedialShakesHandsAgain: the first containerd dial uses the
-// handshake the client has; each one after it, a reconnect, asks the
-// helper again. Calls on an open connection add none.
+// TestContainerdRedialShakesHandsAgain: every containerd dial asks the
+// helper again, the first one too, even when the client shook hands before
+// it (a containerd client made after the helper changed). Calls on an open
+// connection add none.
 func TestContainerdRedialShakesHandsAgain(t *testing.T) {
 	sock := sockPath(t)
 	f := helperAt(rootdpb.APIVersion)
 	serveFake(t, sock, f)
 	c := newClient(t, sock)
-	for i, want := range []int{1, 2, 3} {
+	if err := c.Ensure(ctxT(t)); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []int{2, 3, 4} {
 		conn, err := c.DialContainerd(ctxT(t), "")
 		if err != nil {
 			t.Fatal(err)
@@ -177,7 +184,52 @@ func TestContainerdRedialShakesHandsAgain(t *testing.T) {
 	if err := c2.recheck(ctxT(t)); err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := f.counts(); v != 4 {
-		t.Fatalf("%d handshakes, want 4", v)
+	if v, _ := f.counts(); v != 5 {
+		t.Fatalf("%d handshakes, want 5", v)
+	}
+}
+
+// TestParentMovedFirstContainerdClient: the client shook hands with the
+// helper before it restarted, and a containerd client is made for the
+// first time after (the event monitor's, or the driver's first use). Its
+// first connection shakes hands first, finds the parent moved, and no
+// containerd call reaches the new helper's gate.
+func TestParentMovedFirstContainerdClient(t *testing.T) {
+	const before, after = "/kubepods/pod1/ctr-a/sandboxes", "/kubepods/pod1/ctr-b/sandboxes"
+	sock := sockPath(t)
+	first := realHelperWith(t, sock, func(c *rootd.Config) { c.Policy.CgroupParent = before }, nil)
+	hook := &movedHook{}
+	c := parentClient(t, sock, before, hook)
+	if err := c.Ensure(ctxT(t)); err != nil {
+		t.Fatal(err)
+	}
+	first.Shutdown(context.Background())
+	var reached atomic.Int32
+	realHelperWith(t, sock, func(c *rootd.Config) { c.Policy.CgroupParent = after }, func(o *rootd.Options) {
+		o.Containerd = func(_ any, _ grpc.ServerStream) error {
+			reached.Add(1)
+			return status.Error(codes.PermissionDenied, "test gate: no call may reach it")
+		}
+	})
+	ctr, err := cntr.New(c.Socket(), append(c.ContainerdOptions(), cntr.WithDefaultNamespace("aerolvm"))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctr.Close()
+	var pm *ParentMovedError
+	eventually(t, func() error {
+		if _, err := ctr.Version(ctxT(t)); !errors.Is(err, ErrUnavailable) {
+			return fmt.Errorf("containerd Version = %v, want ErrUnavailable", err)
+		}
+		if err := c.Ensure(ctxT(t)); !errors.As(err, &pm) {
+			return fmt.Errorf("Ensure = %v, want a ParentMovedError", err)
+		}
+		return nil
+	})
+	if n := reached.Load(); n != 0 {
+		t.Fatalf("%d containerd calls reached the new helper's gate", n)
+	}
+	if got := hook.heard(); len(got) != 1 {
+		t.Fatalf("the agent heard %v, want the move once", got)
 	}
 }

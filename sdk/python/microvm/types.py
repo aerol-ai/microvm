@@ -803,6 +803,15 @@ class SandboxData(TypedDict, total=False):
     # Container runtime this sandbox is running under. Empty string indicates
     # a pre-migration row that resolves to the host default at start time.
     runtime: Literal["", "docker", "gvisor", "kata", "firecracker", "wasm", "isolate"]
+    # The hardware a VM runtime runs on: "kvm" for firecracker. Absent for
+    # runtimes that are not VMs.
+    backend: str
+    # How the create that made this sandbox started: "snapshot" (a
+    # Firecracker VM the warm pool had already restored), "parked" (a
+    # container, WASM worker or workerd host started ahead of time) or
+    # "none" (nothing was waiting). Absent on sandboxes made before the
+    # field, or moved between nodes.
+    warm: Literal["snapshot", "parked", "none"]
     durability: Literal["ephemeral", "passivatable", "durable"]
     module_ref: str
     module_digest: str
