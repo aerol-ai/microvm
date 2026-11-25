@@ -159,7 +159,7 @@ func kindsFixture(h *harness, f *fakeKinds) {
 		ExposedPorts: []models.ExposedPort{{Port: 8080, Protocol: "http", PublicURL: "https://8080-box.example.com"}, {Port: 5432, Protocol: "tcp", HostPort: 22001}},
 		Lifecycle:    models.Lifecycle{StopIfIdleFor: 30 * time.Minute, DestroyAtAge: 48 * time.Hour},
 		LastActiveAt: kindsNow.Add(-90 * time.Second), NetworkAllowOut: []string{"pypi.org", "*.pythonhosted.org"},
-		Engine: "containerd", StatusReason: "warm", ExitCode: &exit, LastError: "toolbox restarted once"})
+		Engine: "containerd", StatusReason: "warm", ExitCode: &exit, LastError: "toolbox restarted once", Warm: models.WarmPoolKindParked})
 	h.fake.AddSandbox(models.Sandbox{Name: "db", Image: "postgres:17", Runtime: "docker", Tags: map[string]string{"app": "db"},
 		NetworkBlockAll: true, CreatedAt: kindsNow.Add(-5 * time.Hour)})
 	h.fake.AddSandbox(models.Sandbox{Runtime: "wasm", Status: models.SandboxStatusStopped, Tags: map[string]string{"app": "web"},

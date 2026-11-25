@@ -302,7 +302,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	host.DiskTotalGB = max(cfg.HostDiskGB, 0)
 	host.GPUCount = cfg.HostGPUCount
 	host.GPUVendor = cfg.HostGPUVendor
-	host.SupportedRuntimes = supportedRuntimesForConfig(cfg)
+	advertised, switchedOff := supportedRuntimesForConfig(cfg)
+	host.SupportedRuntimes = advertised
+	warnSwitchedOffRuntimes(logger, switchedOff)
 	host.Labels = hostLabels(cfg)
 	// Phase 5: the per-VMM RSS sampler is constructed up front when
 	// firecracker is enabled so admission can be wired against it from
@@ -2109,25 +2111,6 @@ func readBypassMarker(path string) bool {
 	return string(bytesTrimSpace(data)) == "true"
 }
 
-// supportedRuntimesForConfig builds the host's advertised runtime list from the
-// daemon config. This is what cluster placement (placement.go nodeFits) filters
-// candidate nodes against: a runtime absent here makes the host an invalid
-// placement target for that runtime and every create is rejected with
-// ErrNoPlacementTarget — even single-node, which runs as a 1-member cluster.
-//
-// SB_HOST_RUNTIMES (cfg.HostSupportedRuntimes) is the explicit override; when
-// unset we default to docker and then advertise each runtime the host actually
-// has enabled. Firecracker and WASM each gate on their own enable flag so a
-// host that wired the driver also tells the cluster it can place that runtime.
-//
-// gVisor is the exception: it has no SB_ENABLE_* flag (it rides on the docker
-// driver + a runsc OCI runtime registered in daemon.json). Its capability is
-// only advertised via SB_HOST_RUNTIMES — which install.sh --with-gvisor now
-// writes. But a node configured with SB_RUNTIME=gvisor as its *default* runtime
-// can clearly run gVisor too, so infer the advertisement from cfg.Runtime as
-// well. Without this, such a node runs gVisor locally yet is invisible to
-// cluster placement and every gVisor create is rejected with
-// ErrNoPlacementTarget (the same class of bug the firecracker/wasm flags fixed).
 // shouldStartSSHGateway decides whether this node binds the per-sandbox SSH
 // gateway. The rule lives on config.Config.RunsSSHGateway so /health probes
 // the gateway on exactly the nodes that start it.
@@ -2156,8 +2139,51 @@ func registerSlotPoolsProvider(cfg config.Config, client any, pools func(context
 	})
 }
 
-func supportedRuntimesForConfig(cfg config.Config) []string {
-	runtimes := cfg.HostSupportedRuntimes
+// supportedRuntimesForConfig builds the host's advertised runtime list from the
+// daemon config. This is what cluster placement (placement.go nodeFits) filters
+// candidate nodes against: a runtime absent here makes the host an invalid
+// placement target for that runtime and every create is rejected with
+// ErrNoPlacementTarget — even single-node, which runs as a 1-member cluster.
+// The same list is what GET /v1/runtimes reports as available, and what a
+// refused create names as offered.
+//
+// SB_HOST_RUNTIMES (cfg.HostSupportedRuntimes) is the explicit override; when
+// unset we default to docker and then advertise each runtime the host actually
+// has enabled. Firecracker, WASM and isolate each gate on their own enable flag
+// so a host that wired the driver also tells the cluster it can place that
+// runtime.
+//
+// The flags gate SB_HOST_RUNTIMES too: a name it lists whose switch is off
+// (firecracker without SB_ENABLE_FIRECRACKER; wasm or isolate without its flag,
+// or on a node that is not a worker) is dropped and returned in switchedOff,
+// which the daemon logs once at start. Advertising it made GET /v1/runtimes
+// call it available and let placement send its creates to a node that refuses
+// every one. If nothing is left, the node advertises docker, as it does with
+// SB_HOST_RUNTIMES unset: an empty list would read as a legacy node that takes
+// any runtime.
+//
+// gVisor is the exception: it has no SB_ENABLE_* flag (it rides on the docker
+// driver + a runsc OCI runtime registered in daemon.json). Its capability is
+// only advertised via SB_HOST_RUNTIMES — which install.sh --with-gvisor now
+// writes. But a node configured with SB_RUNTIME=gvisor as its *default* runtime
+// can clearly run gVisor too, so infer the advertisement from cfg.Runtime as
+// well. Without this, such a node runs gVisor locally yet is invisible to
+// cluster placement and every gVisor create is rejected with
+// ErrNoPlacementTarget (the same class of bug the firecracker/wasm flags fixed).
+func supportedRuntimesForConfig(cfg config.Config) (runtimes, switchedOff []string) {
+	// A fresh slice: appending to cfg.HostSupportedRuntimes could write into
+	// the config's own backing array.
+	for _, name := range cfg.HostSupportedRuntimes {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if runtimeSwitchedOff(cfg, name) {
+			switchedOff = append(switchedOff, name)
+			continue
+		}
+		runtimes = append(runtimes, name)
+	}
 	if len(runtimes) == 0 {
 		runtimes = []string{models.RuntimeDocker}
 	}
@@ -2173,7 +2199,32 @@ func supportedRuntimesForConfig(cfg config.Config) []string {
 	if cfg.EnableIsolate && cfg.IsWorker() {
 		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeIsolate)
 	}
-	return runtimes
+	return runtimes, switchedOff
+}
+
+// runtimeSwitchedOff reports whether name is a runtime with its own switch
+// that this node has off. Names with no switch (docker, gvisor, the reserved
+// kata, free text) are never switched off here.
+func runtimeSwitchedOff(cfg config.Config, name string) bool {
+	switch name {
+	case models.RuntimeFirecracker:
+		return !cfg.EnableFirecracker
+	case models.RuntimeWasm:
+		return !cfg.EnableWasm || !cfg.IsWorker()
+	case models.RuntimeIsolate:
+		return !cfg.EnableIsolate || !cfg.IsWorker()
+	}
+	return false
+}
+
+// warnSwitchedOffRuntimes logs, once at start, the SB_HOST_RUNTIMES names
+// this node does not advertise because their switch is off.
+func warnSwitchedOffRuntimes(logger *slog.Logger, switchedOff []string) {
+	if logger == nil || len(switchedOff) == 0 {
+		return
+	}
+	logger.Warn("SB_HOST_RUNTIMES lists runtimes this node cannot run, so it does not advertise them: turn on SB_ENABLE_FIRECRACKER, SB_ENABLE_WASM or SB_ENABLE_ISOLATE (WASM and isolate run only on a worker), or remove them from SB_HOST_RUNTIMES",
+		"runtimes", strings.Join(switchedOff, ","))
 }
 
 func appendRuntimeIfMissing(runtimes []string, runtimeName string) []string {

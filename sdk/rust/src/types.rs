@@ -845,7 +845,10 @@ pub struct Sandbox {
     /// Firecracker VM the warm pool had already restored), `"parked"` (a
     /// container, WASM worker or workerd host started ahead of time) or
     /// `"none"` (nothing was waiting). `None` for a sandbox made before the
-    /// server recorded it, or moved between nodes.
+    /// server recorded it, a WASM sandbox moved to another node, or a durable
+    /// WASM sandbox recreated after its node failed. A Firecracker sandbox
+    /// moved to another node keeps its value; a gVisor sandbox moved with its
+    /// memory reports how it was rebuilt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warm: Option<String>,
     /// GPU configuration this sandbox was created with. `None` means no GPU
