@@ -73,6 +73,23 @@ func TestWireNetnsPoolClearsADeadHoldersRulesInSingleMode(t *testing.T) {
 	}
 	t.Cleanup(wired.Stop)
 
+	// The wiring also starts the refiller, and its first pass runs at once
+	// (depth 0 means its default of 4). In a test it cannot build a slot
+	// (there are no CNI plugins), and its teardown fails too. So it takes
+	// the pool's only slot and parks it as releasing, about 1 ms after the
+	// wiring returns on a Mac. A Reserve that came later failed with "no
+	// free slot" (1 run in 3,000). The refiller is not what this test is
+	// about: stop it, give back any slot it parked (a fake host's teardown
+	// works), and check the pool is all free before the test sets up its
+	// dead holder.
+	wired.Stop()
+	if _, err := wired.pool.RetryReleasing(ctx, netns.NewFakeHost(), time.Now()); err != nil {
+		t.Fatalf("give back the refiller's slot: %v", err)
+	}
+	if stats, err := wired.pool.Stats(ctx); err != nil || stats.Free != stats.Total || stats.Total != 1 {
+		t.Fatalf("setup: pool %+v, %v; want its one slot free", stats, err)
+	}
+
 	// A sandbox held a slot and had its rules on; it died while sandboxd
 	// was down.
 	now := time.Now()
