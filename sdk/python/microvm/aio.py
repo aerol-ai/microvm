@@ -34,6 +34,7 @@ from .client import (
     MicroVMError,
     MicroVMNotFoundError,
     MicroVMTimeoutError,
+    Runtimes,
     SessionAttachHandle,
     Tokens,
     _call_deadline,
@@ -54,6 +55,7 @@ from .client import (
 from .image import Image
 from .types import (
     APITokenList,
+    RuntimeInfo,
     AuditOptions,
     AuditPage,
     BuildImagePushOptions,
@@ -408,6 +410,18 @@ class AsyncTokens:
     async def revoke(self, token_id: str, *, timeout: Optional[float] = None) -> None:
         with _call_deadline(timeout):
             return await self._client._run(self._client._op_revoke_api_token(token_id))
+
+
+class AsyncRuntimes:
+    """The runtimes a create can ask for, reached as ``client.runtimes``;
+    see :class:`Runtimes`."""
+
+    def __init__(self, client: "AsyncMicroVM") -> None:
+        self._client = client
+
+    async def list(self, *, timeout: Optional[float] = None) -> List[RuntimeInfo]:
+        with _call_deadline(timeout):
+            return await self._client._run(self._client._op_list_runtimes())
 
 
 class AsyncSandbox(_SandboxBase):
@@ -1592,6 +1606,7 @@ class AsyncMicroVM(_MicroVMCore):
 
 AsyncMicroVM._sandbox_class = AsyncSandbox
 AsyncMicroVM._tokens_class = AsyncTokens
+AsyncMicroVM._runtimes_class = AsyncRuntimes
 
 
 def _copy_docs(sync_cls: type, async_cls: type) -> None:
@@ -1604,5 +1619,5 @@ def _copy_docs(sync_cls: type, async_cls: type) -> None:
             member.__doc__ = source.__doc__
 
 
-for _sync_cls, _async_cls in ((MicroVM, AsyncMicroVM), (MicroVM._sandbox_class, AsyncSandbox), (Tokens, AsyncTokens)):
+for _sync_cls, _async_cls in ((MicroVM, AsyncMicroVM), (MicroVM._sandbox_class, AsyncSandbox), (Tokens, AsyncTokens), (Runtimes, AsyncRuntimes)):
     _copy_docs(_sync_cls, _async_cls)

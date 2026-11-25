@@ -37,7 +37,14 @@ type moveSide struct {
 func startMoveHelper(t *testing.T) moveSide {
 	t.Helper()
 	var s moveSide
-	bin := t.TempDir()
+	// The helper runs runsc as root, so its check walks every folder of
+	// the path with no link followed. The temp folder is the real one, not
+	// a name through a link: on macOS t.TempDir is below /var, a link to
+	// /private/var.
+	bin, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.log = filepath.Join(bin, "runsc.log")
 	script := "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --image-path=*) d=\"${a#--image-path=}\";; esac; done\n" +
 		"echo \"$@\" >> " + s.log + "\nprintf state > \"$d/checkpoint.img\"\nprintf memory > \"$d/pages.img\"\n"

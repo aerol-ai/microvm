@@ -340,6 +340,27 @@ type CreateAPITokenOptions = models.CreateAPITokenRequest
 // APITokenList is Tokens().List's result.
 type APITokenList = models.APITokenList
 
+// RuntimeInfo is one runtime as Runtimes().List returns it: a name a create
+// accepts (Runtime on CreateSandboxRequest), its Isolation ("container",
+// "user-space-kernel", "hardware-vm", "wasm" or "v8-isolate"), the Backend
+// a VM runtime runs on ("kvm"; empty for the rest), what it can do, fixed
+// Limits (nil when it has none), and Available: whether at least one node
+// offers it now. Nodes is how many nodes offer it; the server sends it to
+// fleet admins only, so for everyone else it is nil. No node names are ever
+// sent.
+type RuntimeInfo = models.RuntimeListEntry
+
+// RuntimeFeatures is what a runtime can do. Moves is "memory", "disk" or
+// "none": what a sandbox keeps when the cluster moves it to another node.
+// WarmPool is "snapshot", "parked" or "none": how a create can start warm,
+// if the operator runs a pool.
+type RuntimeFeatures = models.RuntimeFeatures
+
+// RuntimeLimits are fixed limits a runtime has whatever the operator sets.
+// MaxCheckpointMemoryMB is the most memory a checkpoint can restore (zero:
+// no such limit).
+type RuntimeLimits = models.RuntimeLimits
+
 // CreateSandboxTokenOptions is the body of Sandbox.CreateToken: a signed
 // token for one sandbox that can be handed to a browser or an end user.
 // ExpiresIn is required ("15m", "2h", "1d") and capped by the server (24h

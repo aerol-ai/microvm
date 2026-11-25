@@ -141,6 +141,14 @@ type Server struct {
 	FailCreates int
 	// CreateDelay holds each create this long, to widen races in tests.
 	CreateDelay time.Duration
+	// RuntimeOffers is how many nodes offer each runtime name, which GET
+	// /v1/runtimes reports through models.ListRuntimes as the real server
+	// does. Nil offers docker on one node, like a plain single-node install.
+	RuntimeOffers map[string]int
+	// RuntimeNodes plays a fleet admin: GET /v1/runtimes adds node counts.
+	RuntimeNodes bool
+	// FailRuntimes makes GET /v1/runtimes fail with 500.
+	FailRuntimes bool
 
 	// Observations.
 
@@ -271,6 +279,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		s.list(w, r)
 	case path == "/sandboxes" && r.Method == http.MethodPost:
 		s.create(w, r)
+	case path == "/runtimes" && r.Method == http.MethodGet:
+		s.runtimes(w)
 	case strings.HasPrefix(path, "/sandboxes/"):
 		rest := strings.TrimPrefix(path, "/sandboxes/")
 		id, sub, _ := strings.Cut(rest, "/")
@@ -278,6 +288,22 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusNotFound, "no route")
 	}
+}
+
+// runtimes answers GET /v1/runtimes from the real feature table, so the
+// rows a test sees are the ones sandboxd would send.
+func (s *Server) runtimes(w http.ResponseWriter) {
+	s.mu.Lock()
+	offers, withNodes, fail := s.RuntimeOffers, s.RuntimeNodes, s.FailRuntimes
+	s.mu.Unlock()
+	if fail {
+		writeErr(w, http.StatusInternalServerError, "runtimes failed")
+		return
+	}
+	if offers == nil {
+		offers = map[string]int{models.RuntimeDocker: 1}
+	}
+	writeJSON(w, http.StatusOK, models.ListRuntimes(offers, withNodes))
 }
 
 func (s *Server) list(w http.ResponseWriter, r *http.Request) {

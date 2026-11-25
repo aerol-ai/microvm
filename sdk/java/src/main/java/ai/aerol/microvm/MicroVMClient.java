@@ -33,6 +33,9 @@ import ai.aerol.microvm.model.CreateApiTokenOptions;
 import ai.aerol.microvm.model.CreatedApiToken;
 import ai.aerol.microvm.model.CreateSandboxTokenOptions;
 import ai.aerol.microvm.model.RevokeSandboxTokensResult;
+import ai.aerol.microvm.model.RuntimeFeatures;
+import ai.aerol.microvm.model.RuntimeInfo;
+import ai.aerol.microvm.model.RuntimeList;
 import ai.aerol.microvm.model.SandboxToken;
 import ai.aerol.microvm.model.WhoAmI;
 import ai.aerol.microvm.model.AuditCoverage;
@@ -301,6 +304,48 @@ public class MicroVMClient {
                 throw new MicroVMException("token id is required");
             }
             doNoContent("DELETE", versioned("/tokens/" + encodePathSegment(trimmed)), null);
+        }
+    }
+
+    /**
+     * The runtimes this deployment knows: {@code client.runtimes().list()}.
+     * Use it to pick a {@code runtime} for create.
+     */
+    public Runtimes runtimes() {
+        return new Runtimes();
+    }
+
+    /**
+     * The runtime listing, reached through {@link MicroVMClient#runtimes()}.
+     * Any credential that may read sandboxes may list runtimes.
+     */
+    public final class Runtimes {
+        private Runtimes() {
+        }
+
+        /**
+         * Lists every runtime a create accepts, in the server's order: its
+         * isolation kind, what it can do, and whether this deployment
+         * offers it now ({@code available}). It only reads, so a retry is
+         * safe. Only fleet admins get {@code nodes} (how many nodes offer
+         * it); no caller ever sees node names.
+         */
+        public List<RuntimeInfo> list() {
+            RuntimeList list = doJson("GET", versioned("/runtimes"), null, RuntimeList.class);
+            List<RuntimeInfo> out = new ArrayList<>();
+            if (list == null || list.runtimes == null) {
+                return out;
+            }
+            for (RuntimeInfo runtime : list.runtimes) {
+                if (runtime == null) {
+                    continue;
+                }
+                if (runtime.features == null) {
+                    runtime.features = new RuntimeFeatures();
+                }
+                out.add(runtime);
+            }
+            return out;
         }
     }
 

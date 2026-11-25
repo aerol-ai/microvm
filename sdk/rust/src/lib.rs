@@ -41,7 +41,8 @@ pub use types::{
     STATUS_REASON_MAX_AGE, STATUS_REASON_OUT_OF_MEMORY, STATUS_REASON_PROGRAM_EXITED,
     STATUS_REASON_RECONCILE, STATUS_REASON_RESTARTED, STATUS_REASON_USER_STOP,
 };
-use types::{CustomDomainListWire, ExposePortResponseWire, WarmPoolListWire};
+use types::{CustomDomainListWire, ExposePortResponseWire, RuntimeListWire, WarmPoolListWire};
+pub use types::{RuntimeFeatures, RuntimeInfo, RuntimeLimits};
 pub use types::{ApiToken, ApiTokenList, CreateApiTokenOptions, CreatedApiToken, WhoAmI, WhoAmIPrincipal};
 pub use types::{CreateSandboxTokenOptions, ExposeVisibility, RevokeSandboxTokensResult, SandboxToken};
 pub use types::{
@@ -608,6 +609,27 @@ impl Tokens<'_> {
         }
         let path = self.path(&format!("/{}", urlencoding::encode(id)));
         self.client.do_json::<(), ()>(Method::DELETE, &path, None)
+    }
+}
+
+/// The runtimes this server offers, reached through [`Client::runtimes`].
+/// A read: any credential that may read sandboxes may list them.
+pub struct Runtimes<'a> {
+    client: &'a Client,
+}
+
+impl Runtimes<'_> {
+    /// Lists every runtime a create accepts: its isolation, what it can do,
+    /// and whether this server offers it now (`available`). Pick one whose
+    /// `available` is true and pass its `name` as `runtime` on create.
+    /// Safe to retry: it only reads.
+    pub fn list(&self) -> Result<Vec<RuntimeInfo>, Error> {
+        let wire = self.client.do_json::<(), RuntimeListWire>(
+            Method::GET,
+            &format!("{}/runtimes", self.client.version_prefix()),
+            None,
+        )?;
+        Ok(wire.runtimes)
     }
 }
 
@@ -2139,6 +2161,11 @@ impl Client {
     /// Scoped API tokens: `client.tokens().create/list/revoke`.
     pub fn tokens(&self) -> Tokens<'_> {
         Tokens { client: self }
+    }
+
+    /// The runtimes this server offers: `client.runtimes().list()`.
+    pub fn runtimes(&self) -> Runtimes<'_> {
+        Runtimes { client: self }
     }
 
     pub fn get_audit(&self, id: &str, opts: AuditOptions) -> Result<AuditPage, Error> {
@@ -7580,6 +7607,92 @@ mod tests {
         assert!(list.tokens.is_empty(), "a null list decodes as empty");
         let request = request_rx.recv().expect("request");
         assert_eq!(header_value(&request, TEAM_HEADER), None, "{}", request);
+    }
+
+    // runtimes().list() reads GET /v1/runtimes and maps every field the
+    // server sends. backend, limits and nodes are left out by the server
+    // when they do not apply (nodes for anyone but a fleet admin), and
+    // decode as None.
+    #[test]
+    fn runtimes_list_maps_the_wire_shape() {
+        let body = serde_json::json!({"runtimes": [
+            {"name": "docker", "isolation": "container",
+             "features": {"snapshots": true, "pause": false, "moves": "none", "warm_pool": "parked", "confidential": false},
+             "available": true},
+            {"name": "firecracker", "isolation": "hardware-vm", "backend": "kvm",
+             "features": {"snapshots": true, "pause": true, "moves": "memory", "warm_pool": "snapshot", "confidential": false},
+             "available": false, "nodes": 0, "future_field": "ignored"},
+            {"name": "wasm", "isolation": "wasm",
+             "features": {"snapshots": false, "pause": false, "moves": "memory", "warm_pool": "parked", "confidential": false},
+             "limits": {"max_checkpoint_memory_mb": 1024},
+             "available": true, "nodes": 3}
+        ]});
+        let (url, request_rx) = spawn_route_server(vec![("GET /v1/runtimes ", "200 OK", body.to_string())], 1);
+        let client = team_client(&url, Some("payments"));
+
+        let runtimes = client.runtimes().list().expect("list should succeed");
+        assert_eq!(runtimes.len(), 3);
+
+        let docker = &runtimes[0];
+        assert_eq!(docker.name, "docker");
+        assert_eq!(docker.isolation, "container");
+        assert_eq!(docker.backend, None);
+        assert_eq!(docker.limits, None);
+        assert_eq!(docker.nodes, None, "a tenant gets no node count");
+        assert!(docker.available);
+        assert_eq!(
+            docker.features,
+            RuntimeFeatures {
+                snapshots: true,
+                pause: false,
+                moves: "none".into(),
+                warm_pool: "parked".into(),
+                confidential: false,
+            }
+        );
+
+        let fc = &runtimes[1];
+        assert_eq!(fc.backend.as_deref(), Some("kvm"));
+        assert!(fc.features.pause);
+        assert_eq!(fc.features.moves, "memory");
+        assert_eq!(fc.features.warm_pool, "snapshot");
+        assert!(!fc.available);
+        assert_eq!(fc.nodes, Some(0));
+
+        let wasm = &runtimes[2];
+        assert_eq!(wasm.limits, Some(RuntimeLimits { max_checkpoint_memory_mb: Some(1024) }));
+        assert_eq!(wasm.nodes, Some(3));
+
+        let request = request_rx.recv().expect("request");
+        assert_eq!(request.lines().next().unwrap_or_default(), "GET /v1/runtimes HTTP/1.1");
+        assert_eq!(header_value(&request, TEAM_HEADER), Some("payments"), "{}", request);
+    }
+
+    #[test]
+    fn runtimes_list_reads_null_and_missing_fields_as_empty() {
+        let (url, _rx) = spawn_route_server(vec![("GET /v1/runtimes ", "200 OK", r#"{"runtimes":null}"#.to_string())], 1);
+        let runtimes = team_client(&url, None).runtimes().list().expect("list should succeed");
+        assert!(runtimes.is_empty(), "a null list decodes as empty");
+
+        let bare: RuntimeInfo = serde_json::from_str(r#"{"name":"gvisor"}"#).expect("a sparse entry decodes");
+        assert_eq!(bare.name, "gvisor");
+        assert_eq!(bare.features, RuntimeFeatures::default());
+        assert!(!bare.available);
+        assert_eq!((bare.backend, bare.limits, bare.nodes), (None, None, None));
+    }
+
+    #[test]
+    fn runtimes_list_keeps_the_server_refusal() {
+        let (url, _rx) = spawn_route_server(
+            vec![(
+                "GET /v1/runtimes ",
+                "403 Forbidden",
+                r#"{"error":"sandbox token cannot sandbox.read"}"#.to_string(),
+            )],
+            1,
+        );
+        let err = team_client(&url, None).runtimes().list().expect_err("a refusal is an error");
+        assert!(err.to_string().contains("cannot sandbox.read"), "{}", err);
     }
 
     #[test]
