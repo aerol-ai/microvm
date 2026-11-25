@@ -355,6 +355,15 @@ message VersionResponse {
   // "wasm_worker", "wasm_resident"; rootdpb.HostKindName). The agent asks
   // for a kind only when it is listed.
   repeated string hosts = 5;
+  // The cgroup every sandbox's group must sit directly under: the parent
+  // the gate checks each container's cgroups path against, and the cgroup
+  // part builds its paths from. It is the helper's own
+  // SB_CONTAINERD_CGROUP_PARENT, or containerd's /<namespace> without one.
+  // On Kubernetes it is a group of the runtime container's, new each time
+  // that container starts. An agent whose specs name another parent stops
+  // using the helper, and starts again to read the new one
+  // (internal/rootclient). Unset by a helper older than this field.
+  optional string cgroup_parent = 6;
 }
 
 message EnsureHostRequest {}

@@ -26,6 +26,16 @@
 // which calls this helper serves; a call it lacks is refused here, before
 // it is sent, with an UnsupportedError naming the call and the helper.
 //
+// The handshake also reads the cgroup parent the helper holds sandboxes
+// to. On Kubernetes it is the runtime container's own group, new each time
+// that container starts, while the agent read its parent once, at its own
+// start. A helper whose parent is not the agent's (Config.CgroupParent)
+// fails the handshake with a ParentMovedError, and the client tells the
+// agent once (Config.OnCgroupParentMoved), which starts again to read the
+// new one. Every containerd connection after the first shakes hands again
+// before it is made, so the agent finds out as soon as it reconnects to a
+// helper that came back, before the gate refuses its containers.
+//
 // A call the helper or its gate refuses, on either path, comes back as an
 // error matching ErrRefused, which the API turns into a 500, and is
 // counted and handed to Config.OnRefusal (refusal.go, eng review D9).
@@ -114,6 +124,9 @@ type Info struct {
 	// Hosts are the host kinds the host-process calls serve
 	// (rootdpb.HostKindName).
 	Hosts []string
+	// CgroupParent is the parent the helper holds every sandbox's group
+	// to; empty from a helper older than the field.
+	CgroupParent string
 }
 
 // HasHost reports whether the helper serves host kind k.
@@ -130,7 +143,7 @@ func (i Info) HasPart(part string) bool { return slices.Contains(i.Parts, part) 
 
 func infoOf(resp *rootdpb.VersionResponse) Info {
 	return Info{HelperVersion: resp.GetHelperVersion(), API: resp.GetApi(), Features: resp.GetFeatures(), Parts: resp.GetParts(),
-		Hosts: resp.GetHosts()}
+		Hosts: resp.GetHosts(), CgroupParent: resp.GetCgroupParent()}
 }
 
 // UnsupportedError is a call or a helper this agent cannot use.
@@ -151,6 +164,26 @@ func (e *UnsupportedError) Error() string {
 }
 
 func (e *UnsupportedError) Is(target error) bool { return target == ErrUnsupported }
+
+// ParentMovedError is a helper that holds sandboxes to another cgroup
+// parent than the one this agent's specs name. On Kubernetes that is the
+// runtime container started again: its group, and the sandboxes' parent
+// below it, are new, and every sandbox under the old one ended with it.
+// The gate would refuse each container the agent sends, so the client uses
+// that helper no more; the agent must start again to read the new parent.
+// It matches ErrUnavailable: the API answers 503, and the caller tries
+// again once the agent is back.
+type ParentMovedError struct {
+	// Agent is the parent this agent's specs name; Helper the helper's.
+	Agent, Helper string
+}
+
+func (e *ParentMovedError) Error() string {
+	return fmt.Sprintf("root helper: sandboxes go under cgroup %s now, and this agent puts them under %s: "+
+		"the runtime container started again, and sandboxd must start again to follow it", e.Helper, e.Agent)
+}
+
+func (e *ParentMovedError) Is(target error) bool { return target == ErrUnavailable }
 
 // Config is how to reach the helper.
 type Config struct {
@@ -189,6 +222,17 @@ type Config struct {
 	// the host processes it holds still run (hosts.go). Zero means
 	// DefaultHostWatchInterval.
 	HostWatchInterval time.Duration
+	// CgroupParent is the parent this agent's specs put every sandbox's
+	// group directly under, by the gate's rule (rootpolicy
+	// Policy.SandboxParent): SB_CONTAINERD_CGROUP_PARENT, or /<namespace>
+	// without one. A helper that says another in its handshake is used no
+	// more (ParentMovedError). Empty: not checked.
+	CgroupParent string
+	// OnCgroupParentMoved hears, once, the first ParentMovedError. sandboxd
+	// stops and is started again (the kubelet, or systemd), and then reads
+	// the runtime container's new parent. It runs in a goroutine of its
+	// own.
+	OnCgroupParentMoved func(error)
 }
 
 // session is one connection to the helper and what its handshake said.
@@ -238,12 +282,21 @@ type Client struct {
 	// hostEvery.
 	hosts     hostWatch
 	hostEvery time.Duration
+	// cgroupParent is Config.CgroupParent; onMoved hears the first helper
+	// that says another, once (moved).
+	cgroupParent string
+	onMoved      func(error)
+	moved        atomic.Bool
+	// ctrDials counts the containerd connections dialed: each after the
+	// first is a reconnect, perhaps to a helper that came back.
+	ctrDials atomic.Uint64
 }
 
 // New returns a client. It does not dial: the first call does.
 func New(cfg Config) *Client {
 	c := &Client{socket: cfg.Socket, timeout: cfg.Timeout, netTimeout: cfg.NetworkTimeout, mountTimeout: cfg.MountTimeout, agentVersion: cfg.AgentVersion,
-		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, ""), onRefusal: cfg.OnRefusal, hostEvery: cfg.HostWatchInterval}
+		peer: egress.UnixPeerCheck([]uint32{cfg.HelperUID}, ""), onRefusal: cfg.OnRefusal, hostEvery: cfg.HostWatchInterval,
+		cgroupParent: cfg.CgroupParent, onMoved: cfg.OnCgroupParentMoved}
 	if c.hostEvery <= 0 {
 		c.hostEvery = DefaultHostWatchInterval
 	}
@@ -371,6 +424,12 @@ func (c *Client) run(ctx context.Context, a *attempt, cur *session, rpc rootdpb.
 		err = c.unavailable(err)
 	case resp.GetApi() < rootdpb.MinHelperAPI:
 		err = &UnsupportedError{Helper: infoOf(resp)}
+	case resp.CgroupParent != nil && c.cgroupParent != "" && resp.GetCgroupParent() != c.cgroupParent:
+		pm := &ParentMovedError{Agent: c.cgroupParent, Helper: resp.GetCgroupParent()}
+		err = pm
+		if c.onMoved != nil && c.moved.CompareAndSwap(false, true) {
+			go c.onMoved(pm)
+		}
 	}
 	var ue *UnsupportedError
 	if errors.As(err, &ue) {
@@ -753,7 +812,8 @@ func dropped(err error, trailer metadata.MD) bool {
 // no such failure.
 func droppedBefore(err error) bool {
 	var ue *UnsupportedError
-	return errors.Is(err, ErrUnavailable) && !errors.As(err, &ue)
+	var pm *ParentMovedError
+	return errors.Is(err, ErrUnavailable) && !errors.As(err, &ue) && !errors.As(err, &pm)
 }
 
 func (c *Client) isClosed() bool {
@@ -904,13 +964,36 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 
 // DialContainerd is the dialer containerd's client uses: it makes sure
 // the helper has shaken hands, then connects to its socket, where the gate
-// answers containerd's API. A helper that is down or too old fails the
-// dial with the handshake's error.
+// answers containerd's API. A helper that is down, too old, or whose
+// cgroup parent moved fails the dial with the handshake's error.
+//
+// A dial after the first is a reconnect: the helper the last handshake
+// reached may be gone, swapped for a newer one or started again with its
+// runtime container. So the handshake runs again first (recheck), and a
+// helper whose parent moved is found before any container reaches its
+// gate. One Version call per reconnect; the first dial and every call on
+// an open connection add none.
 func (c *Client) DialContainerd(ctx context.Context, _ string) (net.Conn, error) {
 	if err := c.Ensure(ctx); err != nil {
 		return nil, err
 	}
+	if c.ctrDials.Add(1) > 1 {
+		if err := c.recheck(ctx); err != nil {
+			return nil, err
+		}
+	}
 	return c.dial(ctx)
+}
+
+// recheck shakes hands with the helper again, on the current connection,
+// even with the latch set: callers that recheck at once share one
+// handshake. With no session it is Ensure.
+func (c *Client) recheck(ctx context.Context) error {
+	s := c.sess.Load()
+	if s == nil {
+		return c.Ensure(ctx)
+	}
+	return c.handshake(ctx, s)
 }
 
 // ContainerdOptions make containerd's Go client reach containerd through
