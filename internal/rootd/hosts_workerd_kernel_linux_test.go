@@ -26,7 +26,7 @@ func TestWorkerdJailIsMadeFresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := newWorkerdHosts(&WorkerdHostsConfig{Jail: isolate.RootJail{ChrootBase: base, WorkerdPath: self, UID: 1000, GID: 1000,
-		AgentUID: 65531, SeccompMode: isolate.SeccompEnforce, ShimPath: self}, PidsMax: 64}, filepath.Join(t.TempDir(), "hosts.log"))
+		AgentUID: 65531, SeccompMode: isolate.SeccompEnforce, ShimPath: self}, PidsMax: 64, MaxJails: defaultMaxV8Jails}, filepath.Join(t.TempDir(), "hosts.log"))
 	resp, err := w.prepare("g1", false, nil)
 	if err != nil {
 		t.Fatal(err)

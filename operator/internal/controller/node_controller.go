@@ -570,13 +570,17 @@ func setupHasFailed(pod *corev1.Pod) bool {
 	return false
 }
 
-// setupFailing names why the pod cannot start: its setup container keeps
-// failing, or an image cannot be pulled, past failAfter.
+// setupFailing names why the pod cannot start, past failAfter: an init
+// container keeps failing, or an image cannot be pulled. Any init
+// container: the setup container, and in privilege mode split the
+// split-folders and workerd containers, which run before the runtime
+// container, so the pod never starts while one fails. A crash loop in a
+// main container is not setup; agentReady sees it.
 func setupFailing(pod *corev1.Pod, now time.Time) string {
 	if now.Sub(pod.CreationTimestamp.Time) < failAfter {
 		return ""
 	}
-	for _, list := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
+	for i, list := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
 		for _, cs := range list {
 			w := cs.State.Waiting
 			if w == nil {
@@ -584,13 +588,35 @@ func setupFailing(pod *corev1.Pod, now time.Time) string {
 			}
 			switch w.Reason {
 			case "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError", "InvalidImageName":
-				if cs.Name == SetupContainer || w.Reason != "CrashLoopBackOff" {
-					return fmt.Sprintf("%s: %s %s", cs.Name, w.Reason, strings.TrimSpace(w.Message))
+				if i == 0 || w.Reason != "CrashLoopBackOff" {
+					return strings.TrimSpace(fmt.Sprintf("%s: %s%s %s", cs.Name, w.Reason, lastExit(cs), strings.TrimSpace(w.Message)))
 				}
 			}
 		}
 	}
 	return ""
+}
+
+// lastExit is " (exit N)" for a container whose last run failed, with the
+// last line of what it left as its termination message, if any; "" when
+// none failed.
+func lastExit(cs corev1.ContainerStatus) string {
+	t := cs.LastTerminationState.Terminated
+	if t == nil || t.ExitCode == 0 {
+		return ""
+	}
+	msg := strings.TrimSpace(t.Message)
+	if i := strings.LastIndexByte(msg, '\n'); i >= 0 {
+		msg = strings.TrimSpace(msg[i+1:])
+	}
+	const max = 240
+	if len(msg) > max {
+		msg = msg[:max]
+	}
+	if msg == "" {
+		return fmt.Sprintf(" (exit %d)", t.ExitCode)
+	}
+	return fmt.Sprintf(" (exit %d: %s)", t.ExitCode, msg)
 }
 
 // swapAgent changes the agent container's image in place when the rollout

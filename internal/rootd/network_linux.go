@@ -273,20 +273,6 @@ func writeNew(dfd int, name string, body []byte) error {
 	return nil
 }
 
-// checkRootFile: a plain file of root's (or the test's own user), which no
-// one else can write.
-func checkRootFile(st *unix.Stat_t, at string, owner uint32) error {
-	switch {
-	case st.Mode&unix.S_IFMT != unix.S_IFREG:
-		return fmt.Errorf("%s is not a plain file (mode %o)", at, st.Mode)
-	case st.Uid != 0 && st.Uid != owner:
-		return fmt.Errorf("%s belongs to uid %d", at, st.Uid)
-	case st.Mode&0o022 != 0:
-		return fmt.Errorf("%s can be written by others (mode %o)", at, st.Mode&0o7777)
-	}
-	return nil
-}
-
 // checkPlugin checks a CNI plugin the helper will run: a name, not a path,
 // and root's plain file in the checked plugin folder.
 func checkPlugin(pfd int, dir, name string, owner uint32) error {
