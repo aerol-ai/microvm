@@ -256,3 +256,51 @@ func TestListRuntimesJSON(t *testing.T) {
 		}
 	}
 }
+
+// TestRuntimeBackendAndWarmStartKind: backend and warm come from the table.
+// A warm start of a runtime the table gives no pool kind still reads as
+// parked, and a name the table does not hold has no backend.
+func TestRuntimeBackendAndWarmStartKind(t *testing.T) {
+	for _, tc := range []struct {
+		runtime    string
+		backend    string
+		warm, cold string
+	}{
+		{RuntimeFirecracker, "kvm", WarmPoolKindSnapshot, WarmPoolKindNone},
+		{RuntimeDocker, "", WarmPoolKindParked, WarmPoolKindNone},
+		{RuntimeWasm, "", WarmPoolKindParked, WarmPoolKindNone},
+		{RuntimeKata, "", WarmPoolKindParked, WarmPoolKindNone},
+		{"nope", "", WarmPoolKindParked, WarmPoolKindNone},
+	} {
+		if got := RuntimeBackend(tc.runtime); got != tc.backend {
+			t.Errorf("RuntimeBackend(%q) = %q, want %q", tc.runtime, got, tc.backend)
+		}
+		if got := WarmStartKind(tc.runtime, true); got != tc.warm {
+			t.Errorf("WarmStartKind(%q, warm) = %q, want %q", tc.runtime, got, tc.warm)
+		}
+		if got := WarmStartKind(tc.runtime, false); got != tc.cold {
+			t.Errorf("WarmStartKind(%q, cold) = %q, want %q", tc.runtime, got, tc.cold)
+		}
+	}
+}
+
+// TestRuntimeNotOfferedError: the offered list leads the message, the
+// cause follows, and the error unwraps to the cause.
+func TestRuntimeNotOfferedError(t *testing.T) {
+	cause := ErrRuntimeNotImplemented
+	err := &RuntimeNotOfferedError{Runtime: RuntimeGvisor, Offered: OfferedRuntimes(map[string]int{RuntimeWasm: 1, RuntimeDocker: 2, RuntimeKata: 1}), Err: cause}
+	want := `runtime "gvisor" is not offered here (offered: docker, wasm): ` + cause.Error()
+	if err.Error() != want {
+		t.Fatalf("Error() = %q, want %q", err.Error(), want)
+	}
+	if err.Unwrap() != cause {
+		t.Fatalf("Unwrap() = %v, want the cause", err.Unwrap())
+	}
+	empty := &RuntimeNotOfferedError{Runtime: RuntimeGvisor}
+	if got := empty.Error(); got != `runtime "gvisor" is not offered here (offered: none)` {
+		t.Fatalf("no cause, nothing offered: %q", got)
+	}
+	if got := OfferedRuntimes(nil); len(got) != 0 {
+		t.Fatalf("OfferedRuntimes(nil) = %v, want none", got)
+	}
+}
