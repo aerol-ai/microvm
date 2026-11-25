@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 )
 
@@ -161,6 +162,31 @@ func (h *RuntimeHandoff) AddressInPool(ctx context.Context, ip string) (bool, er
 		}
 	}
 	return false, nil
+}
+
+// AddressHolder answers who holds ip in the pool, from one read of the
+// pool's slots: the id of the slot that records ip ("" when a warm or
+// releasing slot records it, or none does), and whether any slot is being
+// built for an owner (reserved: CNI ADD may be giving it an address the row
+// does not record yet). Read-only; for the event path's owner check
+// (containerd Driver.IPOwner), never for a create.
+func (h *RuntimeHandoff) AddressHolder(ctx context.Context, ip string) (holder string, building bool, err error) {
+	if h == nil || h.pool == nil || ip == "" {
+		return "", false, nil
+	}
+	slots, err := h.pool.st.ListNonFreeContainerNetnsSlots(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	for _, s := range slots {
+		if s.ContainerIP == ip {
+			holder = s.SandboxID
+		}
+		if s.State == store.NetnsSlotStateReserved && s.SandboxID != "" && s.ContainerIP == "" {
+			building = true
+		}
+	}
+	return holder, building, nil
 }
 
 // releaseAfterGet is set only by tests, to change the slot's ownership in the

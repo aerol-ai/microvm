@@ -191,3 +191,33 @@ func TestReconcileClearsADeadHoldersAddress(t *testing.T) {
 	var nilPool *Pool
 	nilPool.SetAddressClearer(log.clear) // no panic
 }
+
+// AddressHolder names the slot that records an address, and whether a slot
+// is being built (reserved, its address not recorded yet).
+func TestAddressHolder(t *testing.T) {
+	ctx := context.Background()
+	if h, b, err := (*RuntimeHandoff)(nil).AddressHolder(ctx, "10.0.0.1"); h != "" || b || err != nil {
+		t.Fatalf("nil handoff: %q %v %v", h, b, err)
+	}
+	p := testPool(t, 3)
+	h := NewRuntimeHandoff(p, NewFakeHost())
+	_, ip, err := h.Provision(ctx, "sb-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if holder, building, err := h.AddressHolder(ctx, ip); holder != "sb-1" || building || err != nil {
+		t.Fatalf("held: %q %v %v", holder, building, err)
+	}
+	if _, err := p.Reserve(ctx, "sb-2", time.Unix(5, 0)); err != nil {
+		t.Fatal(err)
+	}
+	if holder, building, _ := h.AddressHolder(ctx, "10.250.0.9"); holder != "" || !building {
+		t.Fatalf("with a slot being built: %q %v", holder, building)
+	}
+	if err := h.Release(ctx, "sb-1"); err != nil {
+		t.Fatal(err)
+	}
+	if holder, _, _ := h.AddressHolder(ctx, ip); holder != "" {
+		t.Fatalf("a freed address is held by %q", holder)
+	}
+}
