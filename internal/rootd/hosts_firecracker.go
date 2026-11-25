@@ -555,20 +555,16 @@ func (f *firecrackerHosts) makeFilesystem(ctx context.Context, req *rootdpb.Make
 	if err := rootpolicy.CheckFirecrackerFile(req.GetName()); err != nil {
 		return nil, refusedRule(codes.InvalidArgument, err)
 	}
-	var args []string
-	if src := req.GetSource(); src != "" {
+	src := req.GetSource()
+	if src != "" {
 		if !filepath.IsAbs(src) || filepath.Clean(src) != src {
 			return nil, badRequest("root helper: filesystem source %q: want a clean absolute folder", src)
 		}
 		if err := rootpolicy.CheckFilesystemSize(req.GetSizeMib()); err != nil {
 			return nil, refusedRule(codes.InvalidArgument, err)
 		}
-		args = []string{"-d", src, "-F", "", strconv.FormatUint(req.GetSizeMib(), 10) + "M"}
-	} else {
-		if req.GetSizeMib() != 0 {
-			return nil, badRequest("root helper: an empty filesystem takes its file's size, not a size")
-		}
-		args = []string{"-F", ""}
+	} else if req.GetSizeMib() != 0 {
+		return nil, badRequest("root helper: an empty filesystem takes its file's size, not a size")
 	}
 	stage, root, err := f.openJail(req.GetId(), false)
 	if err != nil {
@@ -579,12 +575,7 @@ func (f *firecrackerHosts) makeFilesystem(ctx context.Context, req *rootdpb.Make
 	// The out file is named through the stage folder the helper opened:
 	// the agent owns the folder, never the path to it.
 	out := fmt.Sprintf("/proc/self/fd/%d/%s", 3, req.GetName())
-	for i, a := range args {
-		if a == "" {
-			args[i] = out
-		}
-	}
-	cmd := exec.CommandContext(ctx, f.cfg.Mkfs4Bin, args...)
+	cmd := exec.CommandContext(ctx, f.cfg.Mkfs4Bin, mkfsArgs(out, src, req.GetSizeMib())...)
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin"}
 	cmd.ExtraFiles = []*os.File{stage}
 	if err := makeFilesystemAttr(cmd, f.cfg.AgentUID, f.agentGID); err != nil {
@@ -595,6 +586,18 @@ func (f *firecrackerHosts) makeFilesystem(ctx context.Context, req *rootdpb.Make
 			msg: fmt.Sprintf("root helper: mkfs.ext4 %s for %s: %v: %s", req.GetName(), req.GetId(), err, tail(b))}
 	}
 	return &rootdpb.MakeFilesystemResponse{}, nil
+}
+
+// mkfsArgs are mkfs.ext4's arguments for an ext4 filesystem in out: empty,
+// in out's own size, or, with src, holding src's files in sizeMib. -t ext4
+// because mke2fs picks ext4 by its own name only when called mkfs.ext4,
+// and SB_FIRECRACKER_MKFS_BIN may name mke2fs itself (the file `readlink
+// -f` prints for mkfs.ext4 on Ubuntu and Debian).
+func mkfsArgs(out, src string, sizeMib uint64) []string {
+	if src == "" {
+		return []string{"-t", "ext4", "-F", out}
+	}
+	return []string{"-t", "ext4", "-d", src, "-F", out, strconv.FormatUint(sizeMib, 10) + "M"}
 }
 
 // tail is the end of a tool's output, for an error.

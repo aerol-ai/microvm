@@ -2,6 +2,7 @@ package rootd
 
 import (
 	"bytes"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -166,6 +167,20 @@ func TestInstallShSplitWithIsolatesAndFirecrackerLoadsIntoTheHelper(t *testing.T
 	fc, w := cfg.Hosts.Firecracker, cfg.Hosts.Workerd
 	if fc == nil || w == nil {
 		t.Fatalf("the helper runs Firecracker %v and V8 %v, want both", fc != nil, w != nil)
+	}
+	// Root runs each program at the path written, and the helper refuses a
+	// link anywhere on it (checkRootBinaries): every one passes the path
+	// rule the deploy tools share (CheckRootProgramPath), with sandboxd's
+	// folders as install.sh lays them out.
+	programs := RootPrograms(cfg)
+	if want := splitPrograms(t)["install.sh"]; !maps.Equal(programs, want) {
+		t.Fatalf("the helper runs %v from install.sh's settings; %s lists %v", programs, splitProgramsFile, want)
+	}
+	agentDirs := []string{"/var/lib/sandboxd", "/run/sandboxd", "/run/aerolvm-procid", "/etc/sandboxd/tls", "/etc/sandboxd/cluster-ca"}
+	for setting, p := range programs {
+		if err := CheckRootProgramPath(p, agentDirs); err != nil {
+			t.Errorf("install.sh's split settings: %s: %v", setting, err)
+		}
 	}
 
 	// sandboxd reads the same lines.

@@ -210,7 +210,7 @@ A mount namespace is a container's private view of which file systems are mounte
 
 AerolVM turns this around: **the mount runs on the host.** The host creates `/var/lib/sandboxd/mounts/<sandbox_id>/<i>/` and runs `mountpoint-s3 ... <that_path>` as the daemon's user. Then it bind-mounts that path into the container at the target you asked for. (A bind mount makes one folder appear at a second place.)
 
-On a default install, the daemon's user is root. `packaging/sandboxd.service` sets no `User=`, and `sandboxd` needs root to drive the container engine, iptables and bind mounts.
+On a default install, the daemon's user is root. `packaging/sandboxd.service` sets no `User=`, and `sandboxd` needs root to drive the container engine, iptables and bind mounts. In [privilege mode split](/enterprise/privilege-mode/), the root helper runs the mount tools instead: NFS as root with fixed `nosuid,nodev` options, and the FUSE tools (mountpoint-s3, sshfs, rclone) as a user of their own, `aerolvm-mounts`, with no rights.
 
 The container sees a file system. It does not see the credentials, the tool, or anything outside its own mount namespace. The mount supervisor (`Manager`) watches the host-side process and restarts it if it crashes. If it fails too many times in a row, the supervisor disables the mount to stop a restart loop.
 
@@ -304,7 +304,7 @@ These envelopes use their own key ring file (`LoadUpstreamWrapKeyRing`), separat
 These are the places where the boundary is weaker than it might look:
 
 - **Sealing protects data at rest only.** A compromised `sandboxd` holds the key, so it can read decrypted secrets: the boundary stops at the host, not the daemon. For cluster secrets, your key store can hold the key that wraps the data keys. The local key that seals mounts, environments and toolbox tokens is a file on the host by default; with wrapped custody only a copy wrapped by your key store is on disk and the key itself lives in `sandboxd`'s memory, which root on a running host can still read. See [Use your own key store](/enterprise/key-custody/).
-- **Sealed values are only as safe as the key file.** By default the database and the key file sit on the same host (wrapped custody removes the plain key file). Anyone who can read both, such as root, can open every toolbox token and environment. Operators on shared hosts should run `sandboxd` as a dedicated user; the default install runs it as root.
+- **Sealed values are only as safe as the key file.** By default the database and the key file sit on the same host (wrapped custody removes the plain key file). Anyone who can read both, such as root, can open every toolbox token and environment. Operators on shared hosts should run `sandboxd` as a dedicated user, which [privilege mode split](/enterprise/privilege-mode/) does; the default install runs it as root.
 - **runc is the default runtime.** It is a resource-isolation boundary, not a security boundary against an attacker who can exploit the kernel. For untrusted tenants sharing a host, set the sandbox's runtime to `gvisor` or `firecracker`. See [gVisor](/gvisor-sandbox/) and [Firecracker architecture](/firecracker-architecture/).
 - **Mount namespaces are the kernel's mechanism, not `sandboxd`'s.** A kernel CVE that allows an escape from a mount namespace is the kernel's bug, but the trust boundary weakens with it.
 - **Network rules and quotas must be set to do anything.** A sandbox with no `network_block_all` and no egress rules can reach everywhere the host can. Property 4 is a mechanism, not a policy.
