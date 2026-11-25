@@ -181,10 +181,9 @@ func (d *Driver) freeClaimLeftoverNetns(ctx context.Context, leftover claimLefto
 			"sandbox_id", leftover.sandboxID, "container_ip", held)
 		return nil
 	}
-	if !d.clearsOnRelease() {
-		_ = d.clearAddressRules(held)
-	}
-	if err := d.netns.Release(ctx, leftover.sandboxID); err != nil {
+	// The id is checked again under the slot's lock: a leftover's Destroy
+	// may have given the address back meanwhile, and the pool handed it on.
+	if _, err := d.giveBack(ctx, giveBackReq{owner: leftover.sandboxID, known: held, match: true, clear: d.wholeAddress}); err != nil {
 		return err
 	}
 	d.logger.Info("containerd warm claim: freed the network namespace a failed claim left under the sandbox id",

@@ -153,6 +153,13 @@ func (p *Pool) Reconcile(ctx context.Context, host HostManager, live LiveSandbox
 			free = func() error { return p.st.FreeReleasingContainerNetnsSlot(ctx, slotID, now) }
 		}
 		unlock := p.lockSlot(slotID)
+		// A slot someone held gives its address back as the driver's
+		// releases do (RuntimeHandoff.ReleaseOwned): its rules go first,
+		// under the lock. A warm slot nobody held has none; a releasing one
+		// had them cleared before its teardown failed.
+		if p.clearAddress != nil && slot.SandboxID != "" && slot.ContainerIP != "" && slot.State != store.NetnsSlotStateReleasing {
+			p.clearAddress(slot.ContainerIP)
+		}
 		if p.teardown(ctx, host, *slot, slot.SandboxID, free, now) == nil {
 			reaped++
 		}

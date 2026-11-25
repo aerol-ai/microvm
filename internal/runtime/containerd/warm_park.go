@@ -176,7 +176,8 @@ func (d *Driver) parkContainer(ctx context.Context, slotID string, key container
 		}
 		_ = pl.Close()
 		if netnsProvisioned && d.netns != nil {
-			_ = d.netns.Release(ctx, slotID)
+			// The park block may be on the address already.
+			_, _ = d.giveBack(ctx, giveBackReq{owner: slotID, known: prepaidIP, clear: d.wholeAddress})
 		}
 		// The park pins an image lease before NewContainer; release it on any
 		// non-committed exit or the pinned layers never GC (same orphan class the
