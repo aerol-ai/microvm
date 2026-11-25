@@ -268,6 +268,14 @@ func TestGiveBackOwnsEveryRuleClearAndRelease(t *testing.T) {
 	// claim's: no address is given back there.
 	helpers := map[string]bool{"ClearNetworkRules": true, "ClearEgressPolicy": true, "clearAddressRules": true,
 		"clearCreateNetRules": true, "ClearAddressRules": true, "wholeAddress": true, "applyAdoptNetworkPolicy": true}
+	// The only functions that call the firewall's clears directly. The
+	// first three are the clear helpers a giveBack caller hands it; the
+	// rest change rules on a live sandbox's address, which it keeps (the
+	// service's network updates): no address is given back there.
+	directClears := map[string]bool{
+		"ClearNetworkRules": true, "ClearEgressPolicy": true, "clearAddressRules": true,
+		"ClearNetworkBlockIngress": true, "ClearEgressHold": true,
+	}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
@@ -326,6 +334,12 @@ func TestGiveBackOwnsEveryRuleClearAndRelease(t *testing.T) {
 				if clears[name] && !helpers[fn.Name.Name] && !(callsGiveBack && inLit(c.Pos())) {
 					bad = append(bad, name+" clears rules outside a giveBack clear at "+where)
 				}
+				// A direct firewall clear: on the firewall itself
+				// (networkRules.Clear*), or a whole-address clear.
+				direct := (strings.HasPrefix(name, "Clear") && isFieldCall(c, "networkRules")) || name == "ClearAddress"
+				if direct && !directClears[fn.Name.Name] {
+					bad = append(bad, name+" is a direct firewall clear outside the named exceptions at "+where)
+				}
 				return true
 			})
 		}
@@ -347,11 +361,15 @@ func calleeName(c *ast.CallExpr) string {
 }
 
 // isNetnsField reports whether c is a call on d.netns (x.netns.Method).
-func isNetnsField(c *ast.CallExpr) bool {
+func isNetnsField(c *ast.CallExpr) bool { return isFieldCall(c, "netns") }
+
+// isFieldCall reports whether c is a call on the field named field
+// (x.field.Method).
+func isFieldCall(c *ast.CallExpr, field string) bool {
 	sel, ok := c.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
 	}
 	inner, ok := sel.X.(*ast.SelectorExpr)
-	return ok && inner.Sel.Name == "netns"
+	return ok && inner.Sel.Name == field
 }
