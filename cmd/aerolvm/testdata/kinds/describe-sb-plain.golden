@@ -4,6 +4,8 @@ Name:         db
 ID:           sb-0000000000000002
 Status:       started
 Runtime:      docker
+Backend:      -
+Warm start:   -
 Image:        postgres:17
 CPU:          -
 Memory:       -

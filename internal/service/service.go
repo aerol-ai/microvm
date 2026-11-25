@@ -3589,7 +3589,12 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 	// table's row for the runtime, Warm the create's own warm marker (the
 	// one the create metrics read). Boot path (pr-review §2): a six-row
 	// table scan and one context lookup; no I/O, no lock, no extra write.
-	// A path that set up no marker (a WASM migration) keeps the row's value.
+	// A path that set up no marker writes the row's own value: a WASM move
+	// (ImportWasmMigration) and a durable WASM failover
+	// (recreateWasmDurableSandbox) build a fresh row, so they save none. A
+	// gVisor move is rebuilt through CreateSandboxWithID, so it records the
+	// rebuild; a Firecracker move writes its bundle's row without coming
+	// here (snapshot_move.go), so it keeps the value its create recorded.
 	sandbox.Backend = models.RuntimeBackend(sandbox.Runtime)
 	if warm, measured := scaleobs.WarmStarted(ctx); measured {
 		sandbox.Warm = models.WarmStartKind(sandbox.Runtime, warm)

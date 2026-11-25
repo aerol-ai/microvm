@@ -47,6 +47,7 @@ exit 0
       },
       "runtime": "docker",
       "engine": "containerd",
+      "warm": "parked",
       "network_bytes_in": 0,
       "network_bytes_out": 0,
       "network_bytes_in_limit": 0,

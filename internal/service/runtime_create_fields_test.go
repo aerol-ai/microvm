@@ -177,7 +177,9 @@ func TestPersistSandboxCreateSetsBackendAndWarm(t *testing.T) {
 		t.Fatalf("firecracker row backend=%q warm=%q, want kvm and snapshot", vm.Backend, vm.Warm)
 	}
 
-	// No marker (a WASM migration's ctx): the row keeps the value it came with.
+	// No marker (a WASM move's or a durable WASM failover's ctx): the row is
+	// written with its own value. Those paths build a fresh row, so in use
+	// they save none; this row carries a value to show it is not overwritten.
 	moved := row("sb-moved", models.RuntimeWasm, models.WarmPoolKindParked)
 	if err := svc.persistSandboxCreate(context.Background(), moved); err != nil {
 		t.Fatalf("persist moved: %v", err)

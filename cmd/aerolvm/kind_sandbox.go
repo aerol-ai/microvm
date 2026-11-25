@@ -177,6 +177,11 @@ func describeSandbox(ctx context.Context, a *app, c *commonFlags, call kindCall)
 		{"ID:", s.ID},
 		{"Status:", status},
 		{"Runtime:", dash(s.Runtime)},
+		// The VM hardware ("kvm" for firecracker) and how the create
+		// started ("snapshot", "parked", "none"); "-" where the server
+		// sends neither (not a VM, or a sandbox older than the field).
+		{"Backend:", dash(s.Backend)},
+		{"Warm start:", dash(s.Warm)},
 		{"Image:", dash(s.Image)},
 		{"CPU:", cpuText(s.CPU)},
 		{"Memory:", memText(s.MemoryMB)},

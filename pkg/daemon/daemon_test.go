@@ -1,9 +1,12 @@
 package daemon
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/aerol-ai/microvm/internal/config"
@@ -184,9 +187,72 @@ func TestSupportedRuntimesForConfig(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := supportedRuntimesForConfig(tt.cfg); !slices.Equal(got, tt.want) {
-				t.Fatalf("supportedRuntimesForConfig = %v, want %v", got, tt.want)
+			got, off := supportedRuntimesForConfig(tt.cfg)
+			if !slices.Equal(got, tt.want) || len(off) != 0 {
+				t.Fatalf("supportedRuntimesForConfig = %v (switched off %v), want %v and none switched off", got, off, tt.want)
 			}
 		})
+	}
+}
+
+// TestSupportedRuntimesDropsSwitchedOffRuntimes: SB_HOST_RUNTIMES cannot
+// advertise a runtime whose own switch is off. Such a node used to tell
+// GET /v1/runtimes the runtime was available and draw placement's creates
+// for it, then refuse every one. The dropped names come back for the start
+// warning, and the config's own slice is left as it was.
+func TestSupportedRuntimesDropsSwitchedOffRuntimes(t *testing.T) {
+	worker := config.NodeRoleWorker
+	for _, tt := range []struct {
+		name    string
+		cfg     config.Config
+		want    []string
+		dropped []string
+	}{
+		{name: "firecracker listed, switch off",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
+			want: []string{models.RuntimeDocker}, dropped: []string{models.RuntimeFirecracker}},
+		{name: "firecracker listed, switch on",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeFirecracker}, EnableFirecracker: true},
+			want: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
+		{name: "wasm and isolate listed, switches off",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeWasm, models.RuntimeIsolate}, NodeRole: worker},
+			want: []string{models.RuntimeDocker}, dropped: []string{models.RuntimeWasm, models.RuntimeIsolate}},
+		{name: "wasm listed and on, but not a worker",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeWasm}, EnableWasm: true, NodeRole: config.NodeRoleIngress},
+			want: []string{models.RuntimeDocker}, dropped: []string{models.RuntimeWasm}},
+		{name: "only a switched-off runtime listed: docker, as with none listed",
+			cfg:  config.Config{HostSupportedRuntimes: []string{" firecracker ", ""}},
+			want: []string{models.RuntimeDocker}, dropped: []string{models.RuntimeFirecracker}},
+		{name: "names with no switch stay",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeGvisor, models.RuntimeKata, "custom"}},
+			want: []string{models.RuntimeGvisor, models.RuntimeKata, "custom"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			listed := slices.Clone(tt.cfg.HostSupportedRuntimes)
+			got, dropped := supportedRuntimesForConfig(tt.cfg)
+			if !slices.Equal(got, tt.want) || !slices.Equal(dropped, tt.dropped) {
+				t.Fatalf("supportedRuntimesForConfig = %v, dropped %v; want %v, dropped %v", got, dropped, tt.want, tt.dropped)
+			}
+			if !slices.Equal(tt.cfg.HostSupportedRuntimes, listed) {
+				t.Fatalf("config's list changed to %v", tt.cfg.HostSupportedRuntimes)
+			}
+		})
+	}
+}
+
+// TestWarnSwitchedOffRuntimes: one warning naming the dropped runtimes and
+// the switches, and nothing when none were dropped.
+func TestWarnSwitchedOffRuntimes(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	warnSwitchedOffRuntimes(logger, nil)
+	warnSwitchedOffRuntimes(nil, []string{models.RuntimeFirecracker})
+	if buf.Len() != 0 {
+		t.Fatalf("logged with nothing dropped or no logger: %s", buf.String())
+	}
+	warnSwitchedOffRuntimes(logger, []string{models.RuntimeFirecracker, models.RuntimeWasm})
+	out := buf.String()
+	if strings.Count(out, "level=WARN") != 1 || !strings.Contains(out, "runtimes=firecracker,wasm") || !strings.Contains(out, "SB_ENABLE_FIRECRACKER") {
+		t.Fatalf("warning = %q", out)
 	}
 }
