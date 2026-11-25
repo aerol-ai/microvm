@@ -4877,6 +4877,11 @@ split_shared_env_fingerprint() {
 leave_split_mode() {
 	[[ "$PRIVILEGE_MODE" == "single" && "$PREVIOUS_PRIVILEGE_MODE" == "split" ]] || return 0
 	echo "Switching this node back to privilege mode single: sandboxd runs as root again"
+	# The steps below remove links and give files back to root; they cannot
+	# tell whether what sandboxd's user wrote is honest. The docs say so
+	# (privilege-mode.mdx, installer-options.mdx); this says it on the node,
+	# on this switch only.
+	echo "warning: in single mode, sandboxd runs as root and trusts its database and its files in /var/lib/sandboxd, /etc/sandboxd/tls and /etc/sandboxd/cluster-ca. sandboxd wrote them while it ran without root. This switch gives them back to root and removes links, but does not check what they hold. If you think this server was broken into, rebuild the machine instead." >&2
 	systemctl stop sandboxd 2>/dev/null || true
 	# What the root sandboxd would act on by path at its first boot, and
 	# sandboxd's user could write in split, goes first: the upgrade folder
