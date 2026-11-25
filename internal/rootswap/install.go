@@ -144,6 +144,10 @@ type Installed struct {
 	// supervisor runs.
 	Path     string
 	Manifest Manifest
+	// Raw and Signature are the signed manifest's bytes and signature,
+	// when the caller kept them (ReadStagedSigned): the supervisor writes
+	// them as the floor (WriteFloor). Install leaves them empty.
+	Raw, Signature []byte
 }
 
 // copyName is the copy's name: the version for a reader, the hash so two
@@ -280,7 +284,8 @@ func (i *Installed) Remove() error {
 }
 
 // Sweep removes every copy and half-made copy in binDir but keep: copies
-// a supervisor that stopped left behind.
+// a supervisor that stopped left behind. The floor stays (FloorName and
+// FloorSigName); a half-written one goes.
 func Sweep(binDir string, keep ...string) error {
 	bfd, err := rootfolder.OpenFolder(binDir)
 	if err != nil {
@@ -301,7 +306,8 @@ func Sweep(binDir string, keep ...string) error {
 	}
 	var errs []error
 	for _, n := range names {
-		ours := strings.HasPrefix(n, BinaryName+"-") || rootfolder.IsTmpName(n, BinaryName)
+		ours := strings.HasPrefix(n, BinaryName+"-") || rootfolder.IsTmpName(n, BinaryName) ||
+			rootfolder.IsTmpName(n, FloorName) || rootfolder.IsTmpName(n, FloorSigName)
 		if !ours || contains(keep, filepath.Join(binDir, n)) {
 			continue
 		}

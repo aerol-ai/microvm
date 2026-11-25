@@ -580,7 +580,16 @@ type VersionResponse struct {
 	// The host kinds the host-process calls serve ("workerd",
 	// "wasm_worker", "wasm_resident"; rootdpb.HostKindName). The agent asks
 	// for a kind only when it is listed.
-	Hosts         []string `protobuf:"bytes,5,rep,name=hosts,proto3" json:"hosts,omitempty"`
+	Hosts []string `protobuf:"bytes,5,rep,name=hosts,proto3" json:"hosts,omitempty"`
+	// The cgroup every sandbox's group must sit directly under: the parent
+	// the gate checks each container's cgroups path against, and the cgroup
+	// part builds its paths from. It is the helper's own
+	// SB_CONTAINERD_CGROUP_PARENT, or containerd's /<namespace> without one.
+	// On Kubernetes it is a group of the runtime container's, new each time
+	// that container starts. An agent whose specs name another parent stops
+	// using the helper, and starts again to read the new one
+	// (internal/rootclient). Unset by a helper older than this field.
+	CgroupParent  *string `protobuf:"bytes,6,opt,name=cgroup_parent,json=cgroupParent,proto3,oneof" json:"cgroup_parent,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -648,6 +657,13 @@ func (x *VersionResponse) GetHosts() []string {
 		return x.Hosts
 	}
 	return nil
+}
+
+func (x *VersionResponse) GetCgroupParent() string {
+	if x != nil && x.CgroupParent != nil {
+		return *x.CgroupParent
+	}
+	return ""
 }
 
 type EnsureHostRequest struct {
@@ -6064,13 +6080,15 @@ const file_rootd_proto_rawDesc = "" +
 	"\vrootd.proto\x12\x10aerolvm.rootd.v1\"R\n" +
 	"\x0eVersionRequest\x12#\n" +
 	"\ragent_version\x18\x01 \x01(\tR\fagentVersion\x12\x1b\n" +
-	"\tagent_api\x18\x02 \x01(\rR\bagentApi\"\x92\x01\n" +
+	"\tagent_api\x18\x02 \x01(\rR\bagentApi\"\xce\x01\n" +
 	"\x0fVersionResponse\x12%\n" +
 	"\x0ehelper_version\x18\x01 \x01(\tR\rhelperVersion\x12\x10\n" +
 	"\x03api\x18\x02 \x01(\rR\x03api\x12\x1a\n" +
 	"\bfeatures\x18\x03 \x03(\tR\bfeatures\x12\x14\n" +
 	"\x05parts\x18\x04 \x03(\tR\x05parts\x12\x14\n" +
-	"\x05hosts\x18\x05 \x03(\tR\x05hosts\"\x13\n" +
+	"\x05hosts\x18\x05 \x03(\tR\x05hosts\x12(\n" +
+	"\rcgroup_parent\x18\x06 \x01(\tH\x00R\fcgroupParent\x88\x01\x01B\x10\n" +
+	"\x0e_cgroup_parent\"\x13\n" +
 	"\x11EnsureHostRequest\"\xae\x01\n" +
 	"\x12EnsureHostResponse\x12(\n" +
 	"\x10ipv6_fence_error\x18\x01 \x01(\tR\x0eipv6FenceError\x12-\n" +
@@ -6780,6 +6798,7 @@ func file_rootd_proto_init() {
 	if File_rootd_proto != nil {
 		return
 	}
+	file_rootd_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

@@ -94,17 +94,21 @@ func (l *claimLeftovers) of(slotID string) (claimLeftover, bool) {
 	return c, ok
 }
 
-// forgetSandbox drops every failed claim of sandboxID: a retried create
-// removed the leftover container itself (Driver.Destroy).
-func (l *claimLeftovers) forgetSandbox(sandboxID string) {
+// slotsOf is every failed claim of sandboxID: its park slot ids and the
+// addresses they had.
+func (l *claimLeftovers) slotsOf(sandboxID string) map[string]string {
+	if l.n.Load() == 0 {
+		return nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	out := map[string]string{}
 	for slotID, c := range l.bySlot {
 		if c.sandboxID == sandboxID {
-			delete(l.bySlot, slotID)
-			l.n.Add(-1)
+			out[slotID] = c.address
 		}
 	}
+	return out
 }
 
 // forget drops slotID once its container is gone.
@@ -177,10 +181,9 @@ func (d *Driver) freeClaimLeftoverNetns(ctx context.Context, leftover claimLefto
 			"sandbox_id", leftover.sandboxID, "container_ip", held)
 		return nil
 	}
-	if !d.clearsOnRelease() {
-		_ = d.clearAddressRules(held)
-	}
-	if err := d.netns.Release(ctx, leftover.sandboxID); err != nil {
+	// The id is checked again under the slot's lock: a leftover's Destroy
+	// may have given the address back meanwhile, and the pool handed it on.
+	if _, err := d.giveBack(ctx, giveBackReq{owner: leftover.sandboxID, known: held, match: true, clear: d.wholeAddress}); err != nil {
 		return err
 	}
 	d.logger.Info("containerd warm claim: freed the network namespace a failed claim left under the sandbox id",
@@ -197,7 +200,15 @@ func (d *Driver) freeClaimLeftoverNetns(ctx context.Context, leftover claimLefto
 // pool's retry still removes the slot's files; it finds the id forgotten
 // and frees nothing more. A list that fails, or a container still there,
 // keeps the id remembered: the pool's retry ends it.
+//
+// Only the claims remembered before the list are forgotten: one that
+// fails after it (another claim of the id, while the orphan sweep or a
+// retry runs) has a container the list did not look for.
 func (d *Driver) forgetClaimLeftoverIfGone(ctx context.Context, sandboxID string) {
+	slots := d.claimLeftovers.slotsOf(sandboxID)
+	if len(slots) == 0 {
+		return
+	}
 	client, err := d.ensureClient()
 	if err != nil {
 		return
@@ -206,7 +217,31 @@ func (d *Driver) forgetClaimLeftoverIfGone(ctx context.Context, sandboxID string
 	if err != nil || len(found) > 0 {
 		return
 	}
-	d.claimLeftovers.forgetSandbox(sandboxID)
+	for slotID := range slots {
+		d.claimLeftovers.forget(slotID)
+	}
+}
+
+// claimLeftoverAddress is the address to clear for a leftover of sandboxID
+// whose removal names none (the service's Inspect found no address): the
+// address the failed claim's slot had, but only while sandboxID still
+// holds that slot. A remembered address the id no longer holds may be
+// another sandbox's by now, so it is never cleared from here.
+func (d *Driver) claimLeftoverAddress(ctx context.Context, sandboxID string) string {
+	addresser, ok := d.netns.(netnsAddresser)
+	if d.netns == nil || !ok {
+		return ""
+	}
+	held, err := addresser.Address(ctx, sandboxID)
+	if err != nil || held == "" {
+		return ""
+	}
+	for _, addr := range d.claimLeftovers.slotsOf(sandboxID) {
+		if addr == held {
+			return held
+		}
+	}
+	return ""
 }
 
 // refusesClaimLeftover reports whether a create of sandboxID must not go

@@ -127,8 +127,9 @@ initContainers:
   # the root helper trusts a folder only when no one else can write it
   # (internal/rootfolder): the shared folder becomes root's, open to the
   # agent's group, with one folder of the agent's own inside; the CNI
-  # records' folder and the helper's moves folder become root's alone;
-  # sandboxd's state volume becomes the agent's; the egress gateway's
+  # records' folder, the helper's moves folder and the supervisor's own
+  # folder become root's alone; sandboxd's state volume becomes the
+  # agent's; the egress gateway's
   # socket folder becomes the gateway user's alone (0755: the agent may
   # dial the socket, not write there). As root with one right, CAP_CHOWN,
   # and nothing else: root owns a folder while it sets the mode, so each
@@ -146,6 +147,8 @@ initContainers:
         chmod 0755 /var/lib/cni
         chown 0:0 /var/lib/aerolvm-rootd-moves
         chmod 0700 /var/lib/aerolvm-rootd-moves
+        chown 0:0 /var/lib/aerolvm-supervisor
+        chmod 0700 /var/lib/aerolvm-supervisor
         chown 65531:65531 /var/lib/sandboxd
         chown 0:0 /run/aerolvm-egress
         chmod 0755 /run/aerolvm-egress
@@ -171,6 +174,7 @@ initContainers:
       - { name: rootd-shared, mountPath: /run/aerolvm-rootd/shared }
       - { name: cni-state, mountPath: /var/lib/cni }
       - { name: containerd, mountPath: /var/lib/aerolvm-rootd-moves, subPath: aerolvm-rootd-moves }
+      - { name: supervisor-state, mountPath: /var/lib/aerolvm-supervisor }
       - { name: state, mountPath: /var/lib/sandboxd }
       - { name: run-egress, mountPath: /run/aerolvm-egress }
       {{- if $isolate }}
@@ -364,6 +368,13 @@ containers:
       # where the agent's disk floor counts it, not on this container's.
       # A folder of containerd's volume, root's alone (split-folders).
       - { name: containerd, mountPath: /var/lib/aerolvm-rootd/moves, subPath: aerolvm-rootd-moves }
+      # The supervisor's own folder: the verified copies of the helper it
+      # runs, and the version of the one that ran last, which no older
+      # helper may undercut. On a volume of its own, root's alone
+      # (split-folders) and mounted by no other container, so it outlives
+      # a restart of this container, which forgets the rest, and ends with
+      # the pod (internal/rootswap floor.go).
+      - { name: supervisor-state, mountPath: /var/lib/aerolvm-supervisor }
       {{- else }}
       # The network namespaces the agent makes, where containerd starts
       # sandboxes in them. Bidirectional, so the supervisor's unmount
@@ -842,6 +853,7 @@ volumes:
   - { name: rootd-shared, emptyDir: {} }
   - { name: run-runtime, emptyDir: {} }
   - { name: rootd-stage, emptyDir: {} }
+  - { name: supervisor-state, emptyDir: {} }
   - { name: tmp, emptyDir: {} }
   - { name: run-egress, emptyDir: {} }
   - name: host-cgroup

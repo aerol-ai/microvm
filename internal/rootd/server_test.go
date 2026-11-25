@@ -220,6 +220,11 @@ func TestVersion(t *testing.T) {
 	if resp.GetHelperVersion() != version.Version || resp.GetApi() != rootdpb.APIVersion {
 		t.Fatalf("Version = %v", resp)
 	}
+	// No cgroup parent set: the gate holds sandboxes to containerd's own
+	// /<namespace>, and the handshake says so.
+	if resp.CgroupParent == nil || resp.GetCgroupParent() != "/"+r.cfg.Policy.Namespace {
+		t.Fatalf("cgroup parent %v, want /%s", resp.CgroupParent, r.cfg.Policy.Namespace)
+	}
 	// EnsureHost is a placeholder, so it is never served; a helper with
 	// no network configuration (this rig) serves no network call either,
 	// and one whose settings name no host kind no host call.
@@ -281,6 +286,11 @@ func TestVersion(t *testing.T) {
 		resp, err := rootdpb.NewRootHelperClient(r.conn).Version(callCtx(t), &rootdpb.VersionRequest{})
 		if err != nil || !slices.Equal(resp.GetParts(), rootdpb.Parts()) {
 			t.Fatalf("parts %v (%v), want every part", resp.GetParts(), err)
+		}
+		// The parent itself is in the handshake: the runtime container's
+		// group on Kubernetes, which the agent's specs must name.
+		if resp.GetCgroupParent() != "/sandboxes" {
+			t.Fatalf("cgroup parent %q, want /sandboxes", resp.GetCgroupParent())
 		}
 		alone := newRig(t, parent)
 		resp, err = rootdpb.NewRootHelperClient(alone.conn).Version(callCtx(t), &rootdpb.VersionRequest{})

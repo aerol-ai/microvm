@@ -43,6 +43,16 @@ func (n *storeNetns) Release(ctx context.Context, id string) error {
 	return n.RuntimeHandoff.Release(ctx, id)
 }
 
+// ReleaseOwned is the real one, noting a release that gave an address
+// back, after the clear it ran under the slot's lock.
+func (n *storeNetns) ReleaseOwned(ctx context.Context, id, want string, clear func(string)) (string, error) {
+	ip, err := n.RuntimeHandoff.ReleaseOwned(ctx, id, want, clear)
+	if ip != "" {
+		_ = n.rec("release %s", id)
+	}
+	return ip, err
+}
+
 // doubleFailureRig is a teardown rig over the real netns store, set up for
 // the double failure: the claim moves the owner park-a > sb-a and then
 // fails (the lift is refused), moving the owner back fails, and

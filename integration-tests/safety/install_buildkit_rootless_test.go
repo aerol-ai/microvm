@@ -66,8 +66,10 @@ type rootlessRig struct {
 	// real stand-in's, whatever rk is changed to after.
 	rkSHA string
 	// mode is install.sh's --privilege-mode for the run; empty leaves
-	// PRIVILEGE_MODE unset, as on a node from before the flag.
-	mode string
+	// PRIVILEGE_MODE unset, as on a node from before the flag. previous is
+	// the mode the node ran in (PREVIOUS_PRIVILEGE_MODE); empty leaves it
+	// unset.
+	mode, previous string
 }
 
 func newRootlessRig(t *testing.T) *rootlessRig {
@@ -153,11 +155,14 @@ func (r *rootlessRig) run(t *testing.T, rootless bool, pre func()) (calls []stri
 	for _, fn := range []string{"install_buildkit", "install_buildkit_rootless", "buildkit_unit", "buildkit_rootless_unit",
 		"build_net_unit", "buildkit_version_at", "rootlesskit_version_at", "buildkit_unit_is_ours_on_host_net",
 		"buildkit_unit_is_ours_rootless", "ensure_buildkit_build_user", "ensure_rootlesskit_apparmor",
-		"buildkit_steps_conflist", "buildkit_rootless_config", "node_env_value", "buildkit_split_dropin"} {
+		"buildkit_steps_conflist", "buildkit_rootless_config", "node_env_value", "buildkit_split_dropin", "switching_back_to_single"} {
 		script += extractShellFunc(t, src, fn)
 	}
 	if r.mode != "" {
 		script += "PRIVILEGE_MODE='" + r.mode + "'\n"
+	}
+	if r.previous != "" {
+		script += "PREVIOUS_PRIVILEGE_MODE='" + r.previous + "'\n"
 	}
 	script += "install_buildkit\necho DONE\n"
 	cmd := exec.Command("bash", "-c", script)
@@ -473,4 +478,46 @@ func TestInstallBuildkitRootlessSplitACL(t *testing.T) {
 	if _, err := os.Stat(dropin); err == nil {
 		t.Fatal("the split drop-in outlived --no-buildkit-rootless")
 	}
+}
+
+// On a switch back to single (the node ran split before this run), the
+// split drop-in stays: install_buildkit runs before the downloads, and a
+// switch back that fails on one must leave split's BuildKit as it was.
+// leave_split_mode removes the drop-in once sandboxd has stopped
+// (TestInstallSwitchBackMovesBuildkitAfterSandboxdStops). A plain single
+// run still removes a drop-in left behind.
+func TestInstallBuildkitRootlessKeepsTheSplitDropinOnASwitchBack(t *testing.T) {
+	r := newRootlessRig(t)
+	r.mode = "split"
+	if _, _, err := r.run(t, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	dropin := r.unit + ".d/privilege-split.conf"
+	want, err := os.ReadFile(dropin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := installShSource(t)
+	mustWrite(t, filepath.Join(r.bin, "buildkitd"), "#!/bin/sh\necho 'buildkitd github.com/moby/buildkit "+installShVarSafety(t, src, "BUILDKIT_VERSION")+" 0123abcd'\n")
+
+	r.mode, r.previous = "single", "split"
+	calls, _, err := r.run(t, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(dropin); err != nil || string(got) != string(want) {
+		t.Fatalf("the switch back changed the split drop-in before the cleanup: %v\n%s", err, got)
+	}
+	checkCalls(t, calls, nil, []string{"daemon-reload", "systemctl restart"})
+
+	// The switch is done: the next single run finds the node single.
+	r.previous = "single"
+	calls, _, err = r.run(t, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dropin); err == nil {
+		t.Fatal("a plain single run kept a split drop-in")
+	}
+	checkCalls(t, calls, []string{"systemctl daemon-reload", "systemctl restart --no-block buildkit.service"}, nil)
 }

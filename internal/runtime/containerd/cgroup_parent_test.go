@@ -500,9 +500,15 @@ func TestSecondOOMMarkFailureFailsTheStart(t *testing.T) {
 		origWait := parkReadyWaitFn
 		parkReadyWaitFn = func(context.Context, *dockerpkg.ParkedListener) error { removeGroup(t, cg, group); return nil }
 		t.Cleanup(func() { parkReadyWaitFn = origWait })
+		gave := recordGiveBacks(t)
 		_, err := d.parkContainer(context.Background(), "park-gone", containerdpool.Key{Image: "cfg:test", Runtime: models.RuntimeGvisor})
 		if err == nil || !strings.Contains(err.Error(), "set memory.oom.group") {
 			t.Fatalf("park = %v, want the second marking error", err)
+		}
+		// The failed park gives its slot back through giveBack
+		// (give_back.go), with whatever rules it had put on.
+		if got := gave(); len(got) != 1 || got[0] != "park-gone" {
+			t.Fatalf("giveBack calls %v, want park-gone once", got)
 		}
 	})
 }
