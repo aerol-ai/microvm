@@ -146,6 +146,11 @@ func TestFailedClaimTeardownOutlivesTheCreate(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := newTeardownRig(t, tc.split)
+			if !tc.split {
+				// Single mode: the slot's release clears nothing, so the
+				// driver clears the rules itself, before the release.
+				r.d.SetHostFirewall(plainFirewall{r.fw})
+			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			tc.hangUp(r, cancel)
@@ -175,12 +180,9 @@ func TestFailedClaimTeardownOutlivesTheCreate(t *testing.T) {
 				t.Fatalf("calls %v: claim moved the owner = %v, want %v", got, moved, tc.moved)
 			}
 			// The netns slot is freed under the park id after the delete
-			// (destroyParked), and the rules cleared while it still holds
-			// the address.
-			clear, rel := slices.Index(got, "clear-block "+claimIP), slices.Index(got, "release park-a")
-			if clear < del || rel < clear {
-				t.Fatalf("calls %v: want the delete, then the rules cleared, then the slot freed", got)
-			}
+			// (destroyParked). In single mode the rules are cleared while it
+			// still holds the address; in split its release clears them.
+			requireClearThenRelease(t, got[del:], tc.split, "release park-a")
 		})
 	}
 }
@@ -199,6 +201,9 @@ func TestFailedClaimTeardownFailureIsRetriedByThePool(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			r := newTeardownRig(t, split)
+			if !split {
+				r.d.SetHostFirewall(plainFirewall{r.fw})
+			}
 			// The claim's read is done when the lift runs; from there
 			// containerd refuses every load, so the teardown fails.
 			r.fw.onLift = func() { r.busy.Store(true) }
@@ -239,10 +244,11 @@ func TestFailedClaimTeardownFailureIsRetriedByThePool(t *testing.T) {
 				t.Fatalf("pending teardowns %d after the retry", n)
 			}
 			after := r.fw.recorded()[len(got):]
-			del, clear, rel := slices.Index(after, "delete park-a"), slices.Index(after, "clear-block "+claimIP), slices.Index(after, "release park-a")
-			if del < 0 || clear < del || rel < clear || slices.Contains(after, "release sb-a") {
-				t.Fatalf("retry calls %v: want the delete, the rules cleared, then the slot freed under the park id", after)
+			del := slices.Index(after, "delete park-a")
+			if del < 0 || slices.Contains(after, "release sb-a") {
+				t.Fatalf("retry calls %v: want the delete, then the slot freed under the park id only", after)
 			}
+			requireClearThenRelease(t, after[del:], split, "release park-a")
 		})
 	}
 }
@@ -295,5 +301,27 @@ func TestFailedClaimTeardownWhenTheOwnerCannotMoveBack(t *testing.T) {
 		if strings.HasPrefix(c, "clear-") || c == "release sb-a" {
 			t.Fatalf("retry calls %v: %q on what may be the sandbox id's", r.fw.recorded()[mark:], c)
 		}
+	}
+}
+
+// requireClearThenRelease checks calls, which start at a container's
+// delete: in single mode the address's rules are cleared, then release
+// frees the slot; in split the release alone, which clears them itself
+// (give_back.go), with no clear of the driver's.
+func requireClearThenRelease(t *testing.T, calls []string, split bool, release string) {
+	t.Helper()
+	rel := slices.Index(calls, release)
+	if rel < 0 {
+		t.Fatalf("calls %v: want %q", calls, release)
+	}
+	clear := slices.Index(calls, "clear-block "+claimIP)
+	if split {
+		if clear >= 0 {
+			t.Fatalf("calls %v: the driver cleared rules itself in split", calls)
+		}
+		return
+	}
+	if clear < 0 || clear > rel {
+		t.Fatalf("calls %v: want the rules cleared, then %q", calls, release)
 	}
 }

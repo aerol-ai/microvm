@@ -205,10 +205,11 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if addressReported {
 			sbruntime.NotifyReleasingAddress(ctx, prepaidIP)
 		}
+		var clear func(string)
 		if earlyRules {
-			d.clearCreateNetRules(prepaidIP, req)
+			clear = func(addr string) { d.clearCreateNetRules(addr, req) }
 		}
-		_ = d.netns.Release(ctx, sandboxID)
+		_, _ = d.giveBack(ctx, giveBackReq{owner: sandboxID, known: prepaidIP, clear: clear})
 	}()
 	defer func() {
 		// The image lease is created (with a random id) before NewContainer; on
@@ -943,30 +944,29 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		return nil
 	}
 	destroyErr := d.destroyContainer(ctx, sandbox)
-	// A failed warm claim's leftover (claim_leftovers.go), removed by a
-	// retried create (service create_leftover.go): no row ever held its
-	// lists, so its whole address is cleared, whatever the removal's
-	// outcome, since the address goes either way. A removal that names no
-	// address takes the one the failed claim's slot had, while the id
-	// still holds it. Only a removal that worked, with no container of the
-	// id left, ends the refusal. One atomic load for every other destroy.
+	// The address goes back whatever the removal's outcome (giveBack): a
+	// sandbox's own lists are cleared, or, for a failed warm claim's
+	// leftover (claim_leftovers.go), removed by a retried create (service
+	// create_leftover.go), the whole address, since no row ever held its
+	// lists. A leftover's removal that names no address is told the one
+	// the id holds, for the observer below; the clear itself always takes
+	// the slot's own address. Only a removal that worked, with no
+	// container of the id left, ends the refusal. One atomic load for
+	// every other destroy.
 	ip := sandbox.ContainerIP
 	leftover := d.claimLeftovers.holds(sandbox.ID)
 	if leftover && strings.TrimSpace(ip) == "" {
 		ip = d.claimLeftoverAddress(ctx, sandbox.ID)
 	}
 	sbruntime.NotifyReleasingAddress(ctx, ip)
-	if !d.clearsOnRelease() || d.netns == nil {
-		if leftover {
-			_ = d.clearAddressRules(ip)
-		} else {
-			_ = d.ClearNetworkRules(ip)
-			_ = d.ClearEgressPolicy(ip, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
-		}
+	clear := func(addr string) {
+		_ = d.ClearNetworkRules(addr)
+		_ = d.ClearEgressPolicy(addr, sandbox.NetworkAllowOut, sandbox.NetworkDenyOut)
 	}
-	if d.netns != nil {
-		_ = d.netns.Release(ctx, sandbox.ID)
+	if leftover {
+		clear = d.wholeAddress
 	}
+	_, _ = d.giveBack(ctx, giveBackReq{owner: sandbox.ID, known: ip, notInPool: !leftover, clear: clear})
 	if leftover && destroyErr == nil {
 		d.forgetClaimLeftoverIfGone(ctx, sandbox.ID)
 	}
