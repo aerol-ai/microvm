@@ -21,7 +21,9 @@ import (
 
 const snapRoot = "/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots"
 
-func overlayMounts(n int) []mount.Mount {
+// overlayMounts takes an int64 so a test can name project IDs at and past
+// 32 bits, which a 32-bit int cannot hold.
+func overlayMounts(n int64) []mount.Mount {
 	return []mount.Mount{{
 		Type:   "overlay",
 		Source: "overlay",
@@ -81,7 +83,7 @@ func (f fakeSnapshots) Mounts(_ context.Context, key string) ([]mount.Mount, err
 	if !ok {
 		return nil, fmt.Errorf("snapshot %s: not found", key)
 	}
-	return overlayMounts(n), nil
+	return overlayMounts(int64(n)), nil
 }
 
 // fakeQuota records what the driver asked the filesystem for.
