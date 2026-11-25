@@ -49,7 +49,7 @@ flowchart LR
   - no host namespaces, except the sandbox's own network;
   - no hooks and no devices;
   - only known runtime programs.
-- **The helper is signed.** It ships with each release, signed with an AerolVM release key. The root side copies it to a folder only root can write, checks the copy's signature, and runs that exact copy. A helper with a bad signature, or older than the one running, is refused, and the running one stays.
+- **The helper is signed.** It ships with each release, signed with an AerolVM release key. The root side copies it to a folder only root can write, checks the copy's signature, and runs that exact copy. A helper with a bad signature, or older than the one running, is refused, and the running one stays. This holds after a restart of the root side too: on Kubernetes the `runtime` container keeps the version of the last helper it ran on a volume of its own, for the life of the pod.
 - **A refusal raises an alarm.** `sandboxd` only sends requests its own code built, and those always pass. So a refusal means one of two things. Either `sandboxd` and the helper are out of step, for example after an upgrade that did not finish. Or `sandboxd` is no longer running AerolVM's own code. Each refusal:
   - fails the request with `500`;
   - writes a `rootd_refusal` record to the audit log;
