@@ -1486,7 +1486,7 @@ func (s *Service) EnsureClusterReady(ctx context.Context) error {
 func (s *Service) CreateSandbox(ctx context.Context, req models.CreateSandboxRequest) (*models.CreateSandboxResponse, error) {
 	resp, err := s.createSandbox(ctx, req, "")
 	s.noteSandboxCreated(ctx, resp)
-	return resp, err
+	return resp, s.ExplainRuntimeRefusal(req.Runtime, err)
 }
 
 // noteSandboxCreated tells the API edge's record which sandbox the create
@@ -1574,7 +1574,7 @@ func (s *Service) CreateSandboxWithID(ctx context.Context, req models.CreateSand
 		}
 	}
 	s.noteSandboxCreated(ctx, resp)
-	return resp, err
+	return resp, s.ExplainRuntimeRefusal(req.Runtime, err)
 }
 
 // reconcileStaleOwnership destroys local materializations whose authoritative
@@ -3582,6 +3582,17 @@ func (s *Service) persistSandboxCreate(ctx context.Context, sandbox *models.Sand
 		if err := s.requireFreshOwnership(ctx, sandbox.ID, sandbox.AuditIncarnationID); err != nil {
 			return err
 		}
+	}
+	// Backend and Warm tell the caller what this create got
+	// (plans/security-gaps-m1-m4.md §11). Both come from values already in
+	// hand, and Warm rides in the INSERT below: Backend is the feature
+	// table's row for the runtime, Warm the create's own warm marker (the
+	// one the create metrics read). Boot path (pr-review §2): a six-row
+	// table scan and one context lookup; no I/O, no lock, no extra write.
+	// A path that set up no marker (a WASM migration) keeps the row's value.
+	sandbox.Backend = models.RuntimeBackend(sandbox.Runtime)
+	if warm, measured := scaleobs.WarmStarted(ctx); measured {
+		sandbox.Warm = models.WarmStartKind(sandbox.Runtime, warm)
 	}
 	sealed, err := s.sealEnv(sandbox.ID, sandbox.AuditIncarnationID, sandbox.Env)
 	if err != nil {

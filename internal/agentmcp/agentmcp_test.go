@@ -266,6 +266,34 @@ func TestListRuntimes(t *testing.T) {
 		t.Fatalf("text names a node count: %s", r.text)
 	}
 
+	// The description names every isolation a listed runtime can have, and
+	// tells the model to pick for sandbox_create only where there is one.
+	for _, tc := range []struct {
+		opts Options
+		want string
+	}{
+		{Options{}, "pass its name as sandbox_create's runtime"},
+		{Options{ReadOnly: true}, "cannot create sandboxes"},
+	} {
+		res, err := newEnv(t, tc.opts).client.ListTools(t.Context(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tool := range res.Tools {
+			if tool.Name != "list_runtimes" {
+				continue
+			}
+			for _, isolation := range []string{"container", "user-space-kernel", "hardware-vm", "wasm", tc.want} {
+				if !strings.Contains(tool.Description, isolation) {
+					t.Errorf("read-only=%v description lacks %q: %s", tc.opts.ReadOnly, isolation, tool.Description)
+				}
+			}
+			if tc.opts.ReadOnly && strings.Contains(tool.Description, "pass its name") {
+				t.Errorf("read-only description tells the model to create: %s", tool.Description)
+			}
+		}
+	}
+
 	e.fake.Observe(func(s *agenttoolstest.Server) { s.FailRuntimes = true })
 	if r := e.call("list_runtimes", nil); !r.isError || !strings.Contains(r.text, "[code:") {
 		t.Fatalf("a failed list must be a tool error with a code: %+v", r)

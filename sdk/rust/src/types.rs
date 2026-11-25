@@ -837,6 +837,17 @@ pub struct Sandbox {
     /// a pre-migration row that resolves to the host default at start time.
     #[serde(default)]
     pub runtime: String,
+    /// The hardware a VM runtime runs on: `"kvm"` for Firecracker. `None`
+    /// for runtimes that are not VMs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    /// How the create that made this sandbox started: `"snapshot"` (a
+    /// Firecracker VM the warm pool had already restored), `"parked"` (a
+    /// container, WASM worker or workerd host started ahead of time) or
+    /// `"none"` (nothing was waiting). `None` for a sandbox made before the
+    /// server recorded it, or moved between nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm: Option<String>,
     /// GPU configuration this sandbox was created with. `None` means no GPU
     /// was requested.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2001,6 +2012,8 @@ pub struct RuntimeInfo {
     /// runtimes that are not VMs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    /// What it can do. A `null` from the server reads as all off.
+    #[serde(deserialize_with = "null_as_default_features")]
     pub features: RuntimeFeatures,
     /// `None` when the runtime has no fixed limits.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2019,6 +2032,13 @@ pub struct RuntimeInfo {
 pub(crate) struct RuntimeListWire {
     #[serde(default, deserialize_with = "null_as_empty_runtimes")]
     pub runtimes: Vec<RuntimeInfo>,
+}
+
+fn null_as_default_features<'de, D>(d: D) -> Result<RuntimeFeatures, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<RuntimeFeatures>::deserialize(d)?.unwrap_or_default())
 }
 
 fn null_as_empty_runtimes<'de, D>(d: D) -> Result<Vec<RuntimeInfo>, D::Error>

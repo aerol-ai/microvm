@@ -549,6 +549,18 @@ class AsyncClientTests(unittest.TestCase):
             "available": True,
         }])
 
+    def test_sandbox_backend_and_warm(self):
+        vm = dict(_SANDBOX, runtime="firecracker", backend="kvm", warm="snapshot")
+        url, _ = _scripted_server(self, [(200, vm, None), (200, _SANDBOX, None)])
+
+        async def go():
+            async with AsyncMicroVM(url, "pat") as client:
+                return await client.get("sb-1"), await client.get("sb-1")
+
+        first, plain = asyncio.run(go())
+        self.assertEqual((first.backend, first.warm), ("kvm", "snapshot"))
+        self.assertEqual((plain.backend, plain.warm), (None, None))
+
     def test_a_passed_in_clients_own_timeout_is_a_microvm_timeout(self):
         # A caller's httpx client keeps httpx's own limit (5 s by default);
         # when it fires, the error must still be the SDK's timeout, which is

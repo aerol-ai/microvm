@@ -871,6 +871,30 @@ test("MicroVM.runtimes.list normalizes a null list and missing features", async 
   ]);
 });
 
+test("MicroVM maps a sandbox's backend and warm start, and leaves them out when the server does", async () => {
+  // A Firecracker sandbox from the warm pool carries both; a sandbox from an
+  // older server, or one whose runtime is not a VM, carries neither.
+  const vm = { id: "sb-vm", image: "python:3.12", status: "started", runtime: "firecracker", backend: "kvm", warm: "snapshot" };
+  const old = { id: "sb-old", image: "alpine", status: "started", runtime: "docker" };
+  const { fetchFn } = recordingFetch((request) => {
+    const path = new URL(request.url).pathname;
+    if (request.method === "POST" && path === "/v1/sandboxes") return jsonResponse(201, vm);
+    if (path === "/v1/sandboxes/sb-old") return jsonResponse(200, old);
+    return jsonResponse(404, { error: "not found" });
+  });
+  const sdk = new MicroVM({ patToken: "pat", apiUrl: "https://api.example.com", fetch: fetchFn, retry: { maxRetries: 0 } });
+
+  const created = await sdk.create({ image: "python:3.12", runtime: "firecracker" });
+  assert.equal(created.backend, "kvm");
+  assert.equal(created.warm, "snapshot");
+  assert.equal(created.toJSON().warm, "snapshot");
+
+  const fetched = await sdk.get("sb-old");
+  assert.equal(fetched.runtime, "docker");
+  assert.equal(fetched.backend, undefined);
+  assert.equal(fetched.warm, undefined);
+});
+
 test("MicroVM.tokens surfaces the server's refusal message", async () => {
   const sdk = new MicroVM({
     patToken: "avm_viewer",

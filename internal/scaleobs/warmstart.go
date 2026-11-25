@@ -29,3 +29,18 @@ func MarkWarmStart(ctx context.Context) {
 		marker.Store(true)
 	}
 }
+
+// WarmStarted reports whether the create running under ctx was marked warm,
+// and whether ctx carries a marker at all (measured is false for a ctx no
+// create set up, such as a WASM migration's). One context lookup and an
+// atomic load.
+func WarmStarted(ctx context.Context) (warm, measured bool) {
+	if ctx == nil {
+		return false, false
+	}
+	marker, ok := ctx.Value(warmStartKey{}).(*atomic.Bool)
+	if !ok || marker == nil {
+		return false, false
+	}
+	return marker.Load(), true
+}

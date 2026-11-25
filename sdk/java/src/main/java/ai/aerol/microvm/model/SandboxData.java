@@ -64,6 +64,19 @@ public class SandboxData {
     public Lifecycle lifecycle = new Lifecycle();
     public Failover failover;
     public String runtime = "";
+    /**
+     * The hardware a VM runtime runs on: {@code "kvm"} for firecracker. Null
+     * for runtimes that are not VMs.
+     */
+    public String backend;
+    /**
+     * How the create that made this sandbox started: {@code "snapshot"} (a
+     * Firecracker VM the warm pool had already restored), {@code "parked"} (a
+     * container, WASM worker or workerd host started ahead of time) or
+     * {@code "none"} (nothing was waiting). Null for a sandbox made before the
+     * server sent it, or moved between nodes.
+     */
+    public String warm;
     public String durability;
     @JsonProperty("module_ref")
     public String moduleRef;
@@ -120,6 +133,8 @@ public class SandboxData {
         lifecycle = other.lifecycle == null ? new Lifecycle() : other.lifecycle.copy();
         failover = other.failover == null ? null : other.failover.copy();
         runtime = other.runtime == null ? "" : other.runtime;
+        backend = other.backend;
+        warm = other.warm;
         durability = other.durability;
         moduleRef = other.moduleRef;
         moduleDigest = other.moduleDigest;
