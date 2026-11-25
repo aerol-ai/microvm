@@ -30,6 +30,15 @@ exit 0
       ]
     },
     {
+      "name": "runtimes",
+      "singular_name": "runtime",
+      "short_names": null,
+      "kind": "Runtime",
+      "verbs": [
+        "get"
+      ]
+    },
+    {
       "name": "sandboxes",
       "singular_name": "sandbox",
       "short_names": [

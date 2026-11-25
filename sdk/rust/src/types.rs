@@ -1956,6 +1956,78 @@ where
     Ok(Option::<Vec<ApiToken>>::deserialize(d)?.unwrap_or_default())
 }
 
+/// What a runtime can do. The server fills this from one fixed table, so
+/// every caller sees the same values.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeFeatures {
+    /// A sandbox can be saved as a named snapshot that new sandboxes start
+    /// from.
+    pub snapshots: bool,
+    /// A stop keeps memory and running programs, and the next start
+    /// resumes them.
+    pub pause: bool,
+    /// What a sandbox keeps when the cluster moves it to another node:
+    /// `"memory"` (running programs and memory), `"disk"` (files only) or
+    /// `"none"`.
+    pub moves: String,
+    /// How a create can start warm: `"snapshot"`, `"parked"` or `"none"`.
+    /// The operator decides whether a warm pool runs.
+    pub warm_pool: String,
+    /// Memory is sealed from the host. No runtime offers this yet.
+    pub confidential: bool,
+}
+
+/// Fixed limits a runtime has, whatever the operator sets.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeLimits {
+    /// The most memory (MiB) a checkpoint can restore. A bigger sandbox
+    /// still runs, but cannot come back from a passivation or a move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_checkpoint_memory_mb: Option<u32>,
+}
+
+/// One runtime as `client.runtimes().list()` returns it.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeInfo {
+    /// The name to pass as `runtime` on create, such as `"firecracker"`.
+    pub name: String,
+    /// What walls the sandbox off from the server: `"container"`,
+    /// `"user-space-kernel"`, `"hardware-vm"`, `"wasm"` or `"v8-isolate"`.
+    pub isolation: String,
+    /// The hardware a VM runtime runs on, such as `"kvm"`. `None` for
+    /// runtimes that are not VMs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    pub features: RuntimeFeatures,
+    /// `None` when the runtime has no fixed limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<RuntimeLimits>,
+    /// At least one node that runs sandboxes offers this runtime now.
+    pub available: bool,
+    /// How many nodes offer it. The server sends this to fleet admins
+    /// only; for everyone else it is `None`. Node names are never sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nodes: Option<u32>,
+}
+
+/// The body of `GET /v1/runtimes`. `client.runtimes().list()` returns its
+/// `runtimes` field.
+#[derive(Deserialize, Debug, Default)]
+pub(crate) struct RuntimeListWire {
+    #[serde(default, deserialize_with = "null_as_empty_runtimes")]
+    pub runtimes: Vec<RuntimeInfo>,
+}
+
+fn null_as_empty_runtimes<'de, D>(d: D) -> Result<Vec<RuntimeInfo>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<RuntimeInfo>>::deserialize(d)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod exec_result_tests {
     use super::ExecResult;

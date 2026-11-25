@@ -14,7 +14,7 @@ export {
   MicroVMUnsupportedFeatureError,
 } from "./errors.js";
 export { DEFAULT_LIST_LIMIT } from "./internal/client.js";
-export type { GetOrCreateResult, MicroVMConfig, Tokens } from "./MicroVM.js";
+export type { GetOrCreateResult, MicroVMConfig, Runtimes, Tokens } from "./MicroVM.js";
 export type { RetryConfig } from "./internal/client.js";
 export type {
   AddCustomDomainOptions,
@@ -24,6 +24,9 @@ export type {
   CreatedAPIToken,
   CreateSandboxTokenOptions,
   RevokeSandboxTokensResult,
+  RuntimeFeatures,
+  RuntimeInfo,
+  RuntimeLimits,
   SandboxToken,
   WhoAmI,
   WhoAmIPrincipal,

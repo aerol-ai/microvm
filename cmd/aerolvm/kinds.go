@@ -58,6 +58,9 @@ func resourceKinds() []resourceKind {
 		{plural: "snapshots", singular: "snapshot", short: []string{"snap"}, title: "Snapshot", get: getSnapshots, describe: describeSnapshot, del: deleteSnapshots},
 		{plural: "tokens", singular: "token", short: []string{"tok"}, title: "Token", get: getTokens, describe: describeToken, del: deleteTokens},
 		{plural: "jointokens", singular: kindJoinToken, short: []string{"jt", "join-token", "join-tokens"}, title: "JoinToken", get: getJoinTokensKind, del: deleteJoinTokensKind},
+		// No short name: a word that becomes a kind stops reaching a
+		// sandbox with that name, and "rt" is a likely sandbox name.
+		{plural: "runtimes", singular: "runtime", title: "Runtime", get: getRuntimes},
 	}
 }
 
@@ -85,11 +88,14 @@ func lookupKind(word string) (string, bool) {
 	return k.singular, ok
 }
 
-// kindList names every kind for an error message: "nodes, sandboxes or tokens".
+// kindList names every kind delete takes, for its error message: "nodes,
+// sandboxes or tokens". A read-only kind (runtimes) is left out.
 func kindList() string {
 	names := make([]string, 0, len(resourceKinds()))
 	for _, k := range resourceKinds() {
-		names = append(names, k.plural)
+		if k.del != nil {
+			names = append(names, k.plural)
+		}
 	}
 	// The table always has more than one kind.
 	return strings.Join(names[:len(names)-1], ", ") + " or " + names[len(names)-1]

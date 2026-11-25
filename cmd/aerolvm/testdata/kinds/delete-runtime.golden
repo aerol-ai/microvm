@@ -1,0 +1,5 @@
+exit 2
+--- stdout
+--- stderr
+aerolvm delete: delete does not take runtimes
+run `aerolvm delete --help` for usage

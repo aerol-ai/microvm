@@ -128,7 +128,7 @@ The tools come in three sets. Only `core` is on by default.
 
 | Set | What the agent can do | Tools |
 |---|---|---|
-| `core` | Create, list and delete sandboxes. Run commands. Read, write and list files. Share a port. | `sandbox_create`, `sandbox_list`, `sandbox_destroy`, `exec`, `read_file`, `write_file`, `list_files`, `expose_port` |
+| `core` | Create, list and delete sandboxes. See which runtimes the server offers. Run commands. Read, write and list files. Share a port. | `sandbox_create`, `sandbox_list`, `sandbox_destroy`, `list_runtimes`, `exec`, `read_file`, `write_file`, `list_files`, `expose_port` |
 | `files` | Change part of a file. Find files by name. Search inside files. | `edit_file`, `search_files`, `grep_files` |
 | `process` | Start a program that keeps running, such as a dev server. Read its output. Stop it. | `start_process`, `process_logs`, `stop_process` |
 
@@ -190,6 +190,7 @@ Tool results stay small enough for an AI model to read:
 - **`exec`** keeps 16 KB of each output stream: the first quarter and the last three quarters. It says how much it cut. Change the size with `--max-output-bytes`. A command that runs past its time limit is stopped and reports exit code 124.
 - **`read_file`** returns up to 2,000 lines or 256 KB per call, and says where to continue. It refuses binary files.
 - **`sandbox_list`** returns 20 sandboxes per page, with a token for the next page.
+- **`list_runtimes`** returns only the runtimes `sandbox_create` accepts, with `available`, `isolation` and `features` for each, so the agent can pick one. It never shows server names or how many servers offer a runtime. Pinned mode does not offer it, since the agent cannot create there.
 - **`search_files` and `grep_files`** cap their matches and say when they cut some.
 
 Errors come back as tool results with a code the agent can act on, such as `not_found`, `edit_conflict`, `binary_file` or `create_limit`.
