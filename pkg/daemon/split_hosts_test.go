@@ -3,16 +3,23 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/service"
+	"github.com/aerol-ai/microvm/pkg/api/apihttp"
+	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/hostproc"
 	pkgisolate "github.com/aerol-ai/microvm/pkg/isolate"
 )
@@ -145,6 +152,21 @@ func TestSplitWorkerdLauncher(t *testing.T) {
 	f.err, f.resp = nil, &rootdpb.SpawnHostResponse{}
 	if _, err := l.Start(ctx, "g", pkgisolate.Limits{}); err == nil {
 		t.Fatal("a host with no process was held")
+	}
+	f.err = boom
+	if _, err := l.Prepare(ctx, "g"); !errors.Is(err, boom) {
+		t.Fatalf("Prepare = %v", err)
+	}
+	// The helper's V8 jail limit is the node's capacity, answered 503 with
+	// the helper's words, not the client's text for a busy helper.
+	limit := "root helper: this node keeps 4096 V8 jails, its limit (SB_ROOTD_ISOLATE_MAX_JAILS=4096)"
+	f.err = fmt.Errorf("%w: %w", rootclient.ErrBusy, status.Error(codes.ResourceExhausted, limit))
+	_, err := l.Prepare(ctx, "g")
+	if !errors.Is(err, capacity.ErrCapacityExceeded) || errors.Is(err, rootclient.ErrBusy) || !strings.Contains(err.Error(), limit) {
+		t.Fatalf("Prepare past the jail limit = %v, want a capacity error with the helper's words", err)
+	}
+	if c := apihttp.Classify(err); c.Status != http.StatusServiceUnavailable || c.RetryAfter == 0 || strings.Contains(c.Message, "network calls") {
+		t.Fatalf("the API answers the jail limit %+v, want a 503 to retry", c)
 	}
 }
 

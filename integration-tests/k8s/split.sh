@@ -23,10 +23,15 @@
 #   hosts     with WASM and V8 isolates on (AEROL_K8S_WASM_V8=1 for
 #             k8s-dev.sh; skipped otherwise): a WASM and a V8 sandbox
 #             answer, their hosts run in the runtime container under the
-#             helper's users, an agent restart takes both over (the same
-#             processes, still answering), and both delete
+#             helper's users, the WASM workers' group reaches the agent
+#             alone (from its image) and no WASM host holds it, and an
+#             agent restart takes both over (the same processes, still
+#             answering). Both stay for restarts, which deletes them; run
+#             without restarts, this step deletes them itself
 #   restarts  an agent restart, then a root helper restart: every sandbox
-#             (and the mount's writes) keep going, and new creates work
+#             (and the mount's writes) keep going, and new creates work;
+#             the WASM and V8 sandboxes from hosts answer after each, run
+#             by the same host processes, and delete through the new helper
 #   verify    aerolvm k8s verify passes and reports the worker in split
 #   f8        deleting the pod with sandboxes running finishes, and leaves
 #             no namespace or mount behind on the machine (the V8 jails'
@@ -240,6 +245,37 @@ host_uids() {
 }
 # survivors prints the pids in both lists.
 survivors() { comm -12 <(tr ' ' '\n' <<<"$1" | sort) <(tr ' ' '\n' <<<"$2" | sort) | tr '\n' ' '; }
+# same_pids: two lists of pids hold the same pids, and some.
+same_pids() {
+  local a b
+  a="$(tr ' ' '\n' <<<"$1" | grep . | sort)"
+  b="$(tr ' ' '\n' <<<"$2" | grep . | sort)"
+  [[ -n "$a" && "$a" == "$b" ]]
+}
+# The WASM and V8 sandboxes step_hosts makes, which step_restarts keeps
+# through both restarts.
+wasm_id="" v8_id=""
+# hosts_answer checks both answer. A WASM exec's first word is the
+# module's argv[0]. A V8 exec calls the handler with the command as the URL
+# path (the CLI has no exec for V8 sandboxes, so the API's).
+hosts_answer() {
+  local out
+  out="$(cli exec "$wasm_id" -- split-stdio args split-wasm 2>&1)"
+  check "$1: the WASM sandbox answers $2 ($out)" test "$out" = split-wasm
+  out="$(api -X POST "$SB_API_URL/v1/sandboxes/$v8_id/toolbox/process/execute" -d '{"command":"/hello"}' | jq -r '.stdout // .' 2>&1)"
+  check "$1: the V8 sandbox answers $2 ($out)" test "$out" = "split-v8 /hello"
+}
+# hosts_delete deletes both, checking each is gone.
+hosts_delete() {
+  local id code
+  for id in "$wasm_id" "$v8_id"; do
+    code="$(api -o /dev/null -w '%{http_code}' -X DELETE "$SB_API_URL/v1/sandboxes/$id")"
+    check "$1: delete $id ($code)" bash -c '[[ "$1" == 200 || "$1" == 204 ]]' _ "$code"
+    code="$(api -o /dev/null -w '%{http_code}' "$SB_API_URL/v1/sandboxes/$id")"
+    check "$1: $id is gone ($code)" test "$code" = 404
+  done
+  wasm_id="" v8_id=""
+}
 step_hosts() {
   local on
   on="$(k get pod "$pod" -o jsonpath='{.spec.containers[?(@.name=="agent")].env[?(@.name=="SB_ENABLE_WASM")].value}/{.spec.containers[?(@.name=="agent")].env[?(@.name=="SB_ENABLE_ISOLATE")].value}')"
@@ -254,7 +290,7 @@ step_hosts() {
     return
   fi
   k exec -i "$pod" -c agent -- sh -c 'mkdir -p /var/lib/sandboxd/wasm/modules && cat > /var/lib/sandboxd/wasm/modules/split-stdio.wasm' <"$tmp/split-stdio.wasm"
-  local out wasm_id v8_id ref
+  local out ref
   out="$(api -X POST "$SB_API_URL/v1/sandboxes" -d '{"runtime":"wasm","image":"split-stdio.wasm","module_ref":"split-stdio.wasm"}')"
   wasm_id="$(jq -r '.id // empty' <<<"$out" 2>/dev/null)"
   [[ -n "$wasm_id" ]] || { fail "hosts: WASM create: $(head -c 300 <<<"$out")"; return; }
@@ -264,16 +300,7 @@ step_hosts() {
   out="$(api -X POST "$SB_API_URL/v1/sandboxes" -d "$(jq -nc --arg r "$ref" '{runtime:"isolate", image:$r, module_ref:$r}')")"
   v8_id="$(jq -r '.id // empty' <<<"$out" 2>/dev/null)"
   [[ -n "$v8_id" ]] || { fail "hosts: V8 create: $(head -c 300 <<<"$out")"; return; }
-  # A WASM exec's first word is the module's argv[0]. A V8 exec calls the
-  # handler with the command as the URL path (the CLI has no exec for V8
-  # sandboxes, so the API's).
-  answers() {
-    out="$(cli exec "$wasm_id" -- split-stdio args split-wasm 2>&1)"
-    check "hosts: the WASM sandbox answers $1 ($out)" test "$out" = split-wasm
-    out="$(api -X POST "$SB_API_URL/v1/sandboxes/$v8_id/toolbox/process/execute" -d '{"command":"/hello"}' | jq -r '.stdout // .' 2>&1)"
-    check "hosts: the V8 sandbox answers $1 ($out)" test "$out" = "split-v8 /hello"
-  }
-  answers "after its create"
+  hosts_answer hosts "after its create"
   # The helper runs both hosts in the runtime container: WASM hosts as the
   # worker user (61000), workerd jailed as the jail user (1000). The agent,
   # in a process namespace of its own, sees neither.
@@ -288,6 +315,18 @@ step_hosts() {
   check "hosts: workerd runs in the runtime container as the jail's uid 1000 (pids ${v8_pids:-none}; uids ${uids:-none})" test "$uids" = "1000 "
   seen="$(agent sh -c 'for d in /proc/[0-9]*; do [ "${d#/proc/}" = "$$" ] && continue; case "$(tr "\0" " " < "$d/cmdline" 2>/dev/null)" in *--wasm-*|*"workerd serve"*) echo x;; esac; done' | wc -l | tr -d ' ')"
   check "hosts: the agent sees none of them ($seen)" test "$seen" = 0
+  # The WASM workers' group (61000) is the agent's alone: its image lists
+  # its uid in the group, and the pod gives the group to no container. The
+  # runtime container's first process (the supervisor) lacks it, and every
+  # WASM host drops every group.
+  local groups
+  groups="$(agent id -G)"
+  check "hosts: the agent is in the WASM workers' group ($groups)" bash -c '[[ " $1 " == *" 61000 "* ]]' _ "$groups"
+  groups="$(runtime sh -c 'sed -n "s/^Groups:[[:space:]]*//p" /proc/1/status')"
+  check "hosts: the runtime container is not (groups: ${groups:-none})" bash -c '[[ " $1 " != *" 61000 "* ]]' _ "$groups"
+  # shellcheck disable=SC2086
+  groups="$(runtime sh -c 'for p in "$@"; do sed -n "s/^Groups:[[:space:]]*//p" "/proc/$p/status"; done' _ $wasm_pids | tr -d ' \n')"
+  check "hosts: no WASM host holds a supplementary group (${groups:-none})" test -z "$groups"
   # An agent restart: the next sandboxd takes both hosts over through the
   # helper, with no process namespace shared.
   local before cid since wasm_after v8_after logs
@@ -297,7 +336,7 @@ step_hosts() {
   docker exec "$node" crictl --timeout 60s stop --timeout 30 "${cid#containerd://}" >/dev/null
   check "hosts: the agent came back" wait_restarted agent "$before"
   forward
-  answers "after the agent restart"
+  hosts_answer hosts "after the agent restart"
   wasm_after="$(survivors "$wasm_pids" "$(host_pids '--wasm-' | tr '\n' ' ')")"
   v8_after="$(survivors "$v8_pids" "$(host_pids 'workerd serve' | tr '\n' ' ')")"
   check "hosts: a WASM host from before the restart still runs (${wasm_after:-none} of ${wasm_pids:-none})" test -n "$wasm_after"
@@ -305,13 +344,8 @@ step_hosts() {
   logs="$(k logs "$pod" -c agent --since-time="$since" 2>/dev/null)"
   check "hosts: the new agent took the WASM sandbox over" bash -c 'grep "wasm adopt: running sandbox taken over" <<<"$1" | grep -q "$2"' _ "$logs" "$wasm_id"
   check "hosts: the new agent took the V8 sandbox over, reloading none" bash -c 'grep "isolate adopt: sandboxes from the previous sandboxd" <<<"$1" | grep -Eq "adopted[\":= ]+[1-9]" && ! grep "isolate adopt: sandboxes from the previous sandboxd" <<<"$1" | grep -Eq "reloading[\":= ]+[1-9]"' _ "$logs"
-  local id code
-  for id in "$wasm_id" "$v8_id"; do
-    code="$(api -o /dev/null -w '%{http_code}' -X DELETE "$SB_API_URL/v1/sandboxes/$id")"
-    check "hosts: delete $id ($code)" bash -c '[[ "$1" == 200 || "$1" == 204 ]]' _ "$code"
-    code="$(api -o /dev/null -w '%{http_code}' "$SB_API_URL/v1/sandboxes/$id")"
-    check "hosts: $id is gone ($code)" test "$code" = 404
-  done
+  # restarts keeps both through a root helper restart, then deletes them.
+  [[ " ${steps[*]} " == *" restarts "* ]] || hosts_delete hosts
 }
 
 step_restarts() {
@@ -324,9 +358,18 @@ step_restarts() {
   check "restarts: the agent came back" wait_restarted agent "$before"
   forward
   check "restarts: every sandbox answers after the agent restart" all_exec
+  [[ -n "$wasm_id" ]] && hosts_answer restarts "after the agent restart"
   id="$(mk)"
   created+=("$id")
   check "restarts: a new create works after the agent restart" test -n "$id"
+  # The WASM and V8 hosts from hosts, if it ran: a helper restart leaves
+  # them running (each is in a cgroup of its own), and the next helper
+  # serves them.
+  local wasm_pids v8_pids
+  if [[ -n "$wasm_id" ]]; then
+    wasm_pids="$(host_pids '--wasm-' | tr '\n' ' ')"
+    v8_pids="$(host_pids 'workerd serve' | tr '\n' ' ')"
+  fi
   hp1="$(helper_pid)"
   runtime kill "$hp1"
   hp2=""
@@ -337,6 +380,19 @@ step_restarts() {
   done
   check "restarts: the supervisor started the helper again ($hp1 -> ${hp2:-none})" bash -c '[[ -n "$1" && "$1" != "$2" ]]' _ "$hp2" "$hp1"
   check "restarts: every sandbox answers after the helper restart" all_exec
+  if [[ -n "$wasm_id" ]]; then
+    hosts_answer restarts "after the helper restart"
+    local wasm_after v8_after
+    wasm_after="$(survivors "$wasm_pids" "$(host_pids '--wasm-' | tr '\n' ' ')")"
+    v8_after="$(survivors "$v8_pids" "$(host_pids 'workerd serve' | tr '\n' ' ')")"
+    check "restarts: every WASM host from before the helper restart still runs (${wasm_after:-none} of ${wasm_pids:-none})" \
+      same_pids "$wasm_after" "$wasm_pids"
+    check "restarts: every workerd from before the helper restart still runs (${v8_after:-none} of ${v8_pids:-none})" \
+      same_pids "$v8_after" "$v8_pids"
+    # The new helper stops hosts the old one started, and removes the V8
+    # jail.
+    hosts_delete restarts
+  fi
   id="$(mk --runtime gvisor)"
   created+=("$id")
   check "restarts: a new create works after the helper restart" test -n "$id"

@@ -209,8 +209,15 @@ func TestRenderedSplitHostsWorkerTemplate(t *testing.T) {
 	if pod.Spec.ShareProcessNamespace != nil && *pod.Spec.ShareProcessNamespace {
 		t.Error("a split worker shares one process namespace")
 	}
-	if psc := pod.Spec.SecurityContext; psc == nil || !slices.Contains(psc.SupplementalGroups, 61000) || psc.FSGroup != nil {
-		t.Errorf("pod security %+v: want the WASM workers' group 61000 and no fsGroup", psc)
+	// The WASM workers' group (61000) is the agent's alone: the agent image
+	// lists its uid in the group, so the pod sets it for no container.
+	if psc := pod.Spec.SecurityContext; psc != nil && (slices.Contains(psc.SupplementalGroups, 61000) || psc.FSGroup != nil) {
+		t.Errorf("pod security %+v: want no pod-wide WASM workers' group 61000 and no fsGroup", psc)
+	}
+	for _, ctr := range pod.Spec.Containers {
+		if sc := ctr.SecurityContext; sc != nil && sc.RunAsUser != nil && *sc.RunAsUser == 65531 && ctr.Name != AgentContainer {
+			t.Errorf("%s runs as the agent's uid 65531, which the agent image puts in the WASM workers' group", ctr.Name)
+		}
 	}
 	ic := pod.Spec.InitContainers
 	if len(ic) != 4 || ic[0].Name != PreflightContainer || ic[1].Name != "split-folders" || ic[2].Name != "workerd" || ic[3].Name != SetupContainer {

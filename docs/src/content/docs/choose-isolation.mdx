@@ -236,6 +236,7 @@ On a cluster, AerolVM sends each sandbox only to a worker that can run its runti
 - **The default runtime.** `SB_CONTAINER_RUNTIME` sets what a create gets when it names none (`docker` unless you change it). On Kubernetes, use `worker.defaultRuntime`: `docker` (runc) or `gvisor`. The container warm pool keeps sandboxes ready in this runtime.
 - **One kind of runtime per node pool.** On Kubernetes cluster mode, set `runtimes` on a worker pool, such as `[gvisor]`, to limit what its workers run. See [Helm values](/kubernetes/values/#worker-pools).
 - **Install flags and settings.** See [Installer options](/getting-started/installer-options/#add-more-kinds-of-sandbox) for one server, and [Cluster setup](/cluster/aws/#step-5-turn-on-more-kinds-of-sandbox-optional) for Terraform.
+- **The wall around the server itself.** The runtime walls off each sandbox. A second setting, the privilege mode, decides whether AerolVM's own server code runs as root. [Run the server without root](/enterprise/privilege-mode/#what-each-option-protects-against) compares both kinds of wall.
 
 ## Next steps
 

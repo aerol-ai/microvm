@@ -482,3 +482,56 @@ func TestRestoreRefusesAFileOnTheWay(t *testing.T) {
 		t.Fatal("the moved database was not put back")
 	}
 }
+
+// A folder's mode is set through the handle the restore opened on it,
+// never by its path. In privilege mode split sandboxd's user owns these
+// folders and can put a link in a folder's place between its open and its
+// chmod: the mode must land on the folder that was opened, and the folder
+// the link points to (a stand-in for /etc) keeps its own. A chmod by path
+// would follow the link.
+func TestRestoreSetsAFoldersModeThroughTheFolderItOpened(t *testing.T) {
+	for _, split := range []bool{false, true} {
+		t.Run(map[bool]string{false: "single", true: "split"}[split], func(t *testing.T) {
+			archive := filepath.Join(t.TempDir(), "a.tgz")
+			writeTar(t, archive, tarEntry{name: "./etc/sandboxd/"}, tarEntry{name: "./etc/sandboxd/tls/", mode: 0o750})
+			dst := t.TempDir()
+			if split {
+				splitTarget(t, dst)
+			}
+			tls := filepath.Join(dst, "etc", "sandboxd", "tls")
+			if err := os.MkdirAll(tls, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			chmod(t, tls, 0o700)
+			etc := t.TempDir()
+			chmod(t, etc, 0o755)
+			swapped := false
+			setRestoreHook(t, func(stage, p string) {
+				if stage != "folder" || p != tls || swapped {
+					return
+				}
+				swapped = true
+				rename(t, tls, tls+".opened")
+				symlink(t, etc, tls)
+			})
+			_, out, err := restore(t, RestoreOptions{Input: archive, TargetRoot: dst, euid: func() int { return 0 },
+				chown: func(string, int, int) error { return nil }})
+			if err != nil {
+				t.Fatalf("restore: %v\n%s", err, out)
+			}
+			if !swapped {
+				t.Fatal("the restore never reached the folder's chmod")
+			}
+			if m := mode(t, etc); m != 0o755 {
+				t.Fatalf("the folder the link points to is now %v, want 0755", m)
+			}
+			want := os.FileMode(0o750)
+			if split {
+				want = 0o700 // sandboxd's user's folder: no group or other bits
+			}
+			if m := mode(t, tls+".opened"); m != want {
+				t.Fatalf("the folder the restore opened is %v, want %v", m, want)
+			}
+		})
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/aerol-ai/microvm/internal/cluster"
+	"github.com/aerol-ai/microvm/pkg/controlplane"
 )
 
 // A sandbox left on a node an operator deleted (internal/cluster
@@ -45,7 +46,7 @@ func destroyAbandoned(c cluster.Client, id string, w http.ResponseWriter, r *htt
 	// would only bounce. A call with no credential of its own would reach
 	// the server as this node, which may not delete sandboxes.
 	fw, ok := c.(serverForwarder)
-	if !ok || r.Header.Get(cluster.HeaderForwarded) == "1" || !hasBearer(r) {
+	if !ok || r.Header.Get(cluster.HeaderForwarded) == "1" || !(hasBearer(r) || kubernetesCaller(r)) {
 		return false
 	}
 	fw.ForwardToServer(w, r)
@@ -56,6 +57,16 @@ func destroyAbandoned(c cluster.Client, id string, w http.ResponseWriter, r *htt
 func hasBearer(r *http.Request) bool {
 	scheme, cred, _ := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
 	return strings.EqualFold(scheme, "Bearer") && strings.TrimSpace(cred) != ""
+}
+
+// kubernetesCaller reports whether r is the agent-sandbox API's in-process
+// call for a Kubernetes user (pkg/api KubeBackend). It has no credential, but
+// the forward names the user and its owner (cluster.StampForward), and the
+// server grants the call only that owner's runner access, never this node's
+// own. The server then checks the owner again before it deletes.
+func kubernetesCaller(r *http.Request) bool {
+	access, ok := controlplane.AccessFromContext(r.Context())
+	return ok && access.Principal.Kind == controlplane.PrincipalKubernetes
 }
 
 // writeOwnerDeleted answers a call for a sandbox whose placement still names

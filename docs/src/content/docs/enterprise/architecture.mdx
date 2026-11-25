@@ -11,7 +11,8 @@ This page describes how an AerolVM deployment is put together from a security po
 
 | Component | Runs on | What it does | Trust level |
 |---|---|---|---|
-| `sandboxd` | The server, as root | The AerolVM server. It serves the API, starts sandboxes, seals secrets and writes the audit log. | Trusted |
+| `sandboxd` | The server, as root by default | The AerolVM server. It serves the API, starts sandboxes, seals secrets and writes the audit log. In [privilege mode split](/enterprise/privilege-mode/) it runs as a user with no rights. | Trusted |
+| Root helper (`aerolvm-rootd`) | The server, in privilege mode split only | Does the root work for `sandboxd`: networks, firewall rules, cgroups, mounts and containerd writes. It checks every request first. | Trusted |
 | Caddy | The server | The web server in front. It handles HTTPS, public links and shared TCP ports. | Trusted |
 | Network filter | The server | Enforces each sandbox's outbound policy: name lookups, site checks and inject rules. | Trusted |
 | Database | The server's disk | SQLite. It holds sandbox records and sealed secrets. | Trusted |

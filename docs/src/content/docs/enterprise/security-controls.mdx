@@ -21,7 +21,7 @@ Each control has an ID, such as **NS-2**. Use the IDs in your own reviews, ticke
 flowchart LR
     B["AerolVM security baseline"] --> NS["NS: Network security<br/>8 controls"]
     B --> IM["IM: Identity and access<br/>7 controls"]
-    B --> WI["WI: Workload isolation<br/>6 controls"]
+    B --> WI["WI: Workload isolation<br/>7 controls"]
     B --> DP["DP: Data protection<br/>7 controls"]
     B --> LT["LT: Logging and threat detection<br/>9 controls"]
     B --> PV["PV: Posture and vulnerability management<br/>4 controls"]
@@ -38,7 +38,7 @@ These facts shape how AerolVM should be secured.
 | Holds your secrets | Yes: environment variables, registry passwords and storage credentials, sealed at rest |
 | Stores data at rest | Sandbox files on the server's disk. Records and sealed secrets in a SQLite database. |
 | Exposed to the network | The HTTPS API and public links, shared TCP ports, SSH if on, and cluster ports in a cluster |
-| Runs as root on the server | Yes. `sandboxd` manages containers, virtual machines, firewall rules and mounts. |
+| Runs as root on the server | By default, yes. `sandboxd` manages containers, virtual machines, firewall rules and mounts. In [privilege mode split](/enterprise/privilege-mode/), `sandboxd` runs as a user with no rights, and a small root helper does that work after checking each request. |
 | Identity model | One server token by default. With access control on: company sign-in (OIDC) for people, scoped API tokens for services, four roles bound to teams. Certificates between cluster servers. |
 | Hosting | Self-hosted only. You run the servers. |
 
@@ -93,6 +93,7 @@ flowchart TB
 | WI‑4 | Lifetime timers | No | You | `stopIfIdleFor` and `destroyAtAge`, up to 30 days. See [Lifecycle](/lifecycle/). |
 | WI‑5 | Non-root code | Partial. Code runs as the image's default user. | You | Build images with a non-root `USER` |
 | WI‑6 | Privileged mode off | Yes | AerolVM | Leave `SB_CONTAINER_PRIVILEGED` off |
+| WI‑7 | The server runs without root | No | You | `install.sh --privilege-mode split`, Terraform's `privilege_mode`, or the chart's `privilegeMode: split`. See [Run the server without root](/enterprise/privilege-mode/). |
 
 How strong the wall is depends on the runtime:
 
