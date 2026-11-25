@@ -49,7 +49,7 @@ flowchart LR
   - no host namespaces, except the sandbox's own network;
   - no hooks and no devices;
   - only known runtime programs.
-- **The helper is signed.** It ships with each release, signed with an AerolVM release key. The root side copies it to a folder only root can write, checks the copy's signature, and runs that exact copy. A helper with a bad signature, or older than the one running, is refused, and the running one stays.
+- **The helper is signed.** It ships with each release, signed with an AerolVM release key. The root side copies it to a folder only root can write, checks the copy's signature, and runs that exact copy. A helper with a bad signature, or older than the one running, is refused, and the running one stays. This holds after a restart of the root side too: on Kubernetes the `runtime` container keeps the version of the last helper it ran on a volume of its own, for the life of the pod.
 - **A refusal raises an alarm.** `sandboxd` only sends requests its own code built, and those always pass. So a refusal means one of two things. Either `sandboxd` and the helper are out of step, for example after an upgrade that did not finish. Or `sandboxd` is no longer running AerolVM's own code. Each refusal:
   - fails the request with `500`;
   - writes a `rootd_refusal` record to the audit log;
@@ -307,6 +307,7 @@ On Kubernetes, run [`aerolvm k8s verify`](/kubernetes/security/#check-a-live-ins
 
 - **`sandboxd` will not start, and its log names a setting.** Split cannot run with that setting. Change it, or run the server in `single`. For example: `SB_PRIVILEGE_MODE=split needs SB_CONTAINER_ENGINE=containerd`.
 - **Creates fail with `503`** and the message `the node's root helper is unavailable; retry shortly`. The helper is down or restarting. systemd, or the `runtime` container on Kubernetes, starts it again, so retry after a few seconds. Read its log: `journalctl -u aerolvm-rootd`, or `kubectl logs <worker pod> -c runtime`.
+- **The `agent` container restarts right after the `runtime` container restarted.** This is expected on Kubernetes. The `runtime` container gets a new cgroup each time it starts, and sandboxes go under it. `sandboxd` reads where they go once, when it starts. So when the helper says they now go somewhere else, `sandboxd` stops and the kubelet starts it again with the new place. Until then, creates fail with `503`. Its log says `the root helper holds sandboxes to a new cgroup parent`. A restart of the `runtime` container ends every sandbox on that worker.
 - **Creates fail with `500`, and the `SandboxdRootHelperRefusal` alert fires.** The helper refused a request. Treat it as a security event until you rule out a version mismatch. The [root helper refusal runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal) says what to check first.
 
 ## How it is tested

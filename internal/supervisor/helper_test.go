@@ -361,6 +361,19 @@ func (r *keeperRig) waitStarts(n int) []*fakeChild {
 	return r.starts()
 }
 
+// copiesIn lists the helper copies in a keeper's folder: everything but
+// the floor.
+func copiesIn(dir string) []string {
+	ents, _ := os.ReadDir(dir)
+	var out []string
+	for _, e := range ents {
+		if e.Name() != rootswap.FloorName {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
 func copyName(t *testing.T, version string, body []byte) string {
 	t.Helper()
 	m, err := rootswap.NewManifest(bytes.NewReader(body), version, 1, runtime.GOOS, runtime.GOARCH)
@@ -517,9 +530,14 @@ func TestHelperRollback(t *testing.T) {
 				t.Fatalf("logs:\n%s", logs)
 			}
 			eventually(t, "v2's copy removed", func() bool {
-				ents, _ := os.ReadDir(r.k.BinDir)
-				return len(ents) == 1 && ents[0].Name() == filepath.Base(first.bin)
+				ents := copiesIn(r.k.BinDir)
+				return len(ents) == 1 && ents[0] == filepath.Base(first.bin)
 			})
+			// v2 never served: the floor is v1's again, so v1 may run
+			// after a restart too.
+			if f, err := rootswap.ReadFloor(r.k.BinDir); err != nil || f == nil || f.Version != "v1.0.0" {
+				t.Fatalf("floor after the rollback = %+v, %v; want v1.0.0", f, err)
+			}
 			time.Sleep(50 * time.Millisecond) // many ticks: v2 waits for RetryFailed
 			if n := len(r.starts()); n != 3 {
 				t.Fatalf("%d starts; the failed helper was tried again at once", n)

@@ -280,7 +280,8 @@ func (i *Installed) Remove() error {
 }
 
 // Sweep removes every copy and half-made copy in binDir but keep: copies
-// a supervisor that stopped left behind.
+// a supervisor that stopped left behind. The floor stays (FloorName); a
+// half-written one goes.
 func Sweep(binDir string, keep ...string) error {
 	bfd, err := rootfolder.OpenFolder(binDir)
 	if err != nil {
@@ -301,7 +302,7 @@ func Sweep(binDir string, keep ...string) error {
 	}
 	var errs []error
 	for _, n := range names {
-		ours := strings.HasPrefix(n, BinaryName+"-") || rootfolder.IsTmpName(n, BinaryName)
+		ours := strings.HasPrefix(n, BinaryName+"-") || rootfolder.IsTmpName(n, BinaryName) || rootfolder.IsTmpName(n, FloorName)
 		if !ours || contains(keep, filepath.Join(binDir, n)) {
 			continue
 		}
