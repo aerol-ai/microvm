@@ -348,15 +348,17 @@ requests to a live helper with real containerd, on a Linux test machine
 `rootd_refusal` audit record (`TestRecordRootRefusal` in
 `internal/service/rootd_refusal_audit_test.go`). It counts the refusal
 in `aerolvm_rootd_refusals_total`, and the `SandboxdRootHelperRefusal`
-alert fires within 5 minutes (`TestRootHelperRefusalAlertRule` and, with
-`promtool` installed, `TestRootHelperRefusalAlertFires`, in
-`setup/prometheus/alerts_test.go`).
+alert fires within 5 minutes (`TestRootHelperRefusalAlertRule` and
+`TestRootHelperRefusalAlertFires`, in `setup/prometheus/alerts_test.go`;
+CI's go-tests job runs the second with `promtool`). The chart's own rules
+(`monitoring/rules.yaml`) carry the same alert, copied from
+`setup/prometheus/sandboxd-alerts.yml`, so `monitoring.enabled=true`
+installs it. `TestChartCarriesSetupAlertsAsIs` fails if the copy differs
+from the setup rule, and `TestRootHelperRefusalAlertFires` runs promtool's
+tests on both.
 The helper also logs each refusal itself, as root, in the `runtime`
 container's log, where the agent cannot change it. The runbook is
-`setup/runbooks/secrets-and-audit.md`, "Root helper refusal". Known gap:
-the chart's own alert rules (`monitoring/rules.yaml`) do not include this
-alert yet. The metric is scraped with the rest; load the rule from
-`setup/prometheus/sandboxd-alerts.yml` until the chart has it.
+`setup/runbooks/secrets-and-audit.md`, "Root helper refusal".
 
 #### What split does not cover
 
