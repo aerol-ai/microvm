@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -876,35 +877,130 @@ func TestEvictDeadOwnerRemovesRaftVoter(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test")
 	}
-	leader, cleanupLeader := newTestCluster(t, "ldr-evict-voter", true, nil)
-	defer cleanupLeader()
-	waitForLeader(t, leader, 10*time.Second)
+	a, cleanupA := newTestCluster(t, "ldr-evict-voter", true, nil)
+	defer cleanupA()
+	waitForLeader(t, a, 10*time.Second)
 
-	follower, cleanupFollower := newTestCluster(t, "fol-evict-voter", false, []string{leader.gossip.ml.LocalNode().Address()})
-	defer cleanupFollower()
-	waitForVoter(t, leader, follower.nodeID, 20*time.Second)
+	b, cleanupB := newTestCluster(t, "fol-evict-voter", false, []string{a.gossip.ml.LocalNode().Address()})
+	defer cleanupB()
+	waitForVoter(t, a, b.nodeID, 20*time.Second)
 
-	place, _ := encodeCommand(command{Op: opPlace, SandboxID: "sb-on-follower", OwnerNodeID: follower.nodeID})
-	if err := leader.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
-		t.Fatalf("place on follower: %v", err)
+	// Two voters, so every write below needs both nodes. The test timers
+	// are short (main_test.go: a 250 ms leader lease). On a busy runner a
+	// node can go that long without CPU; the leader then steps down in the
+	// middle of a write (raft.ErrLeadershipLost, or ErrNotLeader just
+	// before one), and either node may win the next election. That is Raft
+	// working, not the eviction failing. So each try runs on whichever
+	// node leads now and evicts the other one. A try whose leader lost its
+	// term starts again, as the dead-owner loop does on its next tick. A
+	// try that kept one leader in one term must remove the voter.
+	//
+	// The test's own evictDeadOwner call is the only eviction. With the
+	// leader changing between tries, a node's dead-owner loop could act
+	// later on a mark an earlier try left behind and remove the other
+	// voter by itself; the next try would then wait for two voters that
+	// never come back.
+	a.deadOwnerLoopStop()
+	b.deadOwnerLoopStop()
+	deadline := time.Now().Add(60 * time.Second)
+	for try := 1; ; try++ {
+		leader, dead := twoVoterLeader(t, a, b, time.Until(deadline))
+		term := leader.raft.raft.CurrentTerm()
+		if try > 1 {
+			t.Logf("try %d: %q leads in term %d and evicts %q", try, leader.nodeID, term, dead.nodeID)
+		}
+
+		place, err := encodeCommand(command{Op: opPlace, SandboxID: fmt.Sprintf("sb-on-%s-%d", dead.nodeID, try), OwnerNodeID: dead.nodeID})
+		if err != nil {
+			t.Fatalf("encodeCommand: %v", err)
+		}
+		if err := leader.raft.raft.Apply(place, 2*time.Second).Error(); err != nil {
+			if !raftLeadershipMoved(err) {
+				t.Fatalf("place on %q: %v", dead.nodeID, err)
+			}
+			t.Logf("try %d: leadership moved during the place (%v); trying again", try, err)
+			continue
+		}
+
+		markGossipDead(t, leader, dead.nodeID)
+		leader.deadOwners.markDead(dead.nodeID, time.Now().Add(-time.Hour))
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		leader.evictDeadOwner(ctx, dead.nodeID)
+		cancel()
+
+		// The barrier commits all this leader wrote, or fails if it is no
+		// longer the leader. A removal that was only appended before the
+		// leader stepped down does not count.
+		if err := leader.raft.raft.Barrier(2 * time.Second).Error(); err != nil {
+			if !raftLeadershipMoved(err) {
+				t.Fatalf("barrier on %q: %v", leader.nodeID, err)
+			}
+			t.Logf("try %d: leadership moved during the eviction (%v); trying again", try, err)
+			continue
+		}
+		if now := leader.raft.raft.CurrentTerm(); now != term {
+			t.Logf("try %d: leader %q went from term %d to %d during the eviction; trying again", try, leader.nodeID, term, now)
+			continue
+		}
+		cfgFuture := leader.raft.raft.GetConfiguration()
+		if err := cfgFuture.Error(); err != nil {
+			t.Fatalf("GetConfiguration: %v", err)
+		}
+		if raftConfigHas(cfgFuture.Configuration(), dead.nodeID) {
+			t.Fatalf("%q still in raft config after leader %q evicted it in one term", dead.nodeID, leader.nodeID)
+		}
+		return
 	}
+}
 
-	markGossipDead(t, leader, follower.nodeID)
-	leader.deadOwners.markDead(follower.nodeID, time.Now().Add(-time.Hour))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	leader.evictDeadOwner(ctx, follower.nodeID)
-
-	cfgFuture := leader.raft.raft.GetConfiguration()
-	if err := cfgFuture.Error(); err != nil {
-		t.Fatalf("GetConfiguration: %v", err)
+// twoVoterLeader waits until one of a and b leads, the other follows it,
+// and the leader's configuration has both as voters. It returns the leader
+// and the other node.
+func twoVoterLeader(t *testing.T, a, b *Cluster, max time.Duration) (leader, other *Cluster) {
+	t.Helper()
+	deadline := time.Now().Add(max)
+	for time.Now().Before(deadline) {
+		for _, pair := range [][2]*Cluster{{a, b}, {b, a}} {
+			l, o := pair[0], pair[1]
+			if l.raft.raft.State() != raft.Leader || o.Leader() != l.nodeID {
+				continue
+			}
+			f := l.raft.raft.GetConfiguration()
+			if f.Error() != nil {
+				continue
+			}
+			if raftConfigHasVoter(f.Configuration(), l.nodeID) && raftConfigHasVoter(f.Configuration(), o.nodeID) {
+				return l, o
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	for _, srv := range cfgFuture.Configuration().Servers {
-		if string(srv.ID) == follower.nodeID {
-			t.Fatalf("follower %q still in raft config after eviction", follower.nodeID)
+	t.Fatalf("no steady leader of two voters within %s (%q sees %q, %q sees %q)", max, a.nodeID, a.Leader(), b.nodeID, b.Leader())
+	return nil, nil
+}
+
+// raftLeadershipMoved reports whether a Raft future failed only because
+// this node stopped leading: the write may or may not have committed.
+func raftLeadershipMoved(err error) bool {
+	return errors.Is(err, raft.ErrLeadershipLost) || errors.Is(err, raft.ErrNotLeader)
+}
+
+func raftConfigHas(cfg raft.Configuration, nodeID string) bool {
+	for _, srv := range cfg.Servers {
+		if string(srv.ID) == nodeID {
+			return true
 		}
 	}
+	return false
+}
+
+func raftConfigHasVoter(cfg raft.Configuration, nodeID string) bool {
+	for _, srv := range cfg.Servers {
+		if string(srv.ID) == nodeID && srv.Suffrage == raft.Voter {
+			return true
+		}
+	}
+	return false
 }
 
 func TestClusterPlacementsForShardsCustomCount(t *testing.T) {
