@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -169,8 +170,10 @@ func newMountManager(cfg config.Config, logger *slog.Logger, off string) (*mount
 // single. It dials nothing until its first call (the lazy bootstrap,
 // rootclient: an atomic latch and a single flight, like
 // Service.EnsureLayer4Ready), and every refusal it is answered with is
-// audited through the service (eng review D9).
-func newRootHelper(cfg config.Config, svc *service.Service) *rootclient.Client {
+// audited through the service (eng review D9). onMoved hears, once, a
+// helper whose cgroup parent is no longer this agent's: the runtime
+// container started again (rootclient.ParentMovedError).
+func newRootHelper(cfg config.Config, svc *service.Service, onMoved func(error)) *rootclient.Client {
 	if cfg.PrivilegeMode != privmode.Split {
 		return nil
 	}
@@ -178,16 +181,52 @@ func newRootHelper(cfg config.Config, svc *service.Service) *rootclient.Client {
 	if svc != nil {
 		c.OnRefusal = svc.RecordRootRefusal
 	}
+	c.OnCgroupParentMoved = onMoved
 	return rootclient.New(c)
 }
 
 // rootHelperConfig is how sandboxd reaches the helper. The network calls
 // get their own bound (PR 4 review): a namespace build queues behind a
 // burst's others for seconds, and the two seconds of the connect and the
-// handshake would fail most of a burst that single mode serves.
+// handshake would fail most of a burst that single mode serves. The
+// cgroup parent is the one this agent's specs name, by the gate's own rule,
+// which the helper's must match.
 func rootHelperConfig(cfg config.Config) rootclient.Config {
 	return rootclient.Config{Socket: cfg.RootdSocket, HelperUID: rootHelperUID,
-		Timeout: rootclient.DefaultTimeout, NetworkTimeout: helperNetworkTimeout}
+		Timeout: rootclient.DefaultTimeout, NetworkTimeout: helperNetworkTimeout,
+		CgroupParent: rootpolicy.Policy{Namespace: cfg.ContainerdNamespace, CgroupParent: cfg.ContainerdCgroupParent}.SandboxParent()}
+}
+
+// selfRestart is why sandboxd stops on its own, to be started again by the
+// kubelet or systemd: today only a root helper whose cgroup parent moved,
+// which a restart of the runtime container does (the agent reads the
+// parent once, at its own start). The first reason asked for wins; Run
+// shuts down as on a signal and returns it, so the process exits with an
+// error that names it.
+type selfRestart struct {
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	err    error
+}
+
+// request stops sandboxd for err.
+func (r *selfRestart) request(err error) {
+	r.mu.Lock()
+	if r.err == nil {
+		r.err = err
+	}
+	r.mu.Unlock()
+	r.cancel()
+}
+
+// reason is the error Run returns, nil when nothing asked for a restart.
+func (r *selfRestart) reason() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err == nil {
+		return nil
+	}
+	return fmt.Errorf("sandboxd stopped to be started again: %w", r.err)
 }
 
 // helperNetworkTimeout bounds one network call to the helper whose caller
@@ -221,7 +260,10 @@ func resolveSplitBridgeSubnet(ctx context.Context, cfg config.Config, h hostNetw
 		if subnet, err = h.EnsureHostNetwork(ctx); err == nil {
 			break
 		}
-		if !errors.Is(err, rootclient.ErrUnavailable) || time.Now().Add(helperBootRetry).After(deadline) {
+		// A helper whose cgroup parent is not this agent's does not come
+		// right by waiting: this agent must start again to read it.
+		var moved *rootclient.ParentMovedError
+		if errors.As(err, &moved) || !errors.Is(err, rootclient.ErrUnavailable) || time.Now().Add(helperBootRetry).After(deadline) {
 			return "", fmt.Errorf("root helper: set the host up for sandbox networks: %w", err)
 		}
 		if !logged {

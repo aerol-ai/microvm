@@ -308,7 +308,7 @@ func New(cfg Config, opts Options, log *slog.Logger) (*Server, error) {
 	rootdpb.RegisterRootHelperServer(s.srv, helper{log: log, files: f, onRefusal: s.onRefusal, locks: locks,
 		net: s.net, fw: s.fw, eg: newEgressCalls(cfg, s.net, opts.Egress, locks), hp: newHostPortCalls(cfg, s.net, opts.HostPorts, locks),
 		cg: newSandboxCgroups(cfg, opts, locks), ct: newContainerCalls(cfg, opts), mc: mc, rc: rc, hc: s.hosts, tc: s.taps, gf: s.gf,
-		wm: newWasmMountCalls(cfg, opts, mc, s.hosts, log), mv: mv})
+		wm: newWasmMountCalls(cfg, opts, mc, s.hosts, log), mv: mv, cgroupParent: cfg.Policy.SandboxParent()})
 	if opts.Containers != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
@@ -568,6 +568,10 @@ type helper struct {
 	wm *wasmMountCalls
 	// mv serves gVisor checkpoint moves; nil without them.
 	mv *moveCalls
+	// cgroupParent is the parent the gate holds every sandbox's group to
+	// (rootpolicy Policy.SandboxParent), which the handshake tells the
+	// agent.
+	cgroupParent string
 }
 
 func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdpb.VersionResponse, error) {
@@ -614,7 +618,7 @@ func (h helper) Version(_ context.Context, req *rootdpb.VersionRequest) (*rootdp
 		served = append(served, moveFeatures...)
 	}
 	return &rootdpb.VersionResponse{HelperVersion: version.Version, Api: rootdpb.APIVersion, Features: served, Parts: h.servedParts(),
-		Hosts: h.hc.servedKinds()}, nil
+		Hosts: h.hc.servedKinds(), CgroupParent: proto.String(h.cgroupParent)}, nil
 }
 
 // servedParts are the parts of PrepareSandbox and ReleaseSandbox this

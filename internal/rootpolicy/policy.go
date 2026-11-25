@@ -304,6 +304,13 @@ func (p Policy) Clone() Policy {
 	return p
 }
 
+// SandboxParent is the parent every sandbox's cgroup must sit directly
+// under, the one the gate checks: CgroupParent, or containerd's own
+// /<Namespace> without one. The helper tells the agent in its handshake, so
+// an agent whose specs name another parent finds out before the gate
+// refuses them.
+func (p Policy) SandboxParent() string { return p.cgroupParent() }
+
 // cgroupParent is the parent every sandbox's cgroup must sit directly under.
 func (p Policy) cgroupParent() string {
 	if p.CgroupParent != "" {

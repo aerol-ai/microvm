@@ -113,6 +113,13 @@ type IPOwnerResolver interface {
 	IPOwner(ctx context.Context, ip string) (sandboxID string, err error)
 }
 
+// ErrNoIPOwnerView is an IPOwner answer from a runtime that has no view of
+// who holds addresses in its current setup (the containerd driver without
+// its native netns pool): callers decide from the store alone, as for a
+// runtime with no IPOwner at all. Any other error means the owner could
+// not be read, and nothing is cleared.
+var ErrNoIPOwnerView = errors.New("runtime: no view of address owners")
+
 // EgressHolder is implemented by container runtimes that can install the
 // fail-closed egress hold: a comment-tagged DROP of its own that quota and
 // limits code never touch (plans/egress-domain-filtering.md CEO D16). Only a

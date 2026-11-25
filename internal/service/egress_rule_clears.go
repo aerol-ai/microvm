@@ -317,6 +317,9 @@ func (s *Service) ipHolder(ctx context.Context, cr runtime.ContainerRuntime, ip,
 		return holder, true
 	}
 	owner, err := resolver.IPOwner(ctx, ip)
+	if errors.Is(err, runtime.ErrNoIPOwnerView) {
+		return holder, true
+	}
 	if err != nil {
 		return "", false
 	}

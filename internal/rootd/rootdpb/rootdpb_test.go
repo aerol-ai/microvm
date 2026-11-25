@@ -124,7 +124,7 @@ func TestWireIsAppendOnly(t *testing.T) {
 	want := map[protoreflect.FullName][]string{
 		"aerolvm.rootd.v1.VersionRequest": {"agent_version=1:string", "agent_api=2:uint32"},
 		"aerolvm.rootd.v1.VersionResponse": {"helper_version=1:string", "api=2:uint32", "features=3:repeated string", "parts=4:repeated string",
-			"hosts=5:repeated string"},
+			"hosts=5:repeated string", "cgroup_parent=6:string"},
 		"aerolvm.rootd.v1.EnsureHostRequest":  nil,
 		"aerolvm.rootd.v1.EnsureHostResponse": {"ipv6_fence_error=1:string", "fences_firecracker=2:bool", "firecracker_ipv6_fence_error=3:string"},
 		"aerolvm.rootd.v1.HelperUnavailable":  nil,

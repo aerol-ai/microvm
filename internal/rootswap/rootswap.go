@@ -210,8 +210,22 @@ func VerifyFor(keys []ed25519.PublicKey, manifest, signature []byte, goos, goarc
 		return Manifest{}, refuse(ReasonBadSignature, "no release key signed this manifest")
 	}
 	// Only signed bytes are parsed: a release wrote them.
+	m, err := parseManifest(manifest)
+	if err != nil {
+		return Manifest{}, err
+	}
+	if m.OS != goos || m.Arch != goarch {
+		return Manifest{}, refuse(ReasonPlatform, "the helper is built for %s/%s; this machine is %s/%s", m.OS, m.Arch, goos, goarch)
+	}
+	return m, nil
+}
+
+// parseManifest reads one manifest, strictly: no field it does not know,
+// nothing after it, and every rule of check. The bytes are a release's
+// (Verify) or root's own (ReadFloor).
+func parseManifest(raw []byte) (Manifest, error) {
 	var m Manifest
-	dec := json.NewDecoder(bytes.NewReader(manifest))
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&m); err != nil {
 		return Manifest{}, refuse(ReasonBadManifest, "%v", err)
@@ -222,14 +236,12 @@ func VerifyFor(keys []ed25519.PublicKey, manifest, signature []byte, goos, goarc
 	if err := m.check(); err != nil {
 		return Manifest{}, err
 	}
-	if m.OS != goos || m.Arch != goarch {
-		return Manifest{}, refuse(ReasonPlatform, "the helper is built for %s/%s; this machine is %s/%s", m.OS, m.Arch, goos, goarch)
-	}
 	return m, nil
 }
 
 // CheckNewer refuses next when it is older than running, the helper that
-// runs now (nil: none): an older version, or a lower API level, which
+// runs now, or ran last before a restart (ReadFloor; nil: none ran): an
+// older version, or a lower API level, which
 // would take calls away from an agent that uses them. The same version
 // passes, so a release cut again under its tag can still be swapped in.
 //

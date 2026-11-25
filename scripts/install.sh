@@ -236,6 +236,10 @@ SPLIT_PROCID_DIR="/run/aerolvm-procid"
 # into every VM's jail, so it sits in a folder only root writes. Single
 # keeps it in sandboxd's data folder, which sandboxd's user owns in split.
 SPLIT_FIRECRACKER_KERNEL_PATH="/usr/local/lib/aerolvm-firecracker/vmlinux"
+# Set by install_firecracker on a switch back from split: the arch and pins
+# finish_firecracker_after_switch_back installs single's guest kernel with,
+# once leave_split_mode has given /var/lib/sandboxd back to root.
+FIRECRACKER_DATA_AFTER_SWITCH_BACK=""
 # The privilege mode this node ran in before this run, read from sandboxd.env
 # (setup_privilege_mode): a change is a switch, which moves files' owners.
 PREVIOUS_PRIVILEGE_MODE=""
@@ -3973,18 +3977,48 @@ install_firecracker() {
 	trap "rm -rf '$tmp_dir'" RETURN
 
 	install_firecracker_release "$arch" "$tmp_dir"
-	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
-	install -d -m 0755 "$JAILER_CHROOT_BASE"
-	# The templates folder is sandboxd's, inside /var/lib/sandboxd. In split
-	# sandboxd's user owns that folder and could leave a link there for root
-	# to follow, so root makes nothing in it: sandboxd makes the templates
-	# folder itself when it first needs one.
-	if [[ "${PRIVILEGE_MODE:-single}" != "split" ]]; then
-		install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR"
+	# Single's guest kernel and templates folder are in /var/lib/sandboxd.
+	# On a switch back from split, sandboxd's user still owns that folder
+	# and may have left links in it until leave_split_mode gives it back to
+	# root, so root writes nothing there before then: the main flow runs
+	# finish_firecracker_after_switch_back after leave_split_mode.
+	if [[ "${PRIVILEGE_MODE:-single}" != "split" ]] && agent_may_own_folders; then
+		echo "The guest kernel and the templates folder go in /var/lib/sandboxd once it is root's again, after the switch back"
+		FIRECRACKER_DATA_AFTER_SWITCH_BACK="$arch $kernel_sha $config_sha"
+	else
+		install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
 	fi
+	install -d -m 0755 "$JAILER_CHROOT_BASE"
+	[[ -n "${FIRECRACKER_DATA_AFTER_SWITCH_BACK:-}" ]] || make_firecracker_templates_dir
 	if ! getent passwd "$JAILER_USER" >/dev/null 2>&1; then
 		useradd --system --no-create-home --shell /usr/sbin/nologin --user-group "$JAILER_USER"
 	fi
+}
+
+# make_firecracker_templates_dir makes single's templates folder. It is
+# sandboxd's, inside /var/lib/sandboxd. In split sandboxd's user owns that
+# folder and could leave a link there for root to follow, so root makes
+# nothing in it: sandboxd makes the templates folder itself when it first
+# needs one.
+make_firecracker_templates_dir() {
+	if [[ "${PRIVILEGE_MODE:-single}" != "split" ]]; then
+		install -d -m 0755 "$FIRECRACKER_TEMPLATES_DIR"
+	fi
+}
+
+# finish_firecracker_after_switch_back runs the install_firecracker_data a
+# switch back left for later, now that leave_split_mode has given
+# sandboxd's folders back to root.
+finish_firecracker_after_switch_back() {
+	[[ -n "${FIRECRACKER_DATA_AFTER_SWITCH_BACK:-}" ]] || return 0
+	local tmp_dir arch kernel_sha config_sha
+	read -r arch kernel_sha config_sha <<<"$FIRECRACKER_DATA_AFTER_SWITCH_BACK"
+	tmp_dir="$(mktemp -d)"
+	# shellcheck disable=SC2064  # capture tmp_dir at trap-install time, not at return
+	trap "rm -rf '$tmp_dir'" RETURN
+	install_firecracker_kernel "$arch" "$kernel_sha" "$config_sha" "$tmp_dir"
+	FIRECRACKER_DATA_AFTER_SWITCH_BACK=""
+	make_firecracker_templates_dir
 }
 
 # firecracker_environment prints the sandboxd.env lines for
@@ -5520,6 +5554,7 @@ write_route_dns_resolver
 write_caddyfile
 write_systemd_unit
 leave_split_mode
+finish_firecracker_after_switch_back
 write_privilege_mode_units
 write_egress_gateway_units
 write_healthcheck_script
