@@ -3,6 +3,7 @@ package prometheus_test
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -351,14 +352,121 @@ func TestRootHelperRefusalAlertRule(t *testing.T) {
 // TestRootHelperRefusalAlertFires runs promtool's unit tests for the alert
 // (testdata/sandboxd-rootd-refusals.test.yaml): a node's first refusal, a
 // later one and one after a sandboxd restart each fire, and a flat counter
-// does not. Like the chart's promtool checks it needs promtool on PATH (or
-// PROMTOOL), and skips without it unless AEROLVM_CHART_TOOLS=require.
+// does not. It runs them on the setup file and again on the chart's copy,
+// whose group has no 30s interval of its own. It needs promtool on PATH (or
+// PROMTOOL), and skips without it unless AEROLVM_CHART_TOOLS=require; the
+// go-tests CI job installs promtool and requires it.
 func TestRootHelperRefusalAlertFires(t *testing.T) {
 	root := repoRoot(t)
 	promtool := chartTool(t, "PROMTOOL", "promtool")
-	if _, err := runTool(t, root, promtool, "test", "rules", filepath.Join(root, "setup", "prometheus", "testdata", "sandboxd-rootd-refusals.test.yaml")); err != nil {
+	tests := filepath.Join(root, "setup", "prometheus", "testdata", "sandboxd-rootd-refusals.test.yaml")
+	t.Run("setup", func(t *testing.T) {
+		if _, err := runTool(t, root, promtool, "test", "rules", tests); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("chart", func(t *testing.T) {
+		raw, err := os.ReadFile(tests)
+		if err != nil {
+			t.Fatal(err)
+		}
+		const setupRules = "  - ../sandboxd-alerts.yml\n"
+		if n := strings.Count(string(raw), setupRules); n != 1 {
+			t.Fatalf("%s names ../sandboxd-alerts.yml %d times in rule_files, want 1", tests, n)
+		}
+		chartTests := filepath.Join(t.TempDir(), "chart-rootd-refusals.test.yaml")
+		swapped := strings.Replace(string(raw), setupRules, "  - "+chartRulesPath(root)+"\n", 1)
+		if err := os.WriteFile(chartTests, []byte(swapped), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runTool(t, root, promtool, "test", "rules", chartTests); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+// TestChartCarriesSetupAlertsAsIs checks the alerts the Helm chart carries
+// from setup/prometheus/sandboxd-alerts.yml (chartSetupAlerts). Each is in
+// both files once, and the chart's copy has the same expression (spacing
+// aside), for, labels and annotations, runbook link included. Any other
+// name in both files fails too: the chart would page under a setup alert's
+// name with another rule. Each copy has a pointer entry in the chart's
+// runbook, setup/runbooks/kubernetes.md, which lists every alert the chart
+// ships. It needs no tools, so it runs in go-tests whenever a rule changes.
+func TestChartCarriesSetupAlertsAsIs(t *testing.T) {
+	root := repoRoot(t)
+	setup := alertsByName(t, filepath.Join(root, "setup", "prometheus", "sandboxd-alerts.yml"))
+	chart := alertsByName(t, chartRulesPath(root))
+	runbook, err := os.ReadFile(filepath.Join(root, "setup", "runbooks", "kubernetes.md"))
+	if err != nil {
 		t.Fatal(err)
 	}
+	headings := map[string]bool{}
+	for _, line := range strings.Split(string(runbook), "\n") {
+		if name, ok := strings.CutPrefix(line, "## "); ok {
+			headings[strings.TrimSpace(name)] = true
+		}
+	}
+
+	names := make([]string, 0, len(chartSetupAlerts))
+	for name := range chartSetupAlerts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, ok := setup[name]; !ok {
+			t.Errorf("chartSetupAlerts names %s, which setup/prometheus/sandboxd-alerts.yml does not define", name)
+		}
+		if _, ok := chart[name]; !ok {
+			t.Errorf("the chart's rules (charts/aerolvm/monitoring/rules.yaml) lack %s from setup/prometheus/sandboxd-alerts.yml", name)
+		}
+		if !headings[name] {
+			t.Errorf("setup/runbooks/kubernetes.md has no '## %s' entry for the chart's copy", name)
+		}
+	}
+	for name, c := range chart {
+		s, ok := setup[name]
+		if !ok {
+			continue
+		}
+		if !chartSetupAlerts[name] {
+			t.Errorf("%s is in the chart and in setup/prometheus: add it to chartSetupAlerts or rename one", name)
+		}
+		c.Expr, s.Expr = strings.Join(strings.Fields(c.Expr), " "), strings.Join(strings.Fields(s.Expr), " ")
+		if !reflect.DeepEqual(c, s) {
+			t.Errorf("%s: the chart's copy differs from setup/prometheus/sandboxd-alerts.yml\nchart: %+v\nsetup: %+v", name, c, s)
+		}
+	}
+}
+
+// alertsByName reads a rule file's alerts by name, failing on a name
+// defined twice.
+func alertsByName(t *testing.T, path string) map[string]k8sRule {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file k8sRuleFile
+	if err := yaml.Unmarshal(raw, &file); err != nil {
+		t.Fatalf("%s does not parse: %v", path, err)
+	}
+	out := map[string]k8sRule{}
+	for _, g := range file.Groups {
+		for _, r := range g.Rules {
+			if r.Alert == "" {
+				continue
+			}
+			if _, dup := out[r.Alert]; dup {
+				t.Errorf("%s defines %s twice", path, r.Alert)
+			}
+			out[r.Alert] = r
+		}
+	}
+	if len(out) == 0 {
+		t.Fatalf("%s has no alerts", path)
+	}
+	return out
 }
 
 // githubAnchor is the fragment GitHub gives a markdown heading: lower

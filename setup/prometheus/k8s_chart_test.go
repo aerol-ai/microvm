@@ -62,6 +62,14 @@ var k8sAlerts = map[string]string{
 	"AerolVMSandboxEgressToClusterRanges": "warning",
 }
 
+// chartSetupAlerts are the alerts the chart carries as copies of
+// setup/prometheus/sandboxd-alerts.yml: same name, rule and runbook link,
+// so TestKubernetesChartRules leaves their runbook to the setup file and
+// TestChartCarriesSetupAlertsAsIs checks each copy against its source.
+var chartSetupAlerts = map[string]bool{
+	"SandboxdRootHelperRefusal": true,
+}
+
 // operatorMetrics are the operator's (P2) series, registered in its own Go
 // module (operator/); TestKubernetesChartOperatorMetricsRegistered checks
 // each one is, so a renamed metric cannot leave an alert that never fires.
@@ -238,6 +246,11 @@ func TestKubernetesChartRules(t *testing.T) {
 					t.Errorf("alert %s is defined twice", r.Alert)
 				}
 				seen[r.Alert] = true
+				if chartSetupAlerts[r.Alert] {
+					// A copy of the setup rule, runbook link included:
+					// TestChartCarriesSetupAlertsAsIs checks it.
+					break
+				}
 				if sev, ok := k8sAlerts[r.Alert]; !ok {
 					t.Errorf("unexpected alert %s: add it to k8sAlerts and the runbook", r.Alert)
 				} else if r.Labels["severity"] != sev {

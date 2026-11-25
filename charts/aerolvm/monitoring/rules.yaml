@@ -15,8 +15,10 @@
 #   aerolvm_zone       the pod's topology.kubernetes.io/zone, when it has one
 #   namespace, pod     from the Prometheus Operator
 # sandboxd's own labels are key, key2 (expvar maps) and owner, incarnation
-# (usage counters). Each alert's runbook is the heading of the same name in
-# setup/runbooks/kubernetes.md.
+# (usage counters). Each AerolVM* alert's runbook is the heading of the same
+# name in setup/runbooks/kubernetes.md. The Sandboxd* alerts near the end
+# are copies of setup/prometheus/sandboxd-alerts.yml and keep that file's
+# runbook links.
 groups:
   # Pods. Three of these read pod status from kube-state-metrics, joined to
   # AerolVM's own scrape targets so they only see AerolVM pods.
@@ -411,6 +413,28 @@ groups:
           summary: "Sandboxes in {{ $labels.aerolvm_cluster }} try to reach {{ $labels.key }} addresses more than usual"
           description: "Sandbox connections to {{ $labels.key }} addresses were refused at more than three times the usual rate. Each was blocked. A sandbox scanning the cluster's network looks like this, so find which sandboxes they were."
           runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/kubernetes.md#aerolvmsandboxegresstoclusterranges"
+
+  # The root helper (privilege mode split, plans/security-gaps-m1-m4.md M1).
+  # These alerts are copies of setup/prometheus/sandboxd-alerts.yml, name
+  # and runbook link included, not Kubernetes versions: the docs and the
+  # runbook name one alert whichever file it came from.
+  # TestChartCarriesSetupAlertsAsIs fails if a copy drifts. On Kubernetes,
+  # instance is the worker pod's address.
+  - name: aerolvm.kubernetes.root-helper
+    rules:
+      - alert: SandboxdRootHelperRefusal
+        expr: |
+          sum by (instance, key, key2) (increase(aerolvm_rootd_refusals_total[5m])) > 0
+          or
+          count by (instance, key, key2) (aerolvm_rootd_refusals_total unless aerolvm_rootd_refusals_total offset 5m)
+        for: 0m
+        labels:
+          severity: critical
+          component: root-helper
+        annotations:
+          summary: "the root helper refused a call from sandboxd"
+          description: "{{ $labels.instance }}: the root helper refused {{ $labels.key }} ({{ $labels.key2 }}) in the last 5 minutes. sandboxd only sends what its own code built, so this is drift between sandboxd and the helper, or a compromised sandboxd. The create failed with a 500. Treat it as a security incident until drift is ruled out."
+          runbook_url: "https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal"
 
   # Per-team usage sums (C20), as in the "Usage per team" docs. Each adds
   # one counter across every worker and every incarnation, so a worker
