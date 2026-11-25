@@ -239,6 +239,13 @@ SPLIT_FIRECRACKER_KERNEL_PATH="/usr/local/lib/aerolvm-firecracker/vmlinux"
 # The privilege mode this node ran in before this run, read from sandboxd.env
 # (setup_privilege_mode): a change is a switch, which moves files' owners.
 PREVIOUS_PRIVILEGE_MODE=""
+# Says a switch back to privilege mode single has started and not finished.
+# setup_privilege_mode writes it before sandboxd.env says single, and
+# leave_split_mode removes it once the cleanup is done. A run stopped in
+# between leaves it, so the next run still sees a node coming from split
+# (running_privilege_mode) and finishes the switch. Root's folder, never
+# one of sandboxd's user's.
+PRIVILEGE_SWITCH_BACK_MARKER="/etc/sandboxd/privilege-mode-switch-back"
 
 # agent_may_own_folders reports whether sandboxd's user may own its folders
 # and have written in them: the node ran in privilege mode split before this
@@ -1347,6 +1354,44 @@ check_privilege_mode() {
 	FIRECRACKER_KERNEL_PATH="$SPLIT_FIRECRACKER_KERNEL_PATH"
 }
 
+# running_privilege_mode prints the privilege mode this node runs in now:
+# SB_PRIVILEGE_MODE in sandboxd.env (none is single), or split while a
+# switch back to single has not finished (PRIVILEGE_SWITCH_BACK_MARKER).
+# sandboxd.env says single by then, but sandboxd's user may still own its
+# folders, and the cleanup and the warning are still owed.
+running_privilege_mode() {
+	if [[ -e "$PRIVILEGE_SWITCH_BACK_MARKER" ]]; then
+		echo split
+		return 0
+	fi
+	local mode
+	mode="$(env_file_value "$SANDBOXD_ENV_FILE" SB_PRIVILEGE_MODE)"
+	echo "${mode:-single}"
+}
+
+# check_privilege_mode_change refuses a run that would leave a node's
+# privilege mode half changed. --config-only never switches a mode: it
+# restarts and moves nothing, and it reads the mode it renders as the
+# mode the node runs (agent_may_own_folders), so rendering single on a
+# split node would have root write in folders sandboxd's user owns, with no
+# cleanup and no warning. And while a switch back to single is unfinished,
+# only a full --privilege-mode single run may go on: it finishes it.
+check_privilege_mode_change() {
+	[[ "$CLI_ONLY" == "true" ]] && return 0
+	if [[ -e "$PRIVILEGE_SWITCH_BACK_MARKER" ]] &&
+		[[ "$CONFIG_ONLY" == "true" || "$LOCAL_MODE" == "true" || "$PRIVILEGE_MODE" != "single" ]]; then
+		echo "A switch of this node back to privilege mode single did not finish. Run install.sh --privilege-mode single, with your other flags and without --config-only, to finish it first." >&2
+		exit 1
+	fi
+	[[ "$CONFIG_ONLY" == "true" ]] || return 0
+	local running
+	running="$(running_privilege_mode)"
+	if [[ "$running" != "$PRIVILEGE_MODE" ]]; then
+		echo "--config-only never changes a node's privilege mode: this node runs $running, and this run asks for $PRIVILEGE_MODE. Run install.sh --privilege-mode $PRIVILEGE_MODE without --config-only: a full run stops sandboxd, gives its files to the right owner and starts or stops the root helper." >&2
+		exit 1
+	fi
+}
+
 # secret_provider_lines prints the key-store settings write_environment
 # appends for --key-custody wrapped: from --secret-provider-env when given,
 # else the lines read back from the existing sandboxd.env.
@@ -1882,6 +1927,7 @@ if [[ "$BUILDKIT_ROOTLESS" == "true" && ("$CLI_ONLY" == "true" || "$LOCAL_MODE" 
 	exit 1
 fi
 check_privilege_mode
+check_privilege_mode_change
 # Release files from the mirror are checked against a checksums.txt from the
 # same mirror, so only TLS keeps a network attacker from swapping both.
 case "$DOWNLOAD_MIRROR" in
@@ -4500,8 +4546,14 @@ privilege_split_dropin() {
 setup_privilege_mode() {
 	SPLIT_CONFIG_BEFORE="$(split_fingerprint)"
 	SPLIT_SHARED_ENV_BEFORE="$(split_shared_env_fingerprint)"
-	PREVIOUS_PRIVILEGE_MODE="$(env_file_value "$SANDBOXD_ENV_FILE" SB_PRIVILEGE_MODE)"
-	PREVIOUS_PRIVILEGE_MODE="${PREVIOUS_PRIVILEGE_MODE:-single}"
+	PREVIOUS_PRIVILEGE_MODE="$(running_privilege_mode)"
+	if [[ "$PRIVILEGE_MODE" == "single" && "$PREVIOUS_PRIVILEGE_MODE" == "split" ]]; then
+		if [[ -e "$PRIVILEGE_SWITCH_BACK_MARKER" ]]; then
+			echo "A switch of this node back to privilege mode single did not finish; finishing it now"
+		fi
+		# Before write_environment says single: see PRIVILEGE_SWITCH_BACK_MARKER.
+		printf '%s\n' "install.sh started to switch this node back to privilege mode single and has not finished. Run install.sh --privilege-mode single to finish it." >"$PRIVILEGE_SWITCH_BACK_MARKER"
+	fi
 	[[ "$PRIVILEGE_MODE" == "split" ]] || return 0
 	if ! command -v setfacl >/dev/null 2>&1; then
 		if [[ "${APT_UPDATED:-false}" != "true" ]]; then
@@ -4910,6 +4962,8 @@ leave_split_mode() {
 		done
 	fi
 	systemctl disable --now aerolvm-rootd.service 2>/dev/null || true
+	# Done: from here sandboxd.env alone says this node runs single.
+	rm -f "$PRIVILEGE_SWITCH_BACK_MARKER"
 }
 
 # restart_split_services restarts what split mode's files changed: the
