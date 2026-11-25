@@ -300,7 +300,12 @@ func writeHostFile(t *testing.T, path string, body []byte, mode os.FileMode) {
 func TestInstallShInstallsFirecracker(t *testing.T) {
 	src := installShSource(t)
 	funcs := installShPins(t, src) + installShFunctions(t, src, append([]string{"firecracker_binary_version", "firecracker_verify",
-		"install_firecracker_release", "install_firecracker_kernel", "install_firecracker"}, installShFetchFunctions...)...)
+		"install_firecracker_release", "install_firecracker_kernel", "install_firecracker", "make_firecracker_templates_dir"},
+		installShFetchFunctions...)...)
+	// agent_may_own_folders is followed by the download pins, which would
+	// put the real hashes back over the fixtures': only its own lines.
+	mayOwn := installShFunctions(t, src, "agent_may_own_folders")
+	funcs += mayOwn[:strings.Index(mayOwn, "\n}\n")+3]
 	version := installShVar(t, src, "FIRECRACKER_VERSION")
 	kciVersion := installShVar(t, src, "FIRECRACKER_KERNEL_CI_VERSION")
 	kVersion := installShVar(t, src, "FIRECRACKER_KERNEL_VERSION")
