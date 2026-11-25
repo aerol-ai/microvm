@@ -1,0 +1,24 @@
+exit 0
+--- stdout
+runtimes:
+    - available: true
+      features:
+        confidential: false
+        moves: memory
+        pause: false
+        snapshots: false
+        warm_pool: parked
+      isolation: wasm
+      limits:
+        max_checkpoint_memory_mb: 1024
+      name: wasm
+    - available: true
+      features:
+        confidential: false
+        moves: none
+        pause: false
+        snapshots: true
+        warm_pool: parked
+      isolation: container
+      name: docker
+--- stderr

@@ -18,6 +18,7 @@ from microvm import (
     AsyncFileWatchHandle,
     AsyncMicroVM,
     AsyncSandbox,
+    AsyncRuntimes,
     AsyncSessionAttachHandle,
     AsyncTokens,
     CodeRunHandle,
@@ -28,6 +29,7 @@ from microvm import (
     MicroVMHTTPError,
     MicroVMNotFoundError,
     MicroVMTimeoutError,
+    Runtimes,
     Tokens,
 )
 from microvm import aio as aio_module
@@ -84,6 +86,7 @@ class AsyncParityTests(unittest.TestCase):
         (MicroVM, AsyncMicroVM),
         (client_module.Sandbox, AsyncSandbox),
         (Tokens, AsyncTokens),
+        (Runtimes, AsyncRuntimes),
         (client_module.ExecStreamHandle, AsyncExecStreamHandle),
         (client_module.SessionAttachHandle, AsyncSessionAttachHandle),
         (FileWatchHandle, AsyncFileWatchHandle),
@@ -120,6 +123,7 @@ class AsyncParityTests(unittest.TestCase):
         for name in ("get_or_create", "destroy_all", "upload_file", "watch_files"):
             self.assertEqual(getattr(AsyncMicroVM, name).__doc__, getattr(MicroVM, name).__doc__)
         self.assertEqual(AsyncTokens.create.__doc__, Tokens.create.__doc__)
+        self.assertEqual(AsyncRuntimes.list.__doc__, Runtimes.list.__doc__)
 
     def test_without_httpx_the_error_names_the_extra(self):
         with unittest.mock.patch.object(aio_module, "httpx", None):
@@ -525,6 +529,25 @@ class AsyncClientTests(unittest.TestCase):
 
         listed = asyncio.run(go())
         self.assertEqual(listed["tokens"][0]["id"], "tok_1")
+
+    def test_runtimes_list(self):
+        answer = {"runtimes": [{"name": "firecracker", "isolation": "hardware-vm", "backend": "kvm",
+                                "features": {"snapshots": True, "pause": True, "moves": "memory",
+                                             "warm_pool": "snapshot", "confidential": False},
+                                "available": True}]}
+        url, hits = _scripted_server(self, [(200, answer, None)])
+
+        async def go():
+            async with AsyncMicroVM(url, "pat") as client:
+                return await client.runtimes.list()
+
+        listed = asyncio.run(go())
+        self.assertEqual([(m, p) for m, p, _ in hits], [("GET", "/v1/runtimes")])
+        self.assertEqual(listed, [{
+            "name": "firecracker", "isolation": "hardware-vm", "backend": "kvm",
+            "features": {"snapshots": True, "pause": True, "moves": "memory", "warmPool": "snapshot", "confidential": False},
+            "available": True,
+        }])
 
     def test_a_passed_in_clients_own_timeout_is_a_microvm_timeout(self):
         # A caller's httpx client keeps httpx's own limit (5 s by default);

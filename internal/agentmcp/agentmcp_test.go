@@ -147,12 +147,12 @@ func TestToolsListGolden(t *testing.T) {
 }
 
 func TestModesShapeTheToolList(t *testing.T) {
-	core := []string{"exec", "expose_port", "list_files", "read_file", "sandbox_create", "sandbox_destroy", "sandbox_list", "write_file"}
+	core := []string{"exec", "expose_port", "list_files", "list_runtimes", "read_file", "sandbox_create", "sandbox_destroy", "sandbox_list", "write_file"}
 	if got := newEnv(t, Options{}).toolNames(); strings.Join(got, ",") != strings.Join(core, ",") {
 		t.Fatalf("default tools = %v", got)
 	}
 	pinned := newEnv(t, Options{Sandbox: "box", Toolsets: []string{"all"}}).toolNames()
-	for _, fleet := range []string{"sandbox_create", "sandbox_list", "sandbox_destroy"} {
+	for _, fleet := range []string{"sandbox_create", "sandbox_list", "sandbox_destroy", "list_runtimes"} {
 		if contains(pinned, fleet) {
 			t.Fatalf("pinned mode registered %s", fleet)
 		}
@@ -161,7 +161,7 @@ func TestModesShapeTheToolList(t *testing.T) {
 		t.Fatalf("pinned all = %v", pinned)
 	}
 	readOnly := newEnv(t, Options{Toolsets: []string{"all"}, ReadOnly: true}).toolNames()
-	want := []string{"grep_files", "list_files", "process_logs", "read_file", "sandbox_list", "search_files"}
+	want := []string{"grep_files", "list_files", "list_runtimes", "process_logs", "read_file", "sandbox_list", "search_files"}
 	if strings.Join(readOnly, ",") != strings.Join(want, ",") {
 		t.Fatalf("read-only = %v", readOnly)
 	}
@@ -223,6 +223,52 @@ func TestCreateListDestroy(t *testing.T) {
 	}
 	if r := e.call("sandbox_destroy", map[string]any{"sandbox": "agent"}); r.isError || r.data["already_gone"] != true {
 		t.Fatalf("destroy again = %+v", r)
+	}
+}
+
+// TestListRuntimes: list_runtimes shows only names sandbox_create takes, in
+// the server's order, with availability and features, and never a node
+// count, even when the credential is a fleet admin's.
+func TestListRuntimes(t *testing.T) {
+	e := newEnv(t, Options{})
+	e.fake.Observe(func(s *agenttoolstest.Server) {
+		s.RuntimeOffers = map[string]int{models.RuntimeDocker: 3, models.RuntimeFirecracker: 1, models.RuntimeIsolate: 2}
+		s.RuntimeNodes = true
+	})
+	r := e.call("list_runtimes", nil)
+	if r.isError {
+		t.Fatalf("list_runtimes = %+v", r)
+	}
+	rows := r.data["runtimes"].([]any)
+	var names []string
+	available := map[string]bool{}
+	for _, raw := range rows {
+		row := raw.(map[string]any)
+		name := row["name"].(string)
+		names = append(names, name)
+		available[name] = row["available"].(bool)
+		for k := range row {
+			if !contains([]string{"name", "isolation", "backend", "available", "features", "limits"}, k) {
+				t.Fatalf("list_runtimes row %s has extra field %q", name, k)
+			}
+		}
+		if row["features"] == nil || row["isolation"] == "" {
+			t.Fatalf("row %s lacks isolation or features: %v", name, row)
+		}
+	}
+	if want := strings.Join(MCPRuntimes, ","); strings.Join(names, ",") != want {
+		t.Fatalf("names = %v, want sandbox_create's enum %s", names, want)
+	}
+	if !available[models.RuntimeDocker] || !available[models.RuntimeFirecracker] || available[models.RuntimeGvisor] || available[models.RuntimeWasm] {
+		t.Fatalf("available = %v", available)
+	}
+	if strings.Contains(r.text, "nodes") {
+		t.Fatalf("text names a node count: %s", r.text)
+	}
+
+	e.fake.Observe(func(s *agenttoolstest.Server) { s.FailRuntimes = true })
+	if r := e.call("list_runtimes", nil); !r.isError || !strings.Contains(r.text, "[code:") {
+		t.Fatalf("a failed list must be a tool error with a code: %+v", r)
 	}
 }
 

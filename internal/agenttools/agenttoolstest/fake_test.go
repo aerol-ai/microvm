@@ -602,6 +602,42 @@ type wsMsg struct {
 	text string
 }
 
+// TestFakeRuntimes: GET /v1/runtimes answers from the real feature table,
+// docker only by default, node counts only when playing a fleet admin.
+func TestFakeRuntimes(t *testing.T) {
+	s := New(t)
+	list := func() models.ListRuntimesResponse {
+		t.Helper()
+		code, body := do(t, s, http.MethodGet, "/v1/runtimes", nil, Token)
+		if code != http.StatusOK {
+			t.Fatalf("runtimes = %d %s", code, body)
+		}
+		var out models.ListRuntimesResponse
+		if err := json.Unmarshal([]byte(body), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	for _, rt := range list().Runtimes {
+		if rt.Available != (rt.Name == models.RuntimeDocker) || rt.Nodes != nil {
+			t.Fatalf("default row %+v: want only docker offered and no node count", rt)
+		}
+	}
+	s.Observe(func(s *Server) {
+		s.RuntimeOffers = map[string]int{models.RuntimeGvisor: 2}
+		s.RuntimeNodes = true
+	})
+	for _, rt := range list().Runtimes {
+		if rt.Nodes == nil || rt.Available != (rt.Name == models.RuntimeGvisor) {
+			t.Fatalf("admin row %+v", rt)
+		}
+	}
+	s.Observe(func(s *Server) { s.FailRuntimes = true })
+	if code, _ := do(t, s, http.MethodGet, "/v1/runtimes", nil, Token); code != http.StatusInternalServerError {
+		t.Fatalf("FailRuntimes status = %d", code)
+	}
+}
+
 func stream(t *testing.T, s *Server, id, command string, bins []wsMsg, texts []string) {
 	t.Helper()
 	wsURL := "ws" + strings.TrimPrefix(s.URL, "http") + "/v1/sandboxes/" + id + "/toolbox/process/exec/stream"

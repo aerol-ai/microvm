@@ -35,10 +35,15 @@ type fakeKinds struct {
 	tokens    []map[string]any
 	members   []map[string]any
 	capacity  map[string]any
-	pageCap   int            // the most snapshots or sandboxes one page holds
-	status    map[string]int // "METHOD path" -> answer with this status
-	sameToken bool           // every sandbox page says "more: same"
-	queries   []string
+	// runtimes is how many nodes offer each runtime; GET /v1/runtimes
+	// answers from it through models.ListRuntimes, as sandboxd does.
+	// runtimeNodes plays a fleet admin, who also sees the counts.
+	runtimes     map[string]int
+	runtimeNodes bool
+	pageCap      int            // the most snapshots or sandboxes one page holds
+	status       map[string]int // "METHOD path" -> answer with this status
+	sameToken    bool           // every sandbox page says "more: same"
+	queries      []string
 }
 
 func newKindsHarness(t *testing.T) (*harness, *fakeKinds) {
@@ -137,6 +142,8 @@ func (f *fakeKinds) serve(w http.ResponseWriter, r *http.Request) bool {
 		writeFakeJSON(w, http.StatusOK, map[string]any{"members": f.members})
 	case path == "/v1/capacity" && r.Method == http.MethodGet:
 		writeFakeJSON(w, http.StatusOK, f.capacity)
+	case path == "/v1/runtimes" && r.Method == http.MethodGet:
+		writeFakeJSON(w, http.StatusOK, models.ListRuntimes(f.runtimes, f.runtimeNodes))
 	default:
 		return false
 	}
@@ -461,6 +468,74 @@ func TestTokenKind(t *testing.T) {
 	f.mu.Unlock()
 	if code := h.run("describe", "token", "x"); code != exitError {
 		t.Fatalf("refused describe = %d", code)
+	}
+}
+
+// TestRuntimeKind: get runtimes prints the server's rows in its order, a
+// node count only when the server sent one (fleet admins), and refuses
+// describe and delete because the kind is read-only.
+func TestRuntimeKind(t *testing.T) {
+	h, f := newKindsHarness(t)
+	f.mu.Lock()
+	f.runtimes = map[string]int{models.RuntimeDocker: 3, models.RuntimeFirecracker: 1, models.RuntimeWasm: 2}
+	f.mu.Unlock()
+	for _, tc := range []struct {
+		golden string
+		code   int
+		args   []string
+	}{
+		{"get-runtimes", exitOK, []string{"get", "runtimes"}},
+		{"get-runtimes-wide-tenant", exitOK, []string{"get", "runtimes", "-o", "wide"}},
+		{"get-runtime-name", exitOK, []string{"get", "runtime", "-o", "name"}},
+		{"get-runtime-one-json", exitOK, []string{"get", "runtimes", "firecracker", "-o", "json"}},
+		{"get-runtimes-two-yaml", exitOK, []string{"get", "runtimes", "wasm", "docker", "-o", "yaml"}},
+		{"get-runtime-missing", exitError, []string{"get", "runtimes", "nope"}},
+		{"get-runtimes-selector", exitUsage, []string{"get", "runtimes", "-l", "a=b"}},
+		{"describe-runtime", exitUsage, []string{"describe", "runtime", "docker"}},
+		{"delete-runtime", exitUsage, []string{"delete", "runtime", "docker"}},
+	} {
+		kindsGolden(t, h, f, tc.code, tc.golden, tc.args...)
+	}
+	f.mu.Lock()
+	f.runtimeNodes = true
+	f.mu.Unlock()
+	kindsGolden(t, h, f, exitOK, "get-runtimes-wide-admin", "get", "runtimes", "-o", "wide")
+
+	f.mu.Lock()
+	f.status["GET /v1/runtimes"] = http.StatusForbidden
+	f.mu.Unlock()
+	if code := h.run("get", "runtimes"); code != exitError {
+		t.Fatalf("refused list = %d", code)
+	}
+}
+
+// TestRuntimeKindEdges covers what a real server does not send today: an
+// empty list and a row that does not decode.
+func TestRuntimeKindEdges(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		code       int
+		stderr     string
+	}{
+		{"empty", `{"runtimes":[]}`, exitOK, "no runtimes"},
+		{"null", `{"runtimes":null}`, exitOK, "no runtimes"},
+		{"unreadable", `{"runtimes":[{"name":7}]}`, exitError, "unreadable runtime"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+			h.env["SB_API_URL"] = srv.URL
+			if code := h.run("get", "runtimes"); code != tc.code || !strings.Contains(h.stderr.String(), tc.stderr) {
+				t.Fatalf("get runtimes = %d %q, want %d and %q", code, h.stderr.String(), tc.code, tc.stderr)
+			}
+		})
+	}
+	if got := checkpointLimit(&models.RuntimeLimits{}); got != "-" {
+		t.Fatalf("zero limit = %q", got)
 	}
 }
 

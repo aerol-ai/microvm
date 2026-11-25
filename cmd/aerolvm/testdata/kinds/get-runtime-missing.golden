@@ -1,0 +1,5 @@
+exit 1
+--- stdout
+--- stderr
+aerolvm: runtime "nope" not found
+hint: run `aerolvm get runtimes` to list them

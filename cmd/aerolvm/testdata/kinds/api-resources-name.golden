@@ -2,6 +2,7 @@ exit 0
 --- stdout
 jointokens
 nodes
+runtimes
 sandboxes
 snapshots
 tokens

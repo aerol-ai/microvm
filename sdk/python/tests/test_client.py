@@ -3087,6 +3087,74 @@ class IdentityTests(unittest.TestCase):
         for request in self.server.requests:
             self.assertEqual(request["team"], ["ops"], request)
 
+    def test_runtimes_list_maps_every_field(self):
+        self.server.routes[("GET", "/v1/runtimes")] = (
+            200,
+            {
+                "runtimes": [
+                    {
+                        "name": "firecracker",
+                        "isolation": "hardware-vm",
+                        "backend": "kvm",
+                        "features": {"snapshots": True, "pause": True, "moves": "memory", "warm_pool": "snapshot", "confidential": False},
+                        "available": True,
+                        "nodes": 3,
+                    },
+                    {
+                        "name": "wasm",
+                        "isolation": "wasm",
+                        "features": {"snapshots": False, "pause": False, "moves": "memory", "warm_pool": "parked", "confidential": False},
+                        "limits": {"max_checkpoint_memory_mb": 1024},
+                        "available": False,
+                        "nodes": 0,
+                        "future_field": "ignored",
+                    },
+                    # A tenant's view: no backend, limits or node count.
+                    {"name": "docker", "isolation": "container", "available": True},
+                ]
+            },
+        )
+        client = MicroVM(self.server.url, "pat", team="ops")
+        listed = client.runtimes.list()
+        self.assertEqual(
+            listed,
+            [
+                {
+                    "name": "firecracker",
+                    "isolation": "hardware-vm",
+                    "backend": "kvm",
+                    "features": {"snapshots": True, "pause": True, "moves": "memory", "warmPool": "snapshot", "confidential": False},
+                    "available": True,
+                    "nodes": 3,
+                },
+                {
+                    "name": "wasm",
+                    "isolation": "wasm",
+                    "features": {"snapshots": False, "pause": False, "moves": "memory", "warmPool": "parked", "confidential": False},
+                    "limits": {"maxCheckpointMemoryMB": 1024},
+                    "available": False,
+                    # A fleet admin's 0 is a count, not a missing field.
+                    "nodes": 0,
+                },
+                {
+                    "name": "docker",
+                    "isolation": "container",
+                    # No features object: safe defaults, never a KeyError.
+                    "features": {"snapshots": False, "pause": False, "moves": "", "warmPool": "", "confidential": False},
+                    "available": True,
+                },
+            ],
+        )
+        for key in ("backend", "limits", "nodes"):
+            self.assertIsNone(listed[2].get(key), key)
+        self.assertEqual([(r["method"], r["path"], r["team"]) for r in self.server.requests], [("GET", "/v1/runtimes", ["ops"])])
+
+    def test_runtimes_list_normalizes_null(self):
+        for body in ({"runtimes": None}, {}, None):
+            with self.subTest(body=body):
+                self.server.routes[("GET", "/v1/runtimes")] = (200, body)
+                self.assertEqual(MicroVM(self.server.url, "pat").runtimes.list(), [])
+
     def test_tokens_list_normalizes_null(self):
         self.server.routes[("GET", "/v1/tokens")] = (200, {"tokens": None})
         self.assertEqual(MicroVM(self.server.url, "pat").tokens.list(), {"tokens": []})
