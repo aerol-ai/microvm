@@ -199,6 +199,16 @@ func TestOrphanRetryWaitsForALiveOwnerThenGoesElsewhere(t *testing.T) {
 // One pass walks a backlog bigger than one page, up to the moves its rate
 // allows in a tick; the next pass carries on from there.
 func TestOrphanRetryPassIsBoundedByTheRate(t *testing.T) {
+	// A pass also stops at orphanRetryBudget (500 ms) of wall time, and each
+	// move is a Raft write with an fsync. On a busy machine a move took about
+	// 20 ms, so the budget ended the first pass before the rate's 50 moves.
+	// This test is about the rate, so the budget is set out of reach
+	// (TestOrphanRetryBoundsAWalkThatFindsNoRoom covers the budget). It is
+	// set before the cluster starts, so the cluster's orphan loop never
+	// reads it while the test writes it.
+	oldBudget := orphanRetryBudget
+	t.Cleanup(func() { orphanRetryBudget = oldBudget })
+	orphanRetryBudget = time.Hour
 	c, cleanup := newTestClusterWithRole(t, "srv-recovery-pages", config.NodeRoleServer, true, nil)
 	defer cleanup()
 	waitForLeader(t, c, 10*time.Second)

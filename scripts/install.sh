@@ -4038,14 +4038,13 @@ stage_switch_back_kernel() {
 
 # finish_firecracker_after_switch_back puts single's guest kernel and
 # templates folder in place, now that leave_split_mode has given sandboxd's
-# folders back to root: a copy of the kernel stage_switch_back_kernel chose,
-# over whatever kernel was there. The old kernel goes first, so a run cut
-# off before the copy leaves no kernel, and the next run installs the
-# pinned one instead of keeping the old one.
+# folders back to root: a copy of the kernel stage_switch_back_kernel chose.
+# leave_split_mode has already removed the old kernel, before it removed the
+# switch-back marker, so a run cut off before this copy leaves no kernel,
+# and the next run installs the pinned one instead of keeping the old one.
 finish_firecracker_after_switch_back() {
 	[[ -n "${FIRECRACKER_KERNEL_FOR_SWITCH_BACK:-}" ]] || return 0
 	local from="$FIRECRACKER_KERNEL_FOR_SWITCH_BACK"
-	rm -f "$FIRECRACKER_KERNEL_PATH"
 	install -d -m 0755 "${FIRECRACKER_KERNEL_PATH%/*}"
 	install -m 0644 "${from}.config" "${FIRECRACKER_KERNEL_PATH}.config"
 	install -m 0644 "$from" "$FIRECRACKER_KERNEL_PATH"
@@ -5033,7 +5032,7 @@ leave_split_mode() {
 	# tell whether what sandboxd's user wrote is honest. The docs say so
 	# (privilege-mode.mdx, installer-options.mdx); this says it on the node,
 	# on this switch only.
-	echo "warning: in single mode, sandboxd runs as root and trusts its database and its files in /var/lib/sandboxd, /etc/sandboxd/tls and /etc/sandboxd/cluster-ca. sandboxd wrote them while it ran without root. This switch gives them back to root and removes links, but does not check what they hold. If you think this server was broken into, rebuild the machine instead." >&2
+	echo "warning: in single mode, sandboxd runs as root and trusts its database and its files in /var/lib/sandboxd, /etc/sandboxd/tls and /etc/sandboxd/cluster-ca. sandboxd wrote them while it ran without root. This switch gives them back to root and removes links, but does not check what they hold. That includes Firecracker templates and saved VM snapshots, which single uses as they are: if in doubt, rebuild the templates after the switch back. If you think this server was broken into, rebuild the machine instead." >&2
 	systemctl stop sandboxd 2>/dev/null || true
 	# Rootless BuildKit's split drop-in (the socket's ACL for sandboxd's
 	# user) was kept until the split sandboxd stopped
@@ -5071,6 +5070,11 @@ leave_split_mode() {
 		done
 	fi
 	systemctl disable --now aerolvm-rootd.service 2>/dev/null || true
+	# Single's guest kernel was sandboxd's user's to change in split, and
+	# every new VM boots it: it goes while the marker still says the switch
+	# is unfinished, so no run, however it stops, keeps it.
+	# finish_firecracker_after_switch_back copies the new one in.
+	rm -f "$FIRECRACKER_KERNEL_PATH"
 	# Done: from here sandboxd.env alone says this node runs single.
 	rm -f "$PRIVILEGE_SWITCH_BACK_MARKER"
 }

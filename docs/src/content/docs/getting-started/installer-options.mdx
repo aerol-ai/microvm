@@ -220,7 +220,7 @@ A switch either way removes the old upgrade records in `/var/lib/sandboxd/upgrad
 A switch to split also removes the WebAssembly compile caches that single mode made, before the server starts. Single gives each cache to the WebAssembly worker's user, and split cannot share such a cache with its workers. Split makes new caches, so each module compiles once more after the switch, and the caches work from then on.
 
 <Aside type="caution">
-Switching back to single gives root the server's database as the server wrote it in split mode. If you think the server was broken into, rebuild the machine instead of switching it back. The installer prints this as a warning when it switches a server back.
+Switching back to single gives root the server's database as the server wrote it in split mode. The same goes for Firecracker templates and saved VM snapshots: single uses them as they are. If in doubt, rebuild your templates after the switch back. If you think the server was broken into, rebuild the machine instead of switching it back. The installer prints this as a warning when it switches a server back.
 </Aside>
 
 ### Turn on Firecracker
