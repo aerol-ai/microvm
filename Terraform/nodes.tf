@@ -115,7 +115,7 @@ resource "aws_instance" "seed" {
     firecracker_tap_pool_size                = var.firecracker.tap_pool_size
     firecracker_skopeo_bin                   = var.firecracker.skopeo_bin
     firecracker_umoci_bin                    = var.firecracker.umoci_bin
-    firecracker_mkfs_bin                     = var.firecracker.mkfs_bin
+    firecracker_mkfs_bin                     = local.firecracker_mkfs_bin
     firecracker_ip_binary                    = var.firecracker.ip_binary
     firecracker_template_gc_enabled          = var.firecracker.template_gc_enabled
     firecracker_template_gc_interval         = var.firecracker.template_gc_interval
@@ -378,7 +378,7 @@ resource "aws_instance" "joiner" {
     firecracker_tap_pool_size                = var.firecracker.tap_pool_size
     firecracker_skopeo_bin                   = var.firecracker.skopeo_bin
     firecracker_umoci_bin                    = var.firecracker.umoci_bin
-    firecracker_mkfs_bin                     = var.firecracker.mkfs_bin
+    firecracker_mkfs_bin                     = local.firecracker_mkfs_bin
     firecracker_ip_binary                    = var.firecracker.ip_binary
     firecracker_template_gc_enabled          = var.firecracker.template_gc_enabled
     firecracker_template_gc_interval         = var.firecracker.template_gc_interval
