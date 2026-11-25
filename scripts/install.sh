@@ -244,11 +244,15 @@ FIRECRACKER_DATA_AFTER_SWITCH_BACK=""
 # (setup_privilege_mode): a change is a switch, which moves files' owners.
 PREVIOUS_PRIVILEGE_MODE=""
 # Says a switch back to privilege mode single has started and not finished.
-# setup_privilege_mode writes it before sandboxd.env says single, and
-# leave_split_mode removes it once the cleanup is done. A run stopped in
-# between leaves it, so the next run still sees a node coming from split
-# (running_privilege_mode) and finishes the switch. Root's folder, never
-# one of sandboxd's user's.
+# mark_switch_back writes it just before write_environment makes sandboxd.env
+# say single, and leave_split_mode removes it once the cleanup is done. A
+# run stopped in between leaves it, so the next run still sees a node
+# coming from split (running_privilege_mode) and finishes the switch.
+# Nothing before mark_switch_back changes the node's split setup (its
+# settings, its units, BuildKit's split drop-in: install_buildkit_rootless
+# leaves that to leave_split_mode), so a run stopped earlier, on a download
+# say, leaves no marker, and the node runs and re-runs as split. Root's
+# folder, never one of sandboxd's user's.
 PRIVILEGE_SWITCH_BACK_MARKER="/etc/sandboxd/privilege-mode-switch-back"
 
 # agent_may_own_folders reports whether sandboxd's user may own its folders
@@ -1373,6 +1377,13 @@ running_privilege_mode() {
 	echo "${mode:-single}"
 }
 
+# switching_back_to_single reports whether this run moves the node from
+# privilege mode split back to single (setup_privilege_mode has set
+# PREVIOUS_PRIVILEGE_MODE).
+switching_back_to_single() {
+	[[ "$PRIVILEGE_MODE" == "single" && "${PREVIOUS_PRIVILEGE_MODE:-}" == "split" ]]
+}
+
 # check_privilege_mode_change refuses a run that would leave a node's
 # privilege mode half changed. --config-only never switches a mode: it
 # restarts and moves nothing, and it reads the mode it renders as the
@@ -1387,9 +1398,16 @@ check_privilege_mode_change() {
 		echo "A switch of this node back to privilege mode single did not finish. Run install.sh --privilege-mode single, with your other flags and without --config-only, to finish it first." >&2
 		exit 1
 	fi
-	[[ "$CONFIG_ONLY" == "true" ]] || return 0
 	local running
 	running="$(running_privilege_mode)"
+	# A switch back keeps rootless BuildKit as split set it up until its
+	# cleanup (leave_split_mode). Moving BuildKit to root in the same run
+	# would change the node before the downloads; it is a run of its own.
+	if [[ "$CONFIG_ONLY" != "true" && "$running" == "split" && "$PRIVILEGE_MODE" == "single" ]] && flag_given --no-buildkit-rootless; then
+		echo "Switch this node back to privilege mode single first, then run install.sh again with --no-buildkit-rootless: one run does not do both." >&2
+		exit 1
+	fi
+	[[ "$CONFIG_ONLY" == "true" ]] || return 0
 	if [[ "$running" != "$PRIVILEGE_MODE" ]]; then
 		echo "--config-only never changes a node's privilege mode: this node runs $running, and this run asks for $PRIVILEGE_MODE. Run install.sh --privilege-mode $PRIVILEGE_MODE without --config-only: a full run stops sandboxd, gives its files to the right owner and starts or stops the root helper." >&2
 		exit 1
@@ -2555,6 +2573,16 @@ install_binaries() {
 		install -m 0755 "$tmp_dir/$toolboxd_asset" "$TOOLBOX_BINARY_PATH"
 		rm -rf "$tmp_dir"
 	fi
+}
+
+# mark_switch_back writes PRIVILEGE_SWITCH_BACK_MARKER on a switch back to
+# single. The main flow calls it right before write_environment, after
+# every download, so the marker is there from the moment sandboxd.env says
+# single until leave_split_mode is done, and not before: a run that stops
+# on a download leaves a split node that re-runs as split.
+mark_switch_back() {
+	switching_back_to_single || return 0
+	printf '%s\n' "install.sh started to switch this node back to privilege mode single and has not finished. Run install.sh --privilege-mode single to finish it." >"$PRIVILEGE_SWITCH_BACK_MARKER"
 }
 
 write_environment() {
@@ -4384,7 +4412,9 @@ install_buildkit_rootless() {
 		echo "warning: ${BUILDKIT_UNIT_FILE} is not one this installer wrote; leaving it. Rootless BuildKit needs install.sh's unit." >&2
 	fi
 	# Privilege mode split: sandboxd's user reaches the socket by an ACL
-	# (buildkit_split_dropin). Single has no drop-in.
+	# (buildkit_split_dropin). Single has no drop-in. On a switch back the
+	# split sandboxd keeps it until it stops: leave_split_mode removes it,
+	# so a run that fails before then (on a download) leaves split working.
 	local dropin="${BUILDKIT_UNIT_FILE}.d/privilege-split.conf"
 	if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
 		body="$(buildkit_split_dropin)"
@@ -4393,7 +4423,7 @@ install_buildkit_rootless() {
 			printf '%s\n' "$body" > "$dropin"
 			restart="true"
 		fi
-	elif [[ -f "$dropin" ]]; then
+	elif [[ -f "$dropin" ]] && ! switching_back_to_single; then
 		rm -f "$dropin"
 		restart="true"
 	fi
@@ -4585,8 +4615,6 @@ setup_privilege_mode() {
 		if [[ -e "$PRIVILEGE_SWITCH_BACK_MARKER" ]]; then
 			echo "A switch of this node back to privilege mode single did not finish; finishing it now"
 		fi
-		# Before write_environment says single: see PRIVILEGE_SWITCH_BACK_MARKER.
-		printf '%s\n' "install.sh started to switch this node back to privilege mode single and has not finished. Run install.sh --privilege-mode single to finish it." >"$PRIVILEGE_SWITCH_BACK_MARKER"
 	fi
 	[[ "$PRIVILEGE_MODE" == "split" ]] || return 0
 	if ! command -v setfacl >/dev/null 2>&1; then
@@ -4961,7 +4989,7 @@ split_shared_env_fingerprint() {
 # sandboxes keep running, and the root sandboxd that starts next takes them
 # over.
 leave_split_mode() {
-	[[ "$PRIVILEGE_MODE" == "single" && "$PREVIOUS_PRIVILEGE_MODE" == "split" ]] || return 0
+	switching_back_to_single || return 0
 	echo "Switching this node back to privilege mode single: sandboxd runs as root again"
 	# The steps below remove links and give files back to root; they cannot
 	# tell whether what sandboxd's user wrote is honest. The docs say so
@@ -4969,6 +4997,15 @@ leave_split_mode() {
 	# on this switch only.
 	echo "warning: in single mode, sandboxd runs as root and trusts its database and its files in /var/lib/sandboxd, /etc/sandboxd/tls and /etc/sandboxd/cluster-ca. sandboxd wrote them while it ran without root. This switch gives them back to root and removes links, but does not check what they hold. If you think this server was broken into, rebuild the machine instead." >&2
 	systemctl stop sandboxd 2>/dev/null || true
+	# Rootless BuildKit's split drop-in (the socket's ACL for sandboxd's
+	# user) was kept until the split sandboxd stopped
+	# (install_buildkit_rootless); single has none.
+	local buildkit_dropin="${BUILDKIT_UNIT_FILE}.d/privilege-split.conf"
+	if [[ -f "$buildkit_dropin" ]]; then
+		rm -f "$buildkit_dropin"
+		systemctl daemon-reload
+		systemctl restart --no-block buildkit.service || echo "warning: buildkit.service failed to restart" >&2
+	fi
 	# What the root sandboxd would act on by path at its first boot, and
 	# sandboxd's user could write in split, goes first: the upgrade folder
 	# (boot recovery reads its records), the runtime folders (sockets and
@@ -5507,6 +5544,7 @@ install_custom_caddy "$DNS_PROVIDER"
 # Before install_binaries, so the restart check sees a new binary too.
 record_sandboxd_state
 install_binaries
+mark_switch_back
 write_environment
 write_node_settings
 prepare_key_custody
