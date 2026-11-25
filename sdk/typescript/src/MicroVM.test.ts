@@ -751,6 +751,126 @@ test("MicroVM.tokens.list normalizes a null list", async () => {
   assert.deepEqual(await sdk.tokens.list(), { tokens: [] });
 });
 
+test("MicroVM.runtimes.list reads GET /v1/runtimes and maps every field", async () => {
+  // The server's shape for a fleet admin: nodes is present, and a runtime
+  // with no backend or limits leaves those keys out.
+  const body = {
+    runtimes: [
+      {
+        name: "docker",
+        isolation: "container",
+        features: { snapshots: true, pause: false, moves: "none", warm_pool: "parked", confidential: false },
+        available: true,
+        nodes: 2,
+      },
+      {
+        name: "firecracker",
+        isolation: "hardware-vm",
+        backend: "kvm",
+        features: { snapshots: true, pause: true, moves: "memory", warm_pool: "snapshot", confidential: false },
+        available: false,
+        nodes: 0,
+      },
+      {
+        name: "wasm",
+        isolation: "wasm",
+        features: { snapshots: false, pause: false, moves: "memory", warm_pool: "parked", confidential: false },
+        limits: { max_checkpoint_memory_mb: 1024 },
+        available: true,
+        nodes: 1,
+      },
+    ],
+  };
+  const { seen, fetchFn } = recordingFetch((request) =>
+    new URL(request.url).pathname === "/v1/runtimes" && request.method === "GET"
+      ? jsonResponse(200, body)
+      : jsonResponse(404, { error: "unexpected" }),
+  );
+  const sdk = new MicroVM({ patToken: "avm_admin", apiUrl: "https://api.example.com", team: "ops", fetch: fetchFn });
+
+  assert.deepEqual(await sdk.runtimes.list(), [
+    {
+      name: "docker",
+      isolation: "container",
+      features: { snapshots: true, pause: false, moves: "none", warmPool: "parked", confidential: false },
+      available: true,
+      nodes: 2,
+    },
+    {
+      name: "firecracker",
+      isolation: "hardware-vm",
+      backend: "kvm",
+      features: { snapshots: true, pause: true, moves: "memory", warmPool: "snapshot", confidential: false },
+      available: false,
+      nodes: 0,
+    },
+    {
+      name: "wasm",
+      isolation: "wasm",
+      features: { snapshots: false, pause: false, moves: "memory", warmPool: "parked", confidential: false },
+      limits: { maxCheckpointMemoryMB: 1024 },
+      available: true,
+      nodes: 1,
+    },
+  ]);
+  assert.deepEqual(
+    seen.map((r) => `${r.method} ${new URL(r.url).pathname}`),
+    ["GET /v1/runtimes"],
+  );
+  assert.equal(seen[0]?.team, "ops");
+  assert.equal(seen[0]?.body, undefined);
+});
+
+test("MicroVM.runtimes.list leaves out what a tenant is not sent", async () => {
+  // A tenant gets no node counts; a runtime without backend or limits has
+  // neither key, so callers can test with `in`.
+  const sdk = new MicroVM({
+    patToken: "avm_viewer",
+    apiUrl: "https://api.example.com",
+    fetch: async () =>
+      jsonResponse(200, {
+        runtimes: [
+          {
+            name: "gvisor",
+            isolation: "user-space-kernel",
+            features: { snapshots: false, pause: false, moves: "memory", warm_pool: "parked", confidential: false },
+            available: true,
+          },
+        ],
+      }),
+  });
+  const [gvisor] = await sdk.runtimes.list();
+  assert.ok(gvisor);
+  assert.equal("nodes" in gvisor, false);
+  assert.equal("backend" in gvisor, false);
+  assert.equal("limits" in gvisor, false);
+  assert.equal(gvisor.available, true);
+  assert.equal(gvisor.features.warmPool, "parked");
+});
+
+test("MicroVM.runtimes.list normalizes a null list and missing features", async () => {
+  const replies: unknown[] = [
+    { runtimes: null },
+    {},
+    { runtimes: [{ name: "kata", isolation: "hardware-vm" }] },
+  ];
+  const sdk = new MicroVM({
+    patToken: "pat",
+    apiUrl: "https://api.example.com",
+    fetch: async () => jsonResponse(200, replies.shift()),
+  });
+  assert.deepEqual(await sdk.runtimes.list(), []);
+  assert.deepEqual(await sdk.runtimes.list(), []);
+  assert.deepEqual(await sdk.runtimes.list(), [
+    {
+      name: "kata",
+      isolation: "hardware-vm",
+      features: { snapshots: false, pause: false, moves: "", warmPool: "", confidential: false },
+      available: false,
+    },
+  ]);
+});
+
 test("MicroVM.tokens surfaces the server's refusal message", async () => {
   const sdk = new MicroVM({
     patToken: "avm_viewer",

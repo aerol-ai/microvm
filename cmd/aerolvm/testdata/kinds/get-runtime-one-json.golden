@@ -1,0 +1,16 @@
+exit 0
+--- stdout
+{
+  "name": "firecracker",
+  "isolation": "hardware-vm",
+  "backend": "kvm",
+  "features": {
+    "snapshots": true,
+    "pause": true,
+    "moves": "memory",
+    "warm_pool": "snapshot",
+    "confidential": false
+  },
+  "available": true
+}
+--- stderr

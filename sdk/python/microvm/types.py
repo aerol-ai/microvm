@@ -1236,6 +1236,57 @@ class APITokenList(TypedDict):
     tokens: List[APIToken]
 
 
+class RuntimeFeatures(TypedDict):
+    """What a runtime can do. A warm pool is what the runtime can use; the
+    operator decides whether one runs."""
+
+    # The sandbox can be saved as a named image that new sandboxes start from.
+    snapshots: bool
+    # A stop keeps memory and running programs, and the next start resumes them.
+    pause: bool
+    # What a sandbox keeps when the cluster moves it to another node:
+    # "memory" (running programs too), "disk" (files only) or "none".
+    moves: str
+    # How a create can start warm: "snapshot" (a VM restored from a memory
+    # snapshot), "parked" (a sandbox started ahead of time) or "none".
+    warmPool: str
+    # Memory is sealed from the host. No runtime offers it yet.
+    confidential: bool
+
+
+class RuntimeLimits(TypedDict, total=False):
+    """Fixed limits a runtime has whatever the operator sets. A limit the
+    runtime does not have is left out."""
+
+    # The most memory a checkpoint can restore. A bigger sandbox still runs,
+    # but cannot come back from a passivation or a move.
+    maxCheckpointMemoryMB: int
+
+
+class RuntimeInfo(TypedDict, total=False):
+    """One runtime as ``client.runtimes.list()`` returns it: a runtime name
+    a create accepts, what it can do, and whether this deployment offers it
+    now. ``name``, ``isolation``, ``features`` and ``available`` are always
+    set; the other keys are left out when the server sends nothing."""
+
+    # The name to pass as ``runtime`` on create: "docker", "gvisor",
+    # "firecracker", "wasm", "isolate", ...
+    name: str
+    # What stands between the sandbox and the server: "container",
+    # "user-space-kernel", "hardware-vm", "wasm" or "v8-isolate".
+    isolation: str
+    # The hardware a VM runtime runs on ("kvm"). Left out for runtimes that
+    # are not VMs.
+    backend: str
+    features: RuntimeFeatures
+    limits: RuntimeLimits
+    # At least one node that can run sandboxes offers it now.
+    available: bool
+    # How many nodes offer it. The server sends it to fleet admins only;
+    # other callers never see node names or counts.
+    nodes: int
+
+
 class SandboxToken(TypedDict, total=False):
     """The result of ``sandbox.create_token()``: a signed token for one
     sandbox, to hand to a browser or an end user. The server keeps no copy,

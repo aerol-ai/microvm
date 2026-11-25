@@ -1211,6 +1211,64 @@ export interface APITokenList {
   tokens: APIToken[];
 }
 
+/**
+ * What a runtime can do. The warm pool is what the runtime can use; the
+ * operator decides whether one runs.
+ */
+export interface RuntimeFeatures {
+  /** A snapshot saves the sandbox as a named image that new sandboxes can start from. */
+  snapshots: boolean;
+  /** A stop keeps memory and running programs, and the next start resumes them. */
+  pause: boolean;
+  /**
+   * What a sandbox keeps when the cluster moves it to another node:
+   * `"memory"` (running programs and memory move too), `"disk"` (files
+   * move, memory does not) or `"none"` (nothing moves).
+   */
+  moves: string;
+  /**
+   * How a create can start warm: `"snapshot"` (a VM restored from a
+   * pre-booted memory snapshot), `"parked"` (a sandbox started ahead of
+   * time) or `"none"` (every create starts cold).
+   */
+  warmPool: string;
+  /** Memory is sealed from the host. No runtime offers this yet. */
+  confidential: boolean;
+}
+
+/** Fixed limits a runtime has, whatever the operator sets. */
+export interface RuntimeLimits {
+  /**
+   * The most memory a checkpoint can restore, in MiB. A bigger sandbox
+   * still runs, but cannot come back from a passivation or a move.
+   */
+  maxCheckpointMemoryMB?: number;
+}
+
+/** One runtime as `microvm.runtimes.list()` returns it. */
+export interface RuntimeInfo {
+  /** The name a create takes as `runtime`, such as `"firecracker"`. */
+  name: string;
+  /**
+   * What stands between a sandbox and the server: `"container"`,
+   * `"user-space-kernel"` (gVisor), `"hardware-vm"`, `"wasm"` or
+   * `"v8-isolate"`.
+   */
+  isolation: string;
+  /** The hardware a VM runtime runs on, such as `"kvm"`. Absent for runtimes that are not VMs. */
+  backend?: string;
+  features: RuntimeFeatures;
+  /** Absent when the runtime has no fixed limits. */
+  limits?: RuntimeLimits;
+  /** True when at least one node offers this runtime now, so a create can ask for it. */
+  available: boolean;
+  /**
+   * How many nodes offer it. The server sends this only to fleet admins;
+   * everyone else never sees node names or counts.
+   */
+  nodes?: number;
+}
+
 /** One destination a learn-mode sandbox reached. */
 export interface NetworkLearnedEntry {
   host: string;
