@@ -56,6 +56,15 @@ func TestAgentFoldersCode(t *testing.T) {
 	if code := agentFoldersCode([]string{"--user", "65531"}, getenv, &out); code != 1 || !strings.Contains(out.String(), "read-only") {
 		t.Fatalf("code %d: %s", code, out.String())
 	}
+	// Caches single mode left: the ones removed and the ones kept are said.
+	giveToAgent = func(rootd.AgentFolders) (rootd.AgentFolderResult, error) {
+		return rootd.AgentFolderResult{Walked: 4, ForgottenCaches: 2, CacheErrors: []string{"/c/owners/operator: busy"}}, nil
+	}
+	out.Reset()
+	if code := agentFoldersCode([]string{"--user", "65531"}, getenv, &out); code != 0 ||
+		!strings.Contains(out.String(), "caches=2") || !strings.Contains(out.String(), "/c/owners/operator: busy") {
+		t.Fatalf("code %d: %q", code, out.String())
+	}
 	// Nothing left to move: nothing said.
 	giveToAgent = func(rootd.AgentFolders) (rootd.AgentFolderResult, error) {
 		return rootd.AgentFolderResult{Walked: 4}, nil

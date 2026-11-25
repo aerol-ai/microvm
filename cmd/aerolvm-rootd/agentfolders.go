@@ -48,6 +48,13 @@ func agentFoldersCode(args []string, getenv func(string) string, stderr io.Write
 		log.Error("cannot give the agent its folders", "error", err, "changed_so_far", res.Changed)
 		return 1
 	}
+	if res.ForgottenCaches > 0 {
+		log.Info("removed the WASM compile caches privilege mode single left; split makes its own", "caches", res.ForgottenCaches,
+			"cache_root", f.WasmCacheRoot)
+	}
+	for _, e := range res.CacheErrors {
+		log.Warn("left a WASM compile cache privilege mode single made; its workers compile without it", "error", e)
+	}
 	// Quiet once there is nothing left to move: this runs at every start.
 	if res.Changed > 0 || res.SkippedLinks > 0 {
 		log.Info("gave root's files in the agent's folders to the agent", "uid", f.UID, "gid", f.GID,

@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/aerol-ai/microvm/internal/rootfolder"
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 )
 
 // The agent's folders on a VM in privilege mode split (plans/security-gaps-
@@ -32,7 +33,10 @@ import (
 // move, and the walk only reads.
 //
 // It changes only what root owns. Files of other users (the WASM worker's,
-// uid 61000; a V8 jail's) keep their owner. It follows no link: each entry
+// uid 61000; a V8 jail's) keep their owner, with one exception: a WASM
+// compile cache privilege mode single gave the worker is removed
+// (singleWasmCache), so split makes the cache again in a way its workers
+// can use. It follows no link: each entry
 // is opened without following one (O_PATH|O_NOFOLLOW on Linux), its owner,
 // kind and link count are read from that handle, and the chown goes
 // through the same handle, so a name swapped between the look and the
@@ -55,6 +59,12 @@ type AgentFolders struct {
 	// UID and GID are the agent's user and its primary group. A file
 	// root's group owns gets GID; any other group is kept.
 	UID, GID uint32
+	// WasmCacheRoot is the WASM compile cache root as sandboxd and the
+	// helper work it out (wasmCacheRoot), and WasmWorkerUID the WASM
+	// worker's user: together they name the caches single mode left
+	// (singleWasmCache). An empty root turns that off.
+	WasmCacheRoot string
+	WasmWorkerUID uint32
 }
 
 // AgentFolderResult is what one walk did.
@@ -69,6 +79,11 @@ type AgentFolderResult struct {
 	// Missing are folders that are not there yet (a node with no cluster
 	// certificates, say): nothing to move.
 	Missing []string
+	// ForgottenCaches are the WASM compile caches single mode left that
+	// the walk removed. CacheErrors say why one could not be removed; it
+	// is left as it was, and the walk goes on.
+	ForgottenCaches int
+	CacheErrors     []string
 }
 
 // maxAgentFolderDepth bounds the walk. sandboxd's deepest folders are a few
@@ -152,7 +167,34 @@ func AgentFoldersFromEnv(getenv func(string) string, who string) (AgentFolders, 
 			return AgentFolders{}, err
 		}
 	}
-	return AgentFolders{Dirs: outermost(dirs), UID: uid, GID: gid}, nil
+	cacheRoot, worker := wasmCacheSettings(getenv, uid)
+	return AgentFolders{Dirs: outermost(dirs), UID: uid, GID: gid, WasmCacheRoot: cacheRoot, WasmWorkerUID: worker}, nil
+}
+
+// wasmCacheSettings are the WASM compile cache root and the WASM worker's
+// uid, from sandboxd's settings, for singleWasmCache. A setting that is
+// not usable (a relative path, a uid that is not a number) turns the
+// removal off rather than stopping sandboxd's start: the helper checks
+// those settings itself when it runs WASM hosts. So does a worker uid of
+// root's or the agent's: their folders are never single mode's leftovers.
+func wasmCacheSettings(getenv func(string) string, agent uint32) (string, uint32) {
+	bad := false
+	path := func(k, def string) string {
+		raw := strings.TrimSpace(getenv(k))
+		if raw == "" {
+			raw = def
+		}
+		if !filepath.IsAbs(raw) {
+			bad = true
+		}
+		return filepath.Clean(raw)
+	}
+	root := wasmCacheRoot(getenv, path)
+	worker, err := envInt(getenv, "SB_WASM_WORKER_UID", defaultWasmWorkerID)
+	if bad || root == "" || err != nil || worker <= 0 || worker > math.MaxInt32 || uint32(worker) == agent {
+		return "", 0
+	}
+	return root, uint32(worker)
 }
 
 // outermost drops each folder inside another of the list, and repeats.
@@ -346,6 +388,10 @@ func giveEntry(fd int, name, path string, dev uint64, f AgentFolders, res *Agent
 		res.SkippedLinks++
 		return nil
 	}
+	if typ == unix.S_IFDIR && f.singleWasmCache(path, e.st.Uid) {
+		forgetWasmCache(e, path, dev, res)
+		return nil
+	}
 	if e.st.Uid == movedFromUID {
 		if err := e.chown(f.UID, groupFor(e.st.Gid, f.GID)); err != nil {
 			if errors.Is(err, unix.ENOENT) {
@@ -370,6 +416,124 @@ func giveEntry(fd int, name, path string, dev uint64, f AgentFolders, res *Agent
 	}
 	defer func() { _ = unix.Close(sub) }()
 	return walkInto(sub, path, dev, f, res, depth+1)
+}
+
+// singleWasmCache reports whether path, a folder uid owns, is a WASM
+// compile cache privilege mode single made: a folder where the WASM driver
+// puts a cache (owners/<name> or slots/<hash>/cache under the cache root,
+// the names rootpolicy.CheckWasmCache takes) that belongs to the worker's
+// user. Single gives each cache to the worker's uid. Split's sandboxd makes
+// its caches as itself and shares them with the worker's group; it cannot
+// do that to the worker's folder (only an owner may change a folder's
+// group), and the helper hands a worker only a cache that is the agent's
+// (openAgentFolder). Such a cache would stay unused, and every worker
+// would compile its module again on each start. Split never makes one:
+// the worker cannot write in owners/ or slots/<hash>/.
+func (f AgentFolders) singleWasmCache(path string, uid uint32) bool {
+	if f.WasmCacheRoot == "" || uid != f.WasmWorkerUID {
+		return false
+	}
+	rel, ok := strings.CutPrefix(path, f.WasmCacheRoot+"/")
+	if !ok {
+		return false
+	}
+	if name, ok := strings.CutPrefix(rel, "owners/"); ok {
+		return name != "" && !strings.Contains(name, "/") && rootpolicy.CheckWasmCache(name) == nil
+	}
+	return strings.HasPrefix(rel, "slots/") && rootpolicy.CheckWasmCache(rel) == nil
+}
+
+// forgetWasmCache removes a cache single mode left (singleWasmCache):
+// what is in it, then the folder. It is only a cache: the worker compiles
+// again what it held, once, into the cache split makes. Everything goes
+// through the walk's handles: the folder through its entry, each name in
+// it relative to the folder that holds it, with no link followed (a link
+// is removed, never what it names) and no other file system entered. A
+// cache it cannot remove is left as it is and named in CacheErrors; that
+// never fails the walk, so sandboxd still starts, and its workers compile
+// without that cache, as before.
+func forgetWasmCache(e *entry, path string, dev uint64, res *AgentFolderResult) {
+	err := func() error {
+		sub, err := e.openDir(dev)
+		if err != nil {
+			return err
+		}
+		if sub < 0 {
+			return errors.New("it changed while the walk looked at it")
+		}
+		defer func() { _ = unix.Close(sub) }()
+		if err := emptyFolder(sub, path, dev, 0); err != nil {
+			return err
+		}
+		return unix.Unlinkat(e.dfd, e.name, unix.AT_REMOVEDIR)
+	}()
+	if err != nil && !errors.Is(err, unix.ENOENT) {
+		res.CacheErrors = append(res.CacheErrors, fmt.Sprintf("%s: %v", path, err))
+		return
+	}
+	res.ForgottenCaches++
+}
+
+// emptyFolder removes everything in the open folder fd (at path), deepest
+// first, one name at a time relative to fd.
+func emptyFolder(fd int, path string, dev uint64, depth int) error {
+	if depth >= maxAgentFolderDepth {
+		return fmt.Errorf("%s is more than %d folders deep", path, maxAgentFolderDepth)
+	}
+	names, err := readNames(fd)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		if err := removeEntry(fd, name, path+"/"+name, dev, depth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeEntry removes one entry of the open folder fd, looked at through a
+// handle with no link followed (openEntry): a link, a file or anything
+// else that is not a folder is unlinked by name; a folder is opened through
+// that handle (the folder looked at), emptied and removed. A folder that is
+// the root of a mount, or on another device, stops the removal.
+func removeEntry(fd int, name, path string, dev uint64, depth int) error {
+	e, err := openEntry(fd, name)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	defer e.close()
+	if e.st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		if err := unix.Unlinkat(fd, name, 0); err != nil && !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("%s: %w", path, err)
+		}
+		return nil
+	}
+	if uint64(e.st.Dev) != dev || e.mountRoot() {
+		return fmt.Errorf("%s is another file system", path)
+	}
+	sub, err := e.openDir(dev)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if sub < 0 {
+		return fmt.Errorf("%s changed while it was removed", path)
+	}
+	err = emptyFolder(sub, path, dev, depth+1)
+	_ = unix.Close(sub)
+	if err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(fd, name, unix.AT_REMOVEDIR); err != nil && !errors.Is(err, unix.ENOENT) {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	return nil
 }
 
 // readNames lists the open folder fd. The listing reads a duplicate of fd,
