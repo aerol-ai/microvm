@@ -23,6 +23,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootd"
+	"github.com/aerol-ai/microvm/internal/supervisor"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -483,6 +484,75 @@ func TestChartSplitMoves(t *testing.T) {
 	}
 }
 
+// The supervisor's folder of helper copies, which holds the floor (the
+// version of the helper that ran last, internal/rootswap floor.go), sits on
+// a volume of its own: an emptyDir, so it outlives a restart of the runtime
+// container and ends with the pod; mounted by the runtime container alone,
+// after split-folders made it root's, closed to others. In the container's
+// own files the floor was lost on every restart of the container, and with
+// it the rule that no older helper runs.
+func TestChartSplitSupervisorFolder(t *testing.T) {
+	helm := chartHelm(t)
+	t.Setenv("SB_ROOTD_BIN_DIR", "")
+	binDir := supervisor.SettingsFromEnv().RootdBinDir
+	for name, flags := range map[string][]string{"single": nil, "cluster": chartClusterFlags} {
+		t.Run(name, func(t *testing.T) {
+			out, err := renderChart(helm, append([]string{"--set", "privilegeMode=split"}, flags...)...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if v, ok := workerEnv(t, out, "runtime")["SB_ROOTD_BIN_DIR"]; ok {
+				t.Fatalf("the runtime container sets SB_ROOTD_BIN_DIR=%s; the volume is mounted for the default %s", v, binDir)
+			}
+			spec := workerSpec(t, out)
+			var vol string
+			mounters := map[string]string{}
+			for _, list := range []string{"initContainers", "containers"} {
+				cs, _ := spec[list].([]any)
+				for _, c := range cs {
+					m, _ := c.(map[string]any)
+					vms, _ := m["volumeMounts"].([]any)
+					for _, v := range vms {
+						vm, _ := v.(map[string]any)
+						if m["name"] == "runtime" && vm["mountPath"] == filepath.Dir(binDir) {
+							vol = fmt.Sprint(vm["name"])
+							if vm["readOnly"] == true || vm["subPath"] != nil {
+								t.Errorf("the runtime container mounts %s as %v, want the whole volume, writable", filepath.Dir(binDir), vm)
+							}
+						}
+						mounters[fmt.Sprint(m["name"])+"/"+fmt.Sprint(vm["name"])] = fmt.Sprint(vm["mountPath"])
+					}
+				}
+			}
+			if vol == "" {
+				t.Fatalf("the runtime container mounts no volume at %s, the folder of the supervisor's helper copies", filepath.Dir(binDir))
+			}
+			for k := range mounters {
+				if c, v, _ := strings.Cut(k, "/"); v == vol && c != "runtime" && c != "split-folders" {
+					t.Errorf("%s mounts the supervisor's volume %s", c, vol)
+				}
+			}
+			if p := mounters["split-folders/"+vol]; p == "" || !strings.Contains(out, "chown 0:0 "+p+"\n") || !strings.Contains(out, "chmod 0700 "+p+"\n") {
+				t.Errorf("split-folders does not make the supervisor's volume root's alone (mounted at %q)", p)
+			}
+			vols, _ := spec["volumes"].([]any)
+			found := false
+			for _, v := range vols {
+				vm, _ := v.(map[string]any)
+				if vm["name"] == vol {
+					found = true
+					if _, ok := vm["emptyDir"]; !ok || len(vm) != 2 {
+						t.Errorf("volume %s is %v, want an emptyDir: it must end with the pod", vol, vm)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("no volume %s", vol)
+			}
+		})
+	}
+}
+
 // WASM and V8 isolates in a split worker pod: the root helper starts their
 // hosts in the runtime container, so the pod shares no process namespace,
 // and the two containers meet only where the helper's rules allow, as on a
@@ -911,7 +981,7 @@ func TestChartSingleHasNoSplit(t *testing.T) {
 			if shared, _ := workerSpec(t, out)["shareProcessNamespace"].(bool); shared != tc.shared {
 				t.Errorf("the worker pod shares one process namespace: %v, want %v", shared, tc.shared)
 			}
-			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime", "run-egress", "SB_EGRESS_GATEWAY_SOCKET",
+			for _, bad := range []string{"SB_PRIVILEGE_MODE", "SB_ROOTD_", "rootd-shared", "host-cgroup", "runAsUser: 65531", "split-folders", "run-runtime", "run-egress", "supervisor-state", "SB_EGRESS_GATEWAY_SOCKET",
 				"/srv/isolate-jail", "HostToContainer", "aerolvm-workerd", "supplementalGroups"} {
 				if strings.Contains(out, bad) {
 					t.Errorf("single renders %q", bad)

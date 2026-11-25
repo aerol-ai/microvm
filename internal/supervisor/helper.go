@@ -62,6 +62,14 @@ import (
 // is started again from the same copy, with a growing wait; what it left
 // in its group is killed at once. Sandboxes never depend on the helper
 // being up: none is its child.
+//
+// Floor: no helper older than the one that runs now, or ran last, is ever
+// run. The keeper writes each helper's manifest to its folder of copies
+// before the helper starts (rootswap.WriteFloor), and puts the old one's
+// back on a rollback. A keeper that starts, after this container
+// restarted, reads it back (rootswap.ReadFloor) and checks the first
+// staged helper against it, so a restart does not open the door to an
+// older release the agent stages. A floor it cannot read runs nothing.
 type HelperKeeper struct {
 	// StageDir is the agent's staged folder; BinDir is the supervisor's
 	// own, for verified copies.
@@ -96,6 +104,11 @@ type HelperKeeper struct {
 	started  time.Time
 	sock     *os.File    // the listening socket every helper is handed
 	sockInfo os.FileInfo // the socket file, removed when the keeper stops
+	// floor is the manifest in BinDir's floor file: the helper that ran
+	// last, in this run of the keeper or one before it; nil when none has.
+	// floorRead is set once it was read.
+	floor     *rootswap.Manifest
+	floorRead bool
 	// Looking at the staged folder: the set seen last, the one judged
 	// last, and a staged helper that failed to start and when to try it
 	// again. lastErr keeps an error that repeats every tick to one line.
@@ -200,9 +213,12 @@ func (h *HelperKeeper) Run(ctx context.Context) {
 // look judges the staged set once it has stayed the same for a tick, and
 // installs a verified copy of a helper to run. nil: nothing to do.
 func (h *HelperKeeper) look() *rootswap.Installed {
+	if !h.readFloor() {
+		return nil
+	}
 	fp, err := rootswap.Fingerprint(h.StageDir)
 	if err != nil {
-		h.once("supervisor: cannot read the staged root helper folder", err)
+		h.once("supervisor: cannot read the staged root helper folder", h.StageDir, err)
 		return nil
 	}
 	if fp != h.seen {
@@ -218,7 +234,9 @@ func (h *HelperKeeper) look() *rootswap.Installed {
 		h.refused(err, nil)
 		return nil
 	}
-	var running *rootswap.Manifest
+	// What runs now, or, when nothing has run since this keeper started,
+	// what ran before it: the floor.
+	running := h.floor
 	if h.cur != nil {
 		running = &h.cur.Manifest
 		if m == *running {
@@ -238,38 +256,67 @@ func (h *HelperKeeper) look() *rootswap.Installed {
 		h.refused(err, &m)
 		return nil
 	}
-	h.lastErr = ""
 	return inst
+}
+
+// readFloor reads the floor once, and again on each look while it cannot
+// be read: until it is known, no staged helper runs, since none can be
+// checked against it.
+func (h *HelperKeeper) readFloor() bool {
+	if h.floorRead {
+		return true
+	}
+	floor, err := rootswap.ReadFloor(h.BinDir)
+	if err != nil {
+		h.once("supervisor: cannot read the version of the root helper that ran last; no staged helper runs until it can", h.BinDir, err)
+		return false
+	}
+	h.floor, h.floorRead = floor, true
+	if floor != nil {
+		h.Log.Info("supervisor: no root helper older than the one that ran last will run", "version", floor.Version, "api", floor.API)
+	}
+	return true
+}
+
+// setFloor records m as the floor, before m's helper starts.
+func (h *HelperKeeper) setFloor(m rootswap.Manifest) error {
+	if err := rootswap.WriteFloor(h.BinDir, m); err != nil {
+		return err
+	}
+	h.floor = &m
+	return nil
 }
 
 // refused logs a staged helper root will not run. A refusal other than an
 // older release (an agent rolled back stages one) means a broken build or
-// a broken agent. The line is root's own, in the runtime container's log,
-// where the agent cannot reach it.
+// a broken agent; so does an older release when no helper runs, as after
+// this container restarted: the floor kept it out, and none runs. The line
+// is root's own, in the runtime container's log, where the agent cannot
+// reach it.
 func (h *HelperKeeper) refused(err error, m *rootswap.Manifest) {
 	reason := rootswap.ReasonOf(err)
 	if reason == "" {
 		// Root's own folder failed, not the staged helper: try again on
 		// the next tick, and say so once.
 		h.judged = ""
-		h.once("supervisor: could not check the staged root helper", err)
+		h.once("supervisor: could not check the staged root helper", h.StageDir, err)
 		return
 	}
 	args := []any{"reason", reason, "error", err}
 	if m != nil {
 		args = append(args, "version", m.Version, "api", m.API)
 	}
-	if reason == rootswap.ReasonOlder {
+	if reason == rootswap.ReasonOlder && h.cur != nil {
 		h.Log.Warn("supervisor: kept the running root helper; the staged one is older", args...)
 		return
 	}
 	h.Log.Error("supervisor: refused the staged root helper", args...)
 }
 
-func (h *HelperKeeper) once(msg string, err error) {
+func (h *HelperKeeper) once(msg, dir string, err error) {
 	if err.Error() != h.lastErr {
 		h.lastErr = err.Error()
-		h.Log.Warn(msg, "dir", h.StageDir, "error", err)
+		h.Log.Warn(msg, "dir", dir, "error", err)
 	}
 }
 
@@ -279,6 +326,19 @@ func (h *HelperKeeper) once(msg string, err error) {
 // old copy runs again.
 func (h *HelperKeeper) swap(ctx context.Context, next *rootswap.Installed) {
 	prev := h.cur
+	// The floor goes first: from the moment next runs, nothing older may,
+	// even after this container restarts. A floor that cannot be written
+	// keeps what runs now, and the staged set is judged again next tick.
+	if err := h.setFloor(next.Manifest); err != nil {
+		h.judged = ""
+		h.once("supervisor: could not record the new root helper's version; it does not run until it can", h.BinDir, err)
+		if prev == nil || prev.Path != next.Path {
+			_ = next.Remove()
+		}
+		return
+	}
+	// A set got this far: an error that comes back is logged again.
+	h.lastErr = ""
 	if prev == nil {
 		h.cur, h.child = next, h.startServing(ctx, next)
 		return
@@ -321,6 +381,12 @@ func (h *HelperKeeper) swap(ctx context.Context, next *rootswap.Installed) {
 	}
 	h.Log.Error("supervisor: the new root helper did not start; the old one runs again",
 		"version", next.Manifest.Version, "old", prev.Manifest.Version, "error", err, "retry_in", h.RetryFailed)
+	// next never served: the floor goes back to the helper that runs
+	// again. One left at next is only stricter after a restart.
+	if ferr := h.setFloor(prev.Manifest); ferr != nil {
+		h.Log.Warn("supervisor: could not put the old root helper's version back as the floor; after a restart only the new one or newer runs",
+			"version", prev.Manifest.Version, "error", ferr)
+	}
 	h.failedSHA, h.retryAt = next.Manifest.SHA256, time.Now().Add(h.RetryFailed)
 	h.judged = ""
 	if prev.Path != next.Path {
