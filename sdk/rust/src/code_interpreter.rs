@@ -686,6 +686,10 @@ mod tests {
         AwaitClientClose,
         /// Refuse the handshake with this HTTP status and JSON body.
         Refuse(u16, &'static str),
+        /// Refuse the handshake as Refuse does, but send the body in a
+        /// second write a moment after the header, as a server or proxy
+        /// may.
+        RefuseSplit(u16, &'static str),
     }
 
     /// Answers an interpreter REST call, given its request line and body.
@@ -805,14 +809,21 @@ mod tests {
         (head, body)
     }
 
-    async fn respond(stream: &mut tokio::net::TcpStream, status: u16, body: &str) {
-        let head = format!(
+    fn response_head(status: u16, body: &str) -> String {
+        format!(
             "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             status,
             body.len()
-        );
-        let _ = stream.write_all(head.as_bytes()).await;
-        let _ = stream.write_all(body.as_bytes()).await;
+        )
+    }
+
+    /// Sends the response in one write. A refused WebSocket handshake keeps
+    /// only the body bytes that arrive with the header (tungstenite's
+    /// handshake tail), so a body written after the header could be lost
+    /// on a busy machine; RefuseSplit tests that case on purpose.
+    async fn respond(stream: &mut tokio::net::TcpStream, status: u16, body: &str) {
+        let reply = response_head(status, body) + body;
+        let _ = stream.write_all(reply.as_bytes()).await;
         let _ = stream.shutdown().await;
     }
 
@@ -840,6 +851,15 @@ mod tests {
             let (head, _) = read_head(&mut stream).await;
             log.lock().unwrap().push(format!("ws refused {}", head.lines().next().unwrap_or_default()));
             respond(&mut stream, *status, body).await;
+            return;
+        }
+        if let Some(Step::RefuseSplit(status, body)) = steps.first() {
+            let _ = read_head(&mut stream).await;
+            let _ = stream.write_all(response_head(*status, body).as_bytes()).await;
+            let _ = stream.flush().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stream.write_all(body.as_bytes()).await;
+            let _ = stream.shutdown().await;
             return;
         }
         let ws = tokio_tungstenite::accept_hdr_async(
@@ -899,7 +919,7 @@ mod tests {
                     }
                     return;
                 }
-                Step::Refuse(..) => unreachable!("refuse is only a first step"),
+                Step::Refuse(..) | Step::RefuseSplit(..) => unreachable!("refuse is only a first step"),
             }
         }
         // Read until the client hangs up, so closing never resets the
@@ -1240,6 +1260,24 @@ mod tests {
             Err(Error::Client(message)) => {
                 assert!(message.starts_with("code run websocket handshake failed: status=501"), "{}", message);
                 assert!(message.contains("not implemented"), "{}", message);
+            }
+            other => panic!("want handshake Client error, got {:?}", other),
+        }
+    }
+
+    // A refusal whose body comes after the header, in a second write: the
+    // handshake keeps only what came with the header, so the body may be
+    // missing, but the error still names the status, and a body it does
+    // show is the whole of it. The run does not wait for the rest.
+    #[test]
+    fn run_code_handshake_refusal_in_two_writes_still_names_the_status() {
+        let fake = fake(AGENT, rest_not_found, vec![Step::RefuseSplit(501, r#"{"error":"not implemented"}"#)]);
+        match fake.client.run_code("sb-1", "1", RunCodeOptions::default()) {
+            Err(Error::Client(message)) => {
+                assert!(message.starts_with("code run websocket handshake failed: status=501"), "{}", message);
+                if message.contains("body=") {
+                    assert!(message.contains(r#"not implemented"#), "{}", message);
+                }
             }
             other => panic!("want handshake Client error, got {:?}", other),
         }
