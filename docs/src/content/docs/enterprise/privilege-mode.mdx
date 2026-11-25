@@ -189,7 +189,7 @@ Add `--with-containerd-engine --privilege-mode split` to the [install command](/
 
 - the `sandboxd` user (uid 65531), which the server runs as;
 - `aerolvm-rootd.service`, which runs the helper as root;
-- a locked-down `sandboxd.service`, with no capabilities, `NoNewPrivileges=yes`, `ProtectSystem=strict`, and write access only to its own data, run and certificate folders. With `--with-firecracker`, it can also write under `/srv/jailer`. There the helper makes one stage folder for each VM that `sandboxd` owns. The jails themselves stay root's.
+- a locked-down `sandboxd.service`, with no capabilities, `NoNewPrivileges=yes`, `ProtectSystem=strict`, and write access only to its own data, run and certificate folders. With `--with-firecracker`, it can also write under `/srv/jailer`. There the helper makes one stage folder for each VM that `sandboxd` owns. `sandboxd` cannot write in the jails themselves.
 
 Split also runs image builds in rootless BuildKit: the image builder runs as a normal user too. It works with `--with-isolate` and `--with-firecracker`. [Run the server without root](/getting-started/installer-options/#run-the-server-without-root) on the installer page lists every file and user it makes.
 
