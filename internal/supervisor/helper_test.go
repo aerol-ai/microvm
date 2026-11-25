@@ -362,12 +362,12 @@ func (r *keeperRig) waitStarts(n int) []*fakeChild {
 }
 
 // copiesIn lists the helper copies in a keeper's folder: everything but
-// the floor.
+// the floor and its signature.
 func copiesIn(dir string) []string {
 	ents, _ := os.ReadDir(dir)
 	var out []string
 	for _, e := range ents {
-		if e.Name() != rootswap.FloorName {
+		if e.Name() != rootswap.FloorName && e.Name() != rootswap.FloorSigName {
 			out = append(out, e.Name())
 		}
 	}
@@ -535,7 +535,7 @@ func TestHelperRollback(t *testing.T) {
 			})
 			// v2 never served: the floor is v1's again, so v1 may run
 			// after a restart too.
-			if f, err := rootswap.ReadFloor(r.k.BinDir); err != nil || f == nil || f.Version != "v1.0.0" {
+			if f, err := rootswap.ReadFloor(r.k.BinDir); err != nil || f == nil || f.Manifest.Version != "v1.0.0" {
 				t.Fatalf("floor after the rollback = %+v, %v; want v1.0.0", f, err)
 			}
 			time.Sleep(50 * time.Millisecond) // many ticks: v2 waits for RetryFailed
