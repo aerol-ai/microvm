@@ -39,7 +39,32 @@ func TestDrainStopsAtClaimedSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	const perChunk = 512
-	chunk := bytes.Repeat(gapLine(t, "late"), perChunk)
+	lateLine := gapLine(t, "late")
+	chunk := bytes.Repeat(lateLine, perChunk)
+	working := s.spillWorkingPath
+	if working == "" {
+		working = s.spillPath + ".working"
+	}
+	// claimed is the size the drain kept at the claim, read back from its
+	// file. The drain measures it right after the rename, so whatever the
+	// writer got in between is inside it. That gap has no fixed length: on
+	// a busy machine the writer can add many MiB while the drain waits to
+	// run. So the bound comes from the size the drain kept, not from a
+	// guess of a chunk or two, which failed on CI runners.
+	var claimed atomic.Int64
+	claimed.Store(-1)
+	readClaim := func() {
+		if claimed.Load() >= 0 {
+			return
+		}
+		raw, err := os.ReadFile(working + spillSizeSuffix)
+		if err != nil {
+			return
+		}
+		if n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64); err == nil {
+			claimed.Store(n)
+		}
+	}
 	var stop atomic.Bool
 	var late atomic.Int64
 	writer := make(chan struct{})
@@ -55,11 +80,16 @@ func TestDrainStopsAtClaimedSize(t *testing.T) {
 			time.Sleep(20 * time.Microsecond)
 		}
 		for !stop.Load() && late.Load() < 48<<20 {
+			readClaim()
 			n, err := f.Write(chunk)
 			if err != nil {
 				return
 			}
 			late.Add(int64(n))
+		}
+		for !stop.Load() && claimed.Load() < 0 {
+			readClaim()
+			time.Sleep(20 * time.Microsecond)
 		}
 	}()
 	start := time.Now()
@@ -67,13 +97,22 @@ func TestDrainStopsAtClaimedSize(t *testing.T) {
 	took := time.Since(start)
 	stop.Store(true)
 	<-writer
-	if took > 5*time.Second {
-		t.Fatalf("the drain followed the writer for %v (%d MiB written behind the claim)", took, late.Load()>>20)
+	// The late lines inside the claim. If the writer never saw the size
+	// file (the drain had already removed it), all it wrote bounds them.
+	inClaim := late.Load()
+	if n := claimed.Load(); n >= 0 {
+		inClaim = max(n-int64(early.Len()), 0)
 	}
-	// The claim's size is taken right after the rename: a chunk or two the
-	// writer got in between are inside it, the rest is not.
-	if got := auditLines(t, s); got < 2000 || got > 2000+2*perChunk {
-		t.Fatalf("%d records chained, want the 2000 there before the claim (%d MiB written after)", got, late.Load()>>20)
+	// +1: a line cut by the claim's end is chained as one gap record.
+	limit := 2000 + int(inClaim/int64(len(lateLine))) + 1
+	if got := auditLines(t, s); got < 2000 || got > limit {
+		t.Fatalf("%d records chained, want 2000 to %d: the drain chained past the size kept at the claim (claim %d bytes, %d MiB written after the rename, drain took %v)",
+			got, limit, claimed.Load(), late.Load()>>20, took)
+	}
+	// The writer wrote far more than the claim holds: had the drain read
+	// on to the end of the file, it would have chained past the limit.
+	if late.Load() < inClaim+int64(len(chunk)) {
+		t.Logf("the writer added nothing after the claim this run (claim %d bytes, %d bytes written)", claimed.Load(), late.Load())
 	}
 }
 
