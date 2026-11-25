@@ -283,6 +283,7 @@ We timed creates in both modes on EKS, on 24 November 2026. The cluster had thre
 
   So a bug in `sandboxd` still matters for the sandboxes on that machine. Split stops it from going further: it does not get root on the machine. On Kubernetes, the `agent` container also gets no Kubernetes API credential. The only folder it sees from the machine is a read-only view of the cgroups.
 - **Escapes from a sandbox are the runtime's job.** Split does not make a runtime's wall stronger. Pick gVisor or Firecracker for code you do not trust.
+- **A switch back to `single` trusts what split wrote.** On a server, `single` runs `sandboxd` as root again and uses its data folder as `split` left it: the database, Firecracker templates and saved VM snapshots. The installer removes links and gives the files back to root, and it replaces the Firecracker guest kernel, but it does not check the rest. If in doubt, rebuild your templates after the switch back. If you think the server was broken into, rebuild the machine instead.
 
 ## Check it
 
