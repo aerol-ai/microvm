@@ -4,6 +4,8 @@ Name:         -
 ID:           sb-0000000000000003
 Status:       stopped
 Runtime:      wasm
+Backend:      -
+Warm start:   -
 Image:        -
 CPU:          -
 Memory:       -
