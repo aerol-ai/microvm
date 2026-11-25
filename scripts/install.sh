@@ -5074,6 +5074,15 @@ leave_split_mode() {
 	# every new VM boots it: it goes while the marker still says the switch
 	# is unfinished, so no run, however it stops, keeps it.
 	# finish_firecracker_after_switch_back copies the new one in.
+	# Only a file or a link goes here. sandboxd's user could have made a
+	# folder (or a pipe, a socket, a device) at this path in split; rm -f
+	# cannot remove it, and root does not go into it. A link is removed,
+	# never followed. The run stops with the marker still there, so the
+	# next run, after the operator has looked, finishes the switch.
+	if [[ ! -L "$FIRECRACKER_KERNEL_PATH" && -e "$FIRECRACKER_KERNEL_PATH" && ! -f "$FIRECRACKER_KERNEL_PATH" ]]; then
+		echo "The switch back to privilege mode single stopped: $FIRECRACKER_KERNEL_PATH should be Firecracker's guest kernel file, but it is a folder or another kind of file. sandboxd's user could change it while this node ran in split mode, so the installer does not remove it or look inside it. Check what it holds, remove it (sudo rm -r $FIRECRACKER_KERNEL_PATH), then run install.sh --privilege-mode single again, with your other flags, to finish the switch back." >&2
+		exit 1
+	fi
 	rm -f "$FIRECRACKER_KERNEL_PATH"
 	# Done: from here sandboxd.env alone says this node runs single.
 	rm -f "$PRIVILEGE_SWITCH_BACK_MARKER"
