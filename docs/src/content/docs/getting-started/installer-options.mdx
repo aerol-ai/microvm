@@ -213,6 +213,8 @@ Upgrades work as before when you run the installer again or `sudo sandboxd upgra
 
 Running sandboxes keep running when you switch a server to split mode, when the server restarts, and when the helper restarts. `--privilege-mode single` switches back: the server's files go back to root, the helper stops, and the server runs as root again. The users and the helper's program stay on the server for a later switch.
 
+Only a full installer run switches the mode. `--config-only` refuses a mode other than the one the server runs, because it restarts nothing and moves no files. If a switch back to single stops part way, run the installer again with `--privilege-mode single`: it finishes the switch. Until then it refuses any other run that sets up that server.
+
 A switch either way removes the old upgrade records in `/var/lib/sandboxd/upgrade`. Split mode never uses them, and the server, running without root, could have written them. A switch back to single also removes the server's runtime folders in `/run` (it makes them again when it starts) and every symbolic link in its data folders, before the root server starts.
 
 A switch to split also removes the WebAssembly compile caches that single mode made, before the server starts. Single gives each cache to the WebAssembly worker's user, and split cannot share such a cache with its workers. Split makes new caches, so each module compiles once more after the switch, and the caches work from then on.
