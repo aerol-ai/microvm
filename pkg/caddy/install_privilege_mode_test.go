@@ -18,12 +18,18 @@ import (
 
 // singleUnit is sandboxd.service as install.sh wrote it before privilege
 // mode existed (origin/main at f4e97b0b2), with PREFIX for the install
-// prefix. Single mode must write exactly this.
+// prefix, plus one condition: it does not start while a switch back from
+// split is unfinished (TestInstallRootUnitWaitsForTheSwitchBack in
+// integration-tests/safety). Single mode must write exactly this.
 const singleUnit = `[Unit]
 Description=AerolVM daemon
 After=docker.service caddy.service network-online.target
 Wants=network-online.target
 Requires=docker.service
+# The file named below exists only while a switch back from privilege mode
+# split is unfinished. Root's sandboxd does not start until install.sh
+# --privilege-mode single finishes the switch and removes the file.
+ConditionPathExists=!/etc/sandboxd/privilege-mode-switch-back
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
