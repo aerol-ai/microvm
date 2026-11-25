@@ -666,6 +666,18 @@ by the worker's firewall, which does not count.
   `networkPolicy.extraEgressCIDRs`.
 - A sandbox that should not: stop it, and tell its owner.
 
+## SandboxdRootHelperRefusal
+
+**What it means.** A worker in privilege mode `split` asked its root
+helper for something, and the helper refused. This alert is the same rule
+as in `setup/prometheus/sandboxd-alerts.yml`, so it keeps that name and
+its runbook: [Root helper refusal](secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal).
+It never fires in privilege mode `single`, which has no root helper.
+
+**Check.** The alert's `instance` is the worker pod's address. Find the
+pod from it: `kubectl get pods -A -o wide | grep <address without the port>`.
+Then follow the runbook above.
+
 ## Alerts still to come
 
 The plan lists these alerts too. They wait on a metric or on a later phase:

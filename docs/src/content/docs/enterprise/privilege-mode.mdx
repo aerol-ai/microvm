@@ -55,7 +55,7 @@ flowchart LR
   - writes a `rootd_refusal` record to the audit log;
   - counts in the `aerolvm_rootd_refusals_total` metric, which the `SandboxdRootHelperRefusal` alert reads.
 
-  The alert is in the bundled rules, `setup/prometheus/sandboxd-alerts.yml`. The Helm chart's own alert rules do not have it yet, so on Kubernetes load that rule into your Prometheus yourself.
+  The alert is in the bundled rules, `setup/prometheus/sandboxd-alerts.yml`. On Kubernetes the Helm chart's alert rules carry the same alert when you set `monitoring.enabled=true`. If you loaded the rule into your Prometheus yourself before, remove your copy, so the alert is not loaded twice.
 
 A restart of the helper stops no sandbox. Neither does a restart of `sandboxd`.
 
@@ -307,7 +307,7 @@ On Kubernetes, run [`aerolvm k8s verify`](/kubernetes/security/#check-a-live-ins
 
 - **`sandboxd` will not start, and its log names a setting.** Split cannot run with that setting. Change it, or run the server in `single`. For example: `SB_PRIVILEGE_MODE=split needs SB_CONTAINER_ENGINE=containerd`.
 - **Creates fail with `503`** and the message `the node's root helper is unavailable; retry shortly`. The helper is down or restarting. systemd, or the `runtime` container on Kubernetes, starts it again, so retry after a few seconds. Read its log: `journalctl -u aerolvm-rootd`, or `kubectl logs <worker pod> -c runtime`.
-- **Creates fail with `500`, and the `SandboxdRootHelperRefusal` alert fires** (where you loaded it). The helper refused a request. Treat it as a security event until you rule out a version mismatch. The [root helper refusal runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal) says what to check first.
+- **Creates fail with `500`, and the `SandboxdRootHelperRefusal` alert fires.** The helper refused a request. Treat it as a security event until you rule out a version mismatch. The [root helper refusal runbook](https://github.com/aerol-ai/microvm/blob/main/setup/runbooks/secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal) says what to check first.
 
 ## How it is tested
 
