@@ -140,6 +140,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// with the cancel from signal.NotifyContext.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// sandboxd may also stop on its own, to be started again: Run then
+	// returns why, whichever path it leaves by (selfRestart).
+	restart := &selfRestart{cancel: cancel}
+	defer func() {
+		if r := restart.reason(); r != nil {
+			err = r
+		}
+	}()
 	logger.Info("starting sandboxd", "version", version.Version, "addr", cfg.ListenAddr())
 	configureHostMediatedNodeGuard(cfg, logger)
 	configureEgressRanges(cfg, logger)
@@ -409,7 +417,14 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	svc.SetDockerAuxClient(dockerClient)
 	// Privilege mode split: the root helper does the root work (nil in
 	// single mode, which takes none of the branches below).
-	helper := newRootHelper(cfg, svc)
+	helper := newRootHelper(cfg, svc, func(err error) {
+		// The runtime container started again: its cgroup, and the
+		// sandboxes' parent in it, are new, and every sandbox it held
+		// ended with it. sandboxd reads the parent once, at start.
+		logger.Error("privilege mode split: the root helper holds sandboxes to a new cgroup parent; sandboxd stops to start again with it",
+			"error", err)
+		restart.request(err)
+	})
 	var engineHelper rootHelper
 	if helper != nil {
 		defer func() { _ = helper.Close() }()

@@ -310,15 +310,21 @@ func TestClaimLeftoverIsForgottenWhenARetriedCreateRemovesIt(t *testing.T) {
 	})
 }
 
-// forgetSandbox drops every slot of one sandbox and only those.
-func TestClaimLeftoversForgetSandbox(t *testing.T) {
+// slotsOf is every failed claim of one sandbox, with its address, and
+// none of another's.
+func TestClaimLeftoversSlotsOf(t *testing.T) {
 	var l claimLeftovers
-	l.remember("park-a", "sb-a", "")
-	l.remember("park-b", "sb-a", "")
-	l.remember("park-c", "sb-c", "")
-	l.forgetSandbox("sb-a")
-	l.forgetSandbox("sb-none")
-	if l.holds("sb-a") || !l.holds("sb-c") || l.n.Load() != 1 {
-		t.Fatalf("holds sb-a %v, sb-c %v, n %d", l.holds("sb-a"), l.holds("sb-c"), l.n.Load())
+	if got := l.slotsOf("sb-a"); got != nil {
+		t.Fatalf("empty set: %v", got)
+	}
+	l.remember("park-a", "sb-a", "10.0.0.1")
+	l.remember("park-b", "sb-a", "10.0.0.2")
+	l.remember("park-c", "sb-c", "10.0.0.3")
+	got := l.slotsOf("sb-a")
+	if len(got) != 2 || got["park-a"] != "10.0.0.1" || got["park-b"] != "10.0.0.2" {
+		t.Fatalf("slotsOf(sb-a) = %v", got)
+	}
+	if got := l.slotsOf("sb-none"); len(got) != 0 {
+		t.Fatalf("slotsOf(sb-none) = %v", got)
 	}
 }

@@ -873,8 +873,10 @@ func TestSplitClaimFailurePutsTheBlockBack(t *testing.T) {
 
 // TestSplitClaimFailureDestroysABlockedSlot: through the pool, a split
 // claim that fails part way is destroyed with its block back on: the
-// block goes back before the teardown clears the slot's rules, and the
-// create goes cold.
+// block goes back before the teardown, and the create goes cold. The
+// teardown's clear is the slot's release in split (the helper clears every
+// rule of the address, CreateRules.ClearsOnRelease), so the driver makes
+// none of its own (give_back.go).
 func TestSplitClaimFailureDestroysABlockedSlot(t *testing.T) {
 	r := newClaimRig(t, true)
 	pool := containerdpool.New(nil)
@@ -892,9 +894,14 @@ func TestSplitClaimFailureDestroysABlockedSlot(t *testing.T) {
 		t.Fatal("the slot was not destroyed")
 	}
 	got := r.fw.recorded()
-	lift, block, clear := slices.Index(got, "lift "+claimIP), slices.Index(got, "block "+claimIP), slices.Index(got, "clear-block "+claimIP)
-	if lift < 0 || block < lift || clear < block {
-		t.Fatalf("calls %v: want the lift, then the block back, then the teardown's clears", got)
+	lift, block := slices.Index(got, "lift "+claimIP), slices.Index(got, "block "+claimIP)
+	if lift < 0 || block < lift {
+		t.Fatalf("calls %v: want the lift, then the block back", got)
+	}
+	for _, c := range got[block:] {
+		if strings.HasPrefix(c, "clear-") {
+			t.Fatalf("calls %v: the driver cleared %q itself; in split the slot's release does", got, c)
+		}
 	}
 }
 

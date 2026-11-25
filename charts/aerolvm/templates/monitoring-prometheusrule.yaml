@@ -28,8 +28,9 @@ wrapped, less the alerts the values turn off. */}}
 {{- fail (printf "monitoring.prometheusRule.disabledAlerts: no alert is named %s" .) }}
 {{- end }}
 {{- end }}
-# AerolVM's alerts and per-team usage sums (P6, P9). Each alert's runbook is
-# the heading of the same name in setup/runbooks/kubernetes.md.
+# AerolVM's alerts and per-team usage sums (P6, P9). Each alert's runbook_url
+# names its runbook: for an AerolVM* alert, the heading of the same name in
+# setup/runbooks/kubernetes.md.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:

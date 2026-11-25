@@ -48,6 +48,12 @@ type Pool struct {
 
 	logMu  sync.RWMutex
 	logger *slog.Logger
+
+	// clearAddress clears every firewall rule of an address whose holder is
+	// gone, for Reconcile's reaped slots (SetAddressClearer). Nil when the
+	// host's teardown clears them (privilege mode split) or there is no
+	// firewall.
+	clearAddress func(ip string)
 }
 
 func New(st *store.Store) *Pool {
@@ -88,6 +94,19 @@ func (p *Pool) log() *slog.Logger {
 }
 
 var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// SetAddressClearer sets how Reconcile clears the rules of a reaped slot's
+// address before it frees the slot: in single mode the driver's whole-
+// address clear (containerd Driver.ClearAddressRules). A slot a sandbox
+// or a park held can carry that holder's rules, and a holder gone across a
+// restart never gave its address back through the driver; freed with its
+// rules, the address would hand them to its next sandbox. Call it before
+// Reconcile.
+func (p *Pool) SetAddressClearer(clear func(ip string)) {
+	if p != nil {
+		p.clearAddress = clear
+	}
+}
 
 // lockSlot takes the per-slot host-mutation lock and returns its release.
 func (p *Pool) lockSlot(slotID string) func() {

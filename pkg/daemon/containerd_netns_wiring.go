@@ -133,6 +133,13 @@ func wireNetnsPool(ctx context.Context, cfg config.Config, logger *slog.Logger, 
 			return nil, err
 		}
 		host = inProcess
+		// Single mode: a slot whose holder died across the restart gives
+		// its address back with its rules, as the driver's own releases do
+		// (containerd give_back.go). In split mode the helper's teardown
+		// clears them.
+		if driver != nil {
+			pool.SetAddressClearer(func(ip string) { _ = driver.ClearAddressRules(ip) })
+		}
 	}
 	if reaped, err := pool.Reconcile(ctx, host, netnsSlotOwnerLive(driver, logger), exists, now); err != nil {
 		return nil, fmt.Errorf("reconcile containerd netns pool: %w", err)

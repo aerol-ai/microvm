@@ -208,7 +208,9 @@ func TestInstallRestartsSandboxdBeforeCaddyStarts(t *testing.T) {
 	inOrder(t, local, "write_local_environment", "write_local_systemd_unit", "systemctl daemon-reload",
 		"restart_sandboxd_if_reconfigured", "systemctl enable --now sandboxd sandboxd-healthcheck.timer")
 
-	main := strings.Index(src, "\nrecord_sandboxd_state\ninstall_binaries\nwrite_environment\nwrite_node_settings\n")
+	// mark_switch_back writes no setting of sandboxd's: only the switch-back
+	// marker, after the last download (TestInstallMarksTheSwitchBackOnlyWithTheEnvRewrite).
+	main := strings.Index(src, "\nrecord_sandboxd_state\ninstall_binaries\nmark_switch_back\nwrite_environment\nwrite_node_settings\n")
 	if main < 0 {
 		t.Fatal("the main install path does not record sandboxd's state right before installing the binary and writing its settings")
 	}

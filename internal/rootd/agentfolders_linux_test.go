@@ -5,6 +5,7 @@ package rootd
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -97,5 +98,86 @@ func TestKernelGiveToAgent(t *testing.T) {
 	}
 	if again.Changed != 0 {
 		t.Errorf("second walk changed %d", again.Changed)
+	}
+}
+
+// TestKernelForgetsSingleWasmCaches removes, as root, the WASM compile
+// caches privilege mode single gave the worker's uid, on a node switched
+// to split: the worker's caches go, split's own (the agent's) stay, a link
+// in a cache is removed and what it names is not, and a bind mount inside
+// a cache stops that cache's removal without anything in the mount being
+// touched. Run as root:
+//
+//	go test -run TestKernelForgetsSingleWasmCaches -v ./internal/rootd/
+func TestKernelForgetsSingleWasmCaches(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root: it makes the worker's files and removes them")
+	}
+	const agent, worker = 65531, 61000
+	base := realTemp(t)
+	data := filepath.Join(base, "var-lib-sandboxd")
+	root := filepath.Join(data, "wasm", "modules", "cache", "wazero-compile")
+	chownAll := func(dir string, uid int) {
+		t.Helper()
+		if err := filepath.Walk(dir, func(p string, _ os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			return os.Lchown(p, uid, uid)
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	single := filepath.Join(root, "owners", "owner-0123456789abcdef")
+	write(t, filepath.Join(single, "wazero-v1", "abc"), "compiled")
+	outside := filepath.Join(base, "root-only.txt")
+	write(t, outside, "root's")
+	if err := os.Symlink(outside, filepath.Join(single, "wazero-v1", "link")); err != nil {
+		t.Fatal(err)
+	}
+	chownAll(single, worker)
+	slotCache := filepath.Join(root, "slots", "fedcba9876543210", "cache")
+	write(t, filepath.Join(slotCache, "wazero-v1", "ghi"), "compiled")
+	chownAll(slotCache, worker)
+	split := filepath.Join(root, "owners", "operator")
+	write(t, filepath.Join(split, "wazero-v1", "def"), "compiled")
+	chownAll(split, agent)
+	// A bind mount inside a cache from single: the removal stops there.
+	mounted := filepath.Join(root, "owners", "owner-fedcba9876543210")
+	bind := filepath.Join(mounted, "bind")
+	if err := os.MkdirAll(bind, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	chownAll(mounted, worker)
+	elsewhere := filepath.Join(base, "elsewhere")
+	write(t, filepath.Join(elsewhere, "keep.txt"), "keep")
+	if err := unix.Mount(elsewhere, bind, "", unix.MS_BIND, ""); err != nil {
+		t.Fatalf("bind mount: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Unmount(bind, unix.MNT_DETACH) })
+
+	res, err := GiveToAgent(AgentFolders{Dirs: []string{data}, UID: agent, GID: agent, WasmCacheRoot: root, WasmWorkerUID: worker})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("result %+v", res)
+	if res.ForgottenCaches != 2 || len(res.CacheErrors) != 1 || !strings.Contains(res.CacheErrors[0], "another file system") {
+		t.Fatalf("result %+v, want 2 caches removed and the mounted one left", res)
+	}
+	for p, want := range map[string]bool{
+		single:                                   false,
+		slotCache:                                false,
+		filepath.Join(split, "wazero-v1", "def"): true,
+		outside:                                  true,
+		filepath.Join(bind, "keep.txt"):          true,
+		filepath.Join(elsewhere, "keep.txt"):     true,
+	} {
+		if _, err := os.Lstat(p); (err == nil) != want {
+			t.Errorf("%s there: %v, want %v", p, err == nil, want)
+		}
+	}
+	var st syscall.Stat_t
+	if err := syscall.Lstat(filepath.Join(root, "slots", "fedcba9876543210"), &st); err != nil || st.Uid != agent {
+		t.Errorf("the slot's folder: uid %d, %v; want the agent's", st.Uid, err)
 	}
 }

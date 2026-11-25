@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/store"
 	"github.com/aerol-ai/microvm/pkg/createtiming"
 )
 
@@ -62,21 +63,41 @@ func (h *RuntimeHandoff) Provision(ctx context.Context, sandboxID string) (netns
 }
 
 // Release tears down sandboxID's netns and returns the slot to the pool.
-// Idempotent. The host teardown uses the identity CNI ADD used (which is NOT
-// sandboxID for a claimed prewarmed slot or an adopted warm-park slot). If it
-// fails, the slot is parked as releasing and retried by the refiller rather
-// than freed with its lease and NAT chain still on the node; Release still
-// returns nil then, because the failure is owned by the retry from here on.
+// Idempotent. It is ReleaseOwned with no address to match and no rules to
+// clear: for a caller whose address has no rules of its own.
 func (h *RuntimeHandoff) Release(ctx context.Context, sandboxID string) error {
+	_, err := h.ReleaseOwned(ctx, sandboxID, "", nil)
+	return err
+}
+
+// ReleaseOwned is the one way an address is given back: under the slot's
+// lock it checks that sandboxID still holds the slot (and, when want is
+// set, that the slot has that address), clears the address's rules with
+// clear, then tears the slot down and returns it to the pool. It answers
+// the address it gave back, or "" when there was nothing to do: no slot,
+// another caller gave it back first, or the id holds another slot now.
+//
+// The check, the clear and the release are one step under the lock, so a
+// second caller for the same id finds nothing, and no clear can land after
+// the slot was freed and handed to another sandbox (whose rules it would
+// remove). Rule clears used to run before Release, outside the lock.
+//
+// The host teardown uses the identity CNI ADD used (which is NOT sandboxID
+// for a claimed prewarmed slot or an adopted warm-park slot). If it fails,
+// the slot is parked as releasing and retried by the refiller rather than
+// freed with its lease and NAT chain still on the node; ReleaseOwned still
+// reports the address then, because the failure is owned by the retry from
+// here on, and the rules are already gone.
+func (h *RuntimeHandoff) ReleaseOwned(ctx context.Context, sandboxID, want string, clear func(ip string)) (string, error) {
 	if h == nil || h.pool == nil {
-		return nil
+		return "", nil
 	}
 	slot, err := h.pool.Get(ctx, sandboxID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if slot == nil {
-		return nil
+		return "", nil
 	}
 	locked := slot.SlotID
 	if releaseAfterGet != nil {
@@ -84,23 +105,26 @@ func (h *RuntimeHandoff) Release(ctx context.Context, sandboxID string) error {
 	}
 	unlock := h.pool.lockSlot(locked)
 	defer unlock()
-	// Re-read under the lock: a concurrent Release for the same sandbox may
+	// Re-read under the lock: a concurrent release for the same sandbox may
 	// have freed the slot while we waited, and the refiller may already have
-	// re-realized it for someone else. Only the current owner may tear down,
-	// and only the slot this lock covers.
+	// re-realized it for someone else. Only the current owner may clear and
+	// tear down, and only the slot this lock covers.
 	slot, err = h.pool.Get(ctx, sandboxID)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if slot == nil || slot.SlotID != locked {
-		return nil
+	if slot == nil || slot.SlotID != locked || (want != "" && slot.ContainerIP != want) {
+		return "", nil
+	}
+	if clear != nil && slot.ContainerIP != "" {
+		clear(slot.ContainerIP)
 	}
 	free := func() error { return h.pool.Release(ctx, sandboxID, h.now()) }
 	if h.host == nil {
-		return free()
+		return slot.ContainerIP, free()
 	}
 	_ = h.pool.teardown(ctx, h.host, *slot, sandboxID, free, h.now())
-	return nil
+	return slot.ContainerIP, nil
 }
 
 // Address is the address of the slot sandboxID holds, "" when it holds
@@ -116,6 +140,53 @@ func (h *RuntimeHandoff) Address(ctx context.Context, sandboxID string) (string,
 		return "", err
 	}
 	return slot.ContainerIP, nil
+}
+
+// AddressInPool reports whether any slot of the pool records ip: held,
+// warm, or parked as releasing. The driver asks it only for a sandbox that
+// holds no slot at all, to tell an address the pool never had (a sandbox
+// made before the native pool was turned on: its address went with its
+// container, and its rules are still the driver's to clear) from one the
+// pool has, which only the slot's holder may clear (ReleaseOwned).
+func (h *RuntimeHandoff) AddressInPool(ctx context.Context, ip string) (bool, error) {
+	if h == nil || h.pool == nil || ip == "" {
+		return false, nil
+	}
+	slots, err := h.pool.st.ListNonFreeContainerNetnsSlots(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, s := range slots {
+		if s.ContainerIP == ip {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AddressHolder answers who holds ip in the pool, from one read of the
+// pool's slots: the id of the slot that records ip ("" when a warm or
+// releasing slot records it, or none does), and whether any slot is being
+// built for an owner (reserved: CNI ADD may be giving it an address the row
+// does not record yet). Read-only; for the event path's owner check
+// (containerd Driver.IPOwner), never for a create.
+func (h *RuntimeHandoff) AddressHolder(ctx context.Context, ip string) (holder string, building bool, err error) {
+	if h == nil || h.pool == nil || ip == "" {
+		return "", false, nil
+	}
+	slots, err := h.pool.st.ListNonFreeContainerNetnsSlots(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	for _, s := range slots {
+		if s.ContainerIP == ip {
+			holder = s.SandboxID
+		}
+		if s.State == store.NetnsSlotStateReserved && s.SandboxID != "" && s.ContainerIP == "" {
+			building = true
+		}
+	}
+	return holder, building, nil
 }
 
 // releaseAfterGet is set only by tests, to change the slot's ownership in the

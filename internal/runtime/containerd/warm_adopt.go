@@ -257,11 +257,10 @@ func (d *Driver) discardClaimedSlot(ctx context.Context, slot *containerdpool.Pa
 			"sandbox_id", sandboxID, "slot_id", slot.ID, "claim_error", cause, "error", err, "owner_error", ownerErr)
 		return errClaimLeftover
 	}
-	if d.netns != nil {
-		// The container is gone, so a slot the sandbox id still holds
-		// (the park's, when moving the owner back failed) goes too.
-		_ = d.netns.Release(uctx, sandboxID)
-	}
+	// The container is gone, so a slot the sandbox id still holds (the
+	// park's, when moving the owner back failed) goes too, with whatever
+	// rules the claim put on its address.
+	_, _ = d.giveBack(uctx, giveBackReq{owner: sandboxID, clear: d.wholeAddress})
 	d.warmPool.ReleasePark(slot.ID)
 	return nil
 }
@@ -508,22 +507,17 @@ func (d *Driver) destroyParked(ctx context.Context, slot *containerdpool.ParkedS
 	if err := d.deleteParkedContainer(ctx, slot.ContainerID); err != nil {
 		return err
 	}
-	if slot.ContainerIP != "" {
-		// Every rule of the address, not only the park block: a claim that
-		// failed half way may have put the request's lists there.
-		_ = d.clearAddressRules(slot.ContainerIP)
-	}
-	// Release the prepaid netns slot the park held (keyed by the park slot id,
-	// which equals ContainerID for a parked container). Without this, every park
+	// Give back the prepaid netns slot the park held (keyed by the park slot
+	// id, which equals ContainerID for a parked container), with every rule
+	// of its address, not only the park block: a claim that failed half way
+	// may have put the request's lists there. Without this, every park
 	// teardown — LRU/stale-image evict, idle-TTL reap, shutdown drain, boot
-	// PurgeParkedContainers — permanently leaks a netns slot (row stays adopted
-	// under the dead park id, plus its veth/IPAM lease/conntrack) until the pool
-	// exhausts and cold creates fail with "provision netns: no free slot".
-	// Release is idempotent and a no-op if the slot was already reassigned to an
-	// adopting sandbox.
-	if d.netns != nil && parkKey != "" {
-		_ = d.netns.Release(ctx, parkKey)
-	}
+	// PurgeParkedContainers — permanently leaks a netns slot (row stays
+	// adopted under the dead park id, plus its veth/IPAM lease/conntrack)
+	// until the pool exhausts and cold creates fail with "provision netns:
+	// no free slot". A slot the park no longer holds (reassigned to an
+	// adopting sandbox) is not touched (giveBack).
+	_, _ = d.giveBack(ctx, giveBackReq{owner: parkKey, known: slot.ContainerIP, clear: d.wholeAddress})
 	d.removeContainerFiles(parkKey)
 	// Privilege mode split: the helper's files for the slot (its host
 	// files, FIFOs and its name for the park socket) go too. A no-op in

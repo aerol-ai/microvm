@@ -1028,7 +1028,10 @@ What to check first:
 
 1. **Read the helper's log on that node** for the same window:
    `kubectl logs <worker pod> -c runtime | grep 'root helper refused'`, or
-   `journalctl -u aerolvm-rootd | grep 'root helper refused'`. Leave out
+   `journalctl -u aerolvm-rootd | grep 'root helper refused'`. On
+   Kubernetes the alert's `instance` is the worker pod's address:
+   `kubectl get pods -A -o wide | grep <address without the port>` finds
+   the pod. Leave out
    `call=connect`. If the helper logged more refusals than sandboxd's metric
    and audit log show, sandboxd is hiding them: take the node out of
    service now.

@@ -170,6 +170,13 @@ kube-state-metrics.
 - A crash in containerd or the supervisor: keep the log and open an issue.
 - Check whether other workers restarted too. Several at once point to the
   machines (a kernel or node image change), not to one pod.
+- Privilege mode `split`: after the restart the supervisor starts the root
+  helper that ran before again, from its own checked copy. If the `runtime`
+  log says `the root helper that ran last cannot start again` and then
+  `refused the staged root helper` with `reason=older`, no helper runs on
+  that worker and its creates fail with `503`. Delete the pod:
+  `kubectl -n <namespace> delete pod <pod>`. The new pod starts with no
+  record of an older helper and runs the one its `agent` stages.
 
 ## AerolVMPodImagePullStuck
 
@@ -665,6 +672,18 @@ by the worker's firewall, which does not count.
   purpose, with an egress profile in AerolVM and the same range in
   `networkPolicy.extraEgressCIDRs`.
 - A sandbox that should not: stop it, and tell its owner.
+
+## SandboxdRootHelperRefusal
+
+**What it means.** A worker in privilege mode `split` asked its root
+helper for something, and the helper refused. This alert is the same rule
+as in `setup/prometheus/sandboxd-alerts.yml`, so it keeps that name and
+its runbook: [Root helper refusal](secrets-and-audit.md#root-helper-refusal-sandboxdroothelperrefusal).
+It never fires in privilege mode `single`, which has no root helper.
+
+**Check.** The alert's `instance` is the worker pod's address. Find the
+pod from it: `kubectl get pods -A -o wide | grep <address without the port>`.
+Then follow the runbook above.
 
 ## Alerts still to come
 
