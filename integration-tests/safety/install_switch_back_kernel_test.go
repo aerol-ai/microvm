@@ -29,6 +29,16 @@ curl_download() {
 	esac
 }
 install() { echo "install $*" >>"$LOG"; command install "$@"; }
+mktemp() {
+	local d
+	if [[ "$*" == -d ]]; then
+		d="$(command mktemp -d "$TMPDIR/tmp.XXXXXX")"
+	else
+		d="$(command mktemp "$@")"
+	fi
+	echo "mktemp $d" >>"$LOG"
+	echo "$d"
+}
 `
 
 type kernelHost struct {
@@ -88,7 +98,11 @@ func (h *kernelHost) run(mode, previous string) (calls, out string, ok bool) {
 	}
 	log := filepath.Join(h.dir, "calls.log")
 	_ = os.Remove(log)
-	script := "set -euo pipefail\nPATH='" + h.bin + "'\nLOG='" + log + "'\nTMPDIR='" + filepath.Join(h.dir, "tmp") + "'\n" +
+	// TMPDIR is exported, so GNU mktemp, a program, reads it from its
+	// environment; the mktemp stand-in also names it, as macOS's mktemp -d
+	// does not read TMPDIR. Either way the temp folders land where the test
+	// looks for leftovers.
+	script := "set -euo pipefail\nPATH='" + h.bin + "'\nLOG='" + log + "'\nexport TMPDIR='" + filepath.Join(h.dir, "tmp") + "'\n" +
 		"HOME='" + filepath.Join(h.dir, "home") + "'\n" +
 		"PRIVILEGE_MODE='" + mode + "'\nPREVIOUS_PRIVILEGE_MODE='" + previous + "'\n" +
 		"FIRECRACKER_KERNEL_PATH='" + h.single + "'\nFIRECRACKER_TEMPLATES_DIR='" + h.template + "'\n" +
@@ -154,7 +168,13 @@ func TestInstallSwitchBackReplacesTheGuestKernel(t *testing.T) {
 		if after := calls[strings.Index(calls, "CLEANUP"):]; strings.Contains(after, "curl_download") {
 			t.Fatalf("downloaded after the cleanup:\n%s", calls)
 		}
-		if entries, _ := os.ReadDir(filepath.Join(h.dir, "tmp")); len(entries) != 0 {
+		// The folders were made in the test's TMPDIR (so the check below
+		// can see a leftover), and none is left.
+		tmp := filepath.Join(h.dir, "tmp")
+		if n := strings.Count(calls, "mktemp "+tmp+"/"); n < 2 || strings.Count(calls, "mktemp ") != n {
+			t.Fatalf("want every temp folder (the release's and the download's) in %s:\n%s", tmp, calls)
+		}
+		if entries, _ := os.ReadDir(tmp); len(entries) != 0 {
 			t.Errorf("left %d folders in TMPDIR", len(entries))
 		}
 	})
