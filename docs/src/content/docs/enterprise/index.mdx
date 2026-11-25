@@ -68,6 +68,7 @@ Each feature is **Default** (on with no setup), **You turn it on**, or **Propose
 | Isolation | Five runtimes, from containers to Firecracker microVMs | Containers by default | [Sandboxes](/sandboxes/) |
 | Isolation | CPU, memory and disk limits | Default | [Security baseline](/enterprise/security-controls/#workload-isolation) |
 | Isolation | Lifetime timers that stop or delete sandboxes | You turn it on | [Lifecycle](/lifecycle/) |
+| Isolation | The server runs without root: a small helper does the root work and checks each request | You turn it on | [Run the server without root](/enterprise/privilege-mode/) |
 | Network | Private by default: no public route until you share a port | Default | [Public URLs](/public-urls/) |
 | Network | Outbound policy: block everything, or allow named sites | You turn it on | [Network access](/network-access/) |
 | Data | Secrets sealed with AES-256-GCM | Default | [Security baseline](/enterprise/security-controls/#data-protection) |
@@ -113,6 +114,7 @@ flowchart LR
 | What keeps a sandbox off the server? | The runtime. Containers share the server's kernel. gVisor and Firecracker put a stronger wall in between. | [Workload isolation](/enterprise/security-controls/#workload-isolation) |
 | What can a new sandbox reach? | The internet and your private network, until you set a policy. V8 isolates are the exception. | [Network security](/enterprise/security-controls/#network-security) |
 | Who can reach a new sandbox? | No one, until you share a port. | [Network security](/enterprise/security-controls/#network-security) |
+| Does the server's own code run as root? | By default, yes. In privilege mode split, the code that reads requests has no rights, and a small helper checks every root action. | [Run the server without root](/enterprise/privilege-mode/) |
 | Where do secrets live? | Sealed on the server. Every time one is opened, a record is written. | [Data protection](/enterprise/security-controls/#data-protection) |
 | Can an AI agent leak an API key? | Not with an inject rule. The sandbox only ever holds a placeholder. | [Data protection](/enterprise/security-controls/#data-protection) |
 | Who can call the API? | Anyone with the server token, by default. With access control on, each person signs in with your company account and each service gets its own token, each with one role on one team. Enterprise mode limits the server token to the server. | [SSO](/enterprise/sso/) |
