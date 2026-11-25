@@ -420,11 +420,13 @@ func TestSweep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := WriteFloor(l.bin, keep.Manifest); err != nil {
+	if err := WriteFloor(l.bin, signedFor(t, l.priv, []byte("helper"), "v1.0.0")); err != nil {
 		t.Fatal(err)
 	}
-	// A half-written floor is swept; the floor itself never is.
-	for _, n := range []string{"aerolvm-rootd-v0.9.0-0123456789abcdef", ".aerolvm-rootd.0123456789abcdef", ".aerolvm-rootd.floor.0123456789abcdef", "notes.txt"} {
+	// A half-written floor or floor signature is swept; the floor itself
+	// never is.
+	for _, n := range []string{"aerolvm-rootd-v0.9.0-0123456789abcdef", ".aerolvm-rootd.0123456789abcdef", ".aerolvm-rootd.floor.0123456789abcdef",
+		".aerolvm-rootd.floor.sig.0123456789abcdef", "notes.txt"} {
 		if err := os.WriteFile(filepath.Join(l.bin, n), nil, 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -433,13 +435,13 @@ func TestSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Join(binEntries(t, l.bin), ",")
-	if got != filepath.Base(keep.Path)+","+FloorName+",notes.txt" {
+	if got != filepath.Base(keep.Path)+","+FloorName+","+FloorSigName+",notes.txt" {
 		t.Fatalf("left %s", got)
 	}
 	if err := Sweep(l.bin); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(binEntries(t, l.bin), ","); got != FloorName+",notes.txt" {
+	if got := strings.Join(binEntries(t, l.bin), ","); got != FloorName+","+FloorSigName+",notes.txt" {
 		t.Fatalf("left %s", got)
 	}
 }

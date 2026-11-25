@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"log/slog"
@@ -28,6 +29,7 @@ import (
 	"github.com/aerol-ai/microvm/internal/privmode"
 	"github.com/aerol-ai/microvm/internal/rootclient"
 	"github.com/aerol-ai/microvm/internal/rootd"
+	"github.com/aerol-ai/microvm/internal/rootd/rootdpb"
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	cntr "github.com/aerol-ai/microvm/internal/runtime/containerd"
 	"github.com/aerol-ai/microvm/internal/service"
@@ -607,6 +609,15 @@ func splitHelper(t *testing.T, sock string) *stubNetwork {
 // splitHelperWith is splitHelper with a change to the helper's config.
 func splitHelperWith(t *testing.T, sock string, config func(*rootd.Config)) *stubNetwork {
 	t.Helper()
+	net, _ := splitHelperServer(t, sock, config, nil)
+	return net
+}
+
+// splitHelperServer is splitHelperWith that also returns the server, to
+// stop it, and takes the handler containerd's API meets behind it (gate):
+// nil answers containerd's Version alone, as containerd 2.1.4.
+func splitHelperServer(t *testing.T, sock string, config func(*rootd.Config), gate func(any, grpc.ServerStream) error) (*stubNetwork, *rootd.Server) {
+	t.Helper()
 	base := filepath.Dir(filepath.Dir(sock))
 	cfg := rootd.Config{
 		Socket: sock, SocketGID: os.Getgid(), AgentUID: uint32(os.Getuid()),
@@ -624,10 +635,8 @@ func splitHelperWith(t *testing.T, sock string, config func(*rootd.Config)) *stu
 		config(&cfg)
 	}
 	net := &stubNetwork{ns: map[string]rootd.NetnsState{}}
-	srv, err := rootd.New(cfg, rootd.Options{
-		Peer:    egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, ""),
-		Network: net,
-		Containerd: func(_ any, ss grpc.ServerStream) error {
+	if gate == nil {
+		gate = func(_ any, ss grpc.ServerStream) error {
 			if name, _ := grpc.MethodFromServerStream(ss); name != "/containerd.services.version.v1.Version/Version" {
 				return status.Errorf(codes.Unavailable, "no containerd behind this test helper (%s)", name)
 			}
@@ -635,14 +644,19 @@ func splitHelperWith(t *testing.T, sock string, config func(*rootd.Config)) *stu
 				return err
 			}
 			return ss.SendMsg(&versionapi.VersionResponse{Version: "2.1.4", Revision: "test"})
-		},
+		}
+	}
+	srv, err := rootd.New(cfg, rootd.Options{
+		Peer:       egress.UnixPeerCheck([]uint32{uint32(os.Getuid())}, ""),
+		Network:    net,
+		Containerd: gate,
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	go func() { _ = srv.Serve() }()
 	t.Cleanup(func() { srv.Shutdown(context.Background()) })
-	return net
+	return net, srv
 }
 
 // stubNetwork is rootd.NetworkHost in memory.
@@ -773,6 +787,114 @@ func TestRun_SplitModeParentMoved(t *testing.T) {
 	if d := time.Since(start); d >= helperBootWait {
 		t.Fatalf("Run took %v: a moved parent was waited out like a helper that is down", d)
 	}
+}
+
+// TestRun_SplitModeParentMovedAfterBoot: the runtime container starts
+// again while sandboxd runs, and its new helper holds sandboxes to a new
+// cgroup parent. sandboxd finds out on its next containerd connection (the
+// event monitor's here, as on a worker), stops as on a signal, and Run
+// returns the ParentMovedError naming both parents, so the kubelet starts
+// it again. The new helper's gate refuses every containerd call it gets,
+// and none is counted, or audited, as a refusal: no call reached it.
+func TestRun_SplitModeParentMovedAfterBoot(t *testing.T) {
+	setBaseRunEnv(t)
+	dir, err := os.MkdirTemp("/tmp", "sp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	if dir, err = filepath.EvalSymlinks(dir); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "sock", "root.sock")
+	net, first := splitHelperServer(t, sock, nil, nil)
+	origUID := rootHelperUID
+	t.Cleanup(func() { rootHelperUID = origUID })
+	rootHelperUID = uint32(os.Getuid())
+	t.Setenv("SB_PRIVILEGE_MODE", "split")
+	t.Setenv("SB_ROOTD_SOCKET", sock)
+	t.Setenv("SB_CONTAINER_ENGINE", "containerd")
+	t.Setenv("SB_CONTAINERD_NATIVE_NETNS_POOL_ENABLED", "true")
+	t.Setenv("SB_CONTAINERD_NETNS_POOL_SIZE", "2")
+	t.Setenv("SB_CONTAINERD_NETNS_POOL_DEPTH", "1")
+	t.Setenv("SB_CONTAINERD_RUN_DIR", filepath.Join(dir, "ctr"))
+	t.Setenv("SB_EGRESS_FQDN_ENABLED", "false")
+	t.Setenv("SB_ENABLE_EVENT_MONITOR", "true")
+	refusalsBefore := rootRefusalsCounted()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, testLogger(), nil) }()
+	// Booted: the netns pool built a namespace through the first helper.
+	booted := time.Now().Add(30 * time.Second)
+	for {
+		net.mu.Lock()
+		built := net.next > 0
+		net.mu.Unlock()
+		if built {
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("Run stopped while booting: %v", err)
+		default:
+		}
+		if time.Now().After(booted) {
+			t.Fatal("sandboxd did not boot against the first helper")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The runtime container starts again: a new helper, a new parent, and
+	// a gate that refuses whatever reaches it.
+	const moved = "/kubepods/pod1/ctr-b/sandboxes"
+	first.Shutdown(context.Background())
+	var reached sync.Map
+	splitHelperServer(t, sock, func(c *rootd.Config) { c.Policy.CgroupParent = moved }, func(_ any, ss grpc.ServerStream) error {
+		name, _ := grpc.MethodFromServerStream(ss)
+		reached.Store(name, true)
+		return rootdpb.Refused(codes.InvalidArgument, "cgroup", "test gate: refused")
+	})
+	start := time.Now()
+	select {
+	case err := <-done:
+		var pm *rootclient.ParentMovedError
+		if !errors.As(err, &pm) || pm.Helper != moved || pm.Agent != "/aerolvm" || !strings.Contains(err.Error(), "sandboxd stopped to be started again") {
+			t.Fatalf("Run = %v, want it stopped for a ParentMovedError from /aerolvm to %s", err, moved)
+		}
+		t.Logf("sandboxd stopped %v after the new helper came up", time.Since(start))
+	case <-ctx.Done():
+		t.Fatal("sandboxd kept running against a helper whose cgroup parent moved")
+	}
+	reached.Range(func(name, _ any) bool {
+		t.Errorf("containerd call %v reached the new helper's gate", name)
+		return true
+	})
+	if after := rootRefusalsCounted(); after != refusalsBefore {
+		t.Fatalf("refusals counted went from %d to %d", refusalsBefore, after)
+	}
+}
+
+// rootRefusalsCounted sums aerolvm_rootd_refusals_total: every refusal the
+// helper's client hears is counted there, and audited through the same
+// call (rootclient refused).
+func rootRefusalsCounted() int64 {
+	var n int64
+	m, _ := expvar.Get("aerolvm_rootd_refusals_total").(*expvar.Map)
+	if m == nil {
+		return 0
+	}
+	m.Do(func(kv expvar.KeyValue) {
+		if inner, ok := kv.Value.(*expvar.Map); ok {
+			inner.Do(func(kv expvar.KeyValue) {
+				if v, ok := kv.Value.(*expvar.Int); ok {
+					n += v.Value()
+				}
+			})
+		}
+	})
+	return n
 }
 
 // TestRun_SplitModeRefusals: a split node this build cannot run stops at

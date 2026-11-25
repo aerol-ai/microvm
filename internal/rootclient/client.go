@@ -287,9 +287,6 @@ type Client struct {
 	cgroupParent string
 	onMoved      func(error)
 	moved        atomic.Bool
-	// ctrDials counts the containerd connections dialed: each after the
-	// first is a reconnect, perhaps to a helper that came back.
-	ctrDials atomic.Uint64
 }
 
 // New returns a client. It does not dial: the first call does.
@@ -962,32 +959,29 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 	return conn, nil
 }
 
-// DialContainerd is the dialer containerd's client uses: it makes sure
-// the helper has shaken hands, then connects to its socket, where the gate
-// answers containerd's API. A helper that is down, too old, or whose
-// cgroup parent moved fails the dial with the handshake's error.
+// DialContainerd is the dialer containerd's client uses: it shakes hands
+// with the helper, then connects to its socket, where the gate answers
+// containerd's API. A helper that is down, too old, or whose cgroup parent
+// moved fails the dial with the handshake's error.
 //
-// A dial after the first is a reconnect: the helper the last handshake
-// reached may be gone, swapped for a newer one or started again with its
-// runtime container. So the handshake runs again first (recheck), and a
-// helper whose parent moved is found before any container reaches its
-// gate. One Version call per reconnect; the first dial and every call on
-// an open connection add none.
+// Every containerd connection is made right after a handshake of its own
+// (recheck), the first one too: the helper the client last shook hands
+// with may be gone, swapped for a newer one or started again with its
+// runtime container, and a containerd client made after that (the event
+// monitor's, say) would otherwise reach the new helper's gate on the old
+// handshake. So a helper whose parent moved is found before any container
+// reaches its gate. One Version call per containerd connection; calls on an
+// open connection add none.
 func (c *Client) DialContainerd(ctx context.Context, _ string) (net.Conn, error) {
-	if err := c.Ensure(ctx); err != nil {
+	if err := c.recheck(ctx); err != nil {
 		return nil, err
-	}
-	if c.ctrDials.Add(1) > 1 {
-		if err := c.recheck(ctx); err != nil {
-			return nil, err
-		}
 	}
 	return c.dial(ctx)
 }
 
 // recheck shakes hands with the helper again, on the current connection,
 // even with the latch set: callers that recheck at once share one
-// handshake. With no session it is Ensure.
+// handshake. With no session it is Ensure, whose handshake is fresh.
 func (c *Client) recheck(ctx context.Context) error {
 	s := c.sess.Load()
 	if s == nil {

@@ -170,6 +170,13 @@ kube-state-metrics.
 - A crash in containerd or the supervisor: keep the log and open an issue.
 - Check whether other workers restarted too. Several at once point to the
   machines (a kernel or node image change), not to one pod.
+- Privilege mode `split`: after the restart the supervisor starts the root
+  helper that ran before again, from its own checked copy. If the `runtime`
+  log says `the root helper that ran last cannot start again` and then
+  `refused the staged root helper` with `reason=older`, no helper runs on
+  that worker and its creates fail with `503`. Delete the pod:
+  `kubectl -n <namespace> delete pod <pod>`. The new pod starts with no
+  record of an older helper and runs the one its `agent` stages.
 
 ## AerolVMPodImagePullStuck
 
