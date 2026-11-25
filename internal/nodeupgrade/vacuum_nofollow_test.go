@@ -329,3 +329,55 @@ func TestVacuumIntoNoFollowRefusesAFileThatIsNoDatabase(t *testing.T) {
 		t.Fatalf("left behind: %v", left)
 	}
 }
+
+// A link to a regular file elsewhere, swapped in for the database between
+// the backup's look and its own open, is refused there and copies nothing.
+// Each refusal is pinned to its own check: a symbolic link to the open's
+// O_NOFOLLOW, a hard link (a regular file, which O_NOFOLLOW does not stop)
+// to the check that the file opened is the one looked at. The FIFO case
+// above cannot tell them apart: its regular-file check refuses it anyway.
+func TestVacuumIntoNoFollowRefusesALinkSwappedInAtTheOpen(t *testing.T) {
+	for name, tc := range map[string]struct {
+		link func(target, at string) error
+		want string
+	}{
+		"symbolic link": {os.Symlink, "without following a link"},
+		"hard link":     {os.Link, "changed between the look at it and its open"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "state.db")
+			makeWALDB(t, path, "ours")
+			other := filepath.Join(dir, "elsewhere", "other.db")
+			if err := os.MkdirAll(filepath.Dir(other), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			makeWALDB(t, other, "not ours")
+			swapped := false
+			testHookVacuumOpen = func(at string) {
+				if at != "open" {
+					return
+				}
+				if err := os.Rename(path, path+".real"); err != nil {
+					t.Error(err)
+				}
+				if err := tc.link(other, path); err != nil {
+					t.Error(err)
+				}
+				swapped = true
+			}
+			t.Cleanup(func() { testHookVacuumOpen = nil })
+			dest := filepath.Join(dir, "copy.db")
+			err := withinSeconds(t, 10, func() error { return VacuumIntoNoFollow(context.Background(), path, dest) })
+			if !swapped {
+				t.Fatal("the backup never reached its open")
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			if _, err := os.Stat(dest); !os.IsNotExist(err) {
+				t.Fatalf("a refused copy left %s: %v", dest, err)
+			}
+		})
+	}
+}

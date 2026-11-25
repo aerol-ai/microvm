@@ -508,9 +508,10 @@ func (r *restorer) extract(file string) error {
 
 // testHookRestore, when set, runs at points where a name the restore works
 // on could be swapped: "write" with an entry's path, once the folder that
-// holds it is open; "temp" with a regular file's temporary name, once its
-// content is written; "keys" with the data folder, after the archive is
-// written. Tests swap files there.
+// holds it is open; "folder" with a folder entry's path, once the folder
+// itself is open and before its mode is set; "temp" with a regular file's
+// temporary name, once its content is written; "keys" with the data
+// folder, after the archive is written. Tests swap files there.
 var testHookRestore func(stage, path string)
 
 // Every entry below the config folder or the data folder is written
@@ -687,6 +688,9 @@ func (r *restorer) folder(dir int, base, name string, h *tar.Header) error {
 	}
 	f := os.NewFile(uintptr(fd), dst)
 	defer f.Close()
+	if testHookRestore != nil {
+		testHookRestore("folder", dst)
+	}
 	if err := f.Chmod(mode); err != nil {
 		return err
 	}
