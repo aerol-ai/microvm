@@ -499,8 +499,26 @@ output "joiner_join_everything_single" {
 }
 
 # Single with Firecracker on: Terraform installs it itself, as before, so
-# install.sh gets no --with-firecracker, and the jailer runs as uid 1000.
+# install.sh gets no --with-firecracker. With no jailer ids set (nodes.tf's
+# default) the bootstrap makes the sandboxd-jailer user and writes its ids.
 output "joiner_join_firecracker" {
+  value = templatefile("__TEMPLATE__", merge(local.base, {
+    is_seed                = false
+    role                   = "worker"
+    one_line_join          = true
+    join_token             = "aaaaaa.00000000000000000000000000000000"
+    with_firecracker       = true
+    firecracker_use_jailer = true
+    firecracker_jailer_uid = null
+    firecracker_jailer_gid = null
+  }))
+}
+
+# The same with jailer ids set in tfvars: written as they are, no user made.
+# With 1000 (the old default) it renders byte for byte what
+# joiner_join_firecracker rendered before the jailer got a user of its own,
+# so a cluster that sets them keeps its nodes (single_renders.sha256).
+output "joiner_join_firecracker_own_ids" {
   value = templatefile("__TEMPLATE__", merge(local.base, {
     is_seed                = false
     role                   = "worker"

@@ -538,6 +538,14 @@ What the play actually does, per host:
    The defaults are pinned to a known-good combination (see below), and the
    playbook fails fast if the config does not enable `CONFIG_VMGENID=y`.
 6. Creates `firecracker.run_dir`, `templates_dir`, and `jailer_chroot_base`.
+7. In privilege mode single, makes `sandboxd-jailer`, the system user the
+   jailer runs every VM as (its own group, no login shell, no other group),
+   as `install.sh --with-firecracker` does. It writes the user's ids as
+   `SB_JAILER_UID` and `SB_JAILER_GID` to the env file the play manages,
+   and sandboxd restarts. This replaces the uid 1000 a Terraform bootstrap
+   wrote before: on Ubuntu and Amazon Linux that is the login user, and
+   sandboxd no longer starts Firecracker as a user with a login shell or
+   sudo. In split, `install.sh` makes the user and writes its ids.
 
 ### Pins and overrides
 

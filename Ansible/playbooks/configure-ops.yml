@@ -710,6 +710,55 @@
       ansible.builtin.command: "grep -qx CONFIG_VMGENID=y {{ sandboxd_firecracker_kernel_path }}.config"
       changed_when: false
 
+    # The jailer runs every VM as one user. In single this play makes it as
+    # install.sh --with-firecracker does: sandboxd-jailer, a system user with
+    # no login shell and a group of its own, and writes its ids. That
+    # replaces the 1000 a Terraform bootstrap wrote before (on Ubuntu and
+    # Amazon Linux the login user, which sandboxd refuses). In split
+    # install.sh made the user and wrote its ids (the unit check above
+    # refuses a split node it did not set up for Firecracker).
+    - name: Make the jailer's group (single)
+      when:
+        - firecracker.enabled | default(false) | bool
+        - sandboxd_privilege_mode != 'split'
+      ansible.builtin.group:
+        name: sandboxd-jailer
+        system: true
+      register: sandboxd_jailer_group
+
+    - name: Make the jailer's system user (single)
+      when:
+        - firecracker.enabled | default(false) | bool
+        - sandboxd_privilege_mode != 'split'
+      ansible.builtin.user:
+        name: sandboxd-jailer
+        group: sandboxd-jailer
+        groups: []
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+      register: sandboxd_jailer_user
+
+    # Check mode makes no user, so it has no ids to write.
+    - name: Point the jailer at its system user (single)
+      when:
+        - firecracker.enabled | default(false) | bool
+        - sandboxd_privilege_mode != 'split'
+        - sandboxd_jailer_user.uid is defined
+        - sandboxd_jailer_group.gid is defined
+      ansible.builtin.lineinfile:
+        path: "{{ sandboxd_ops_env_file }}"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: false
+        mode: "0600"
+        owner: root
+        group: root
+      loop:
+        - { key: SB_JAILER_UID, value: "{{ sandboxd_jailer_user.uid }}" }
+        - { key: SB_JAILER_GID, value: "{{ sandboxd_jailer_group.gid }}" }
+      notify: Apply sandboxd ops config
+
     # Upstream wrap key (Phase 4 F17). Two delivery modes:
     #   * shared SoT      -> aocr.upstream_wrap_key in config/secrets.yml
     #   * control-node file -> sandboxd_upstream_wrap_key_src (fleet / Vault rendering)
