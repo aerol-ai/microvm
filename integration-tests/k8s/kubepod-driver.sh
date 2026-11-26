@@ -76,6 +76,30 @@ kind load docker-image --name "$cluster" "$toolbox_image" "$test_image" "$sandbo
 cleanup_work
 
 echo "== namespaces, RuntimeClass, the worker's Role"
+# RuntimeClass is cluster-wide: one named runc that was already there is
+# used as it is, and left in place at the end.
+made_runtimeclass=0
+if ! k get runtimeclass runc >/dev/null 2>&1; then
+  k apply -f - >/dev/null <<EOF
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: runc
+handler: runc
+EOF
+  made_runtimeclass=1
+fi
+# From here on, any exit (a failed step included) removes what this run
+# made, unless AEROL_KUBEPOD_KEEP=1.
+# shellcheck disable=SC2329 # called from the EXIT trap below
+cleanup_cluster() {
+  [[ "${AEROL_KUBEPOD_KEEP:-}" == 1 ]] && return 0
+  k delete namespace "$worker_ns" "$sandbox_ns" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  if [[ "$made_runtimeclass" == 1 ]]; then
+    k delete runtimeclass runc --ignore-not-found >/dev/null 2>&1 || true
+  fi
+}
+trap 'cleanup_work; cleanup_cluster' EXIT
 k apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Namespace
@@ -90,12 +114,6 @@ metadata:
   name: $sandbox_ns
   labels:
     pod-security.kubernetes.io/enforce: baseline
----
-apiVersion: node.k8s.io/v1
-kind: RuntimeClass
-metadata:
-  name: runc
-handler: runc
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -194,7 +212,8 @@ EOF
 
 phase=Pending
 for _ in $(seq 1 240); do
-  phase="$(k -n "$worker_ns" get pod kubepod-driver-test -o jsonpath='{.status.phase}')"
+  # One failed read (an API server hiccup) is tried again, not the end.
+  phase="$(k -n "$worker_ns" get pod kubepod-driver-test -o jsonpath='{.status.phase}' 2>/dev/null || echo unread)"
   [[ "$phase" == Succeeded || "$phase" == Failed ]] && break
   sleep 3
 done
@@ -205,14 +224,13 @@ else
   echo "FAIL TestKindDriver: the test pod ended $phase"
   failed=1
 fi
-left="$(k -n "$sandbox_ns" get pods -o name)"
-if [[ -n "$left" ]]; then
+if ! left="$(k -n "$sandbox_ns" get pods -o name 2>&1)"; then
+  echo "FAIL could not list the sandbox namespace: $left"
+  failed=1
+elif [[ -n "$left" ]]; then
   echo "FAIL sandbox pods left behind: $left"
   failed=1
 fi
-
-if [[ "${AEROL_KUBEPOD_KEEP:-}" != 1 ]]; then
-  k delete namespace "$worker_ns" "$sandbox_ns" --wait=false >/dev/null
-  k delete runtimeclass runc --ignore-not-found >/dev/null
-fi
+# The EXIT trap removes the namespaces, and the RuntimeClass if this run
+# made it.
 exit "$failed"

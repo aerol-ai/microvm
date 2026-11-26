@@ -704,6 +704,8 @@ func TestInspect(t *testing.T) {
 		{"node lost", withPhase(podOf("worker-0", testID), "Unknown"), false, models.SandboxStatusStarted, false, false},
 		{"ended", withPhase(podOf("worker-0", testID), PhaseSucceeded), false, models.SandboxStatusStopped, false, false},
 		{"stopping, still running", stopping, false, models.SandboxStatusStarted, true, false},
+		{"stopping, never ran", &Pod{Metadata: stopping.Metadata, Status: &PodStatus{Phase: PhasePending}}, false, models.SandboxStatusStopped, false, false},
+		{"stopping, no status", &Pod{Metadata: stopping.Metadata}, false, models.SandboxStatusStopped, false, false},
 		{"stopped: spec, no pod", nil, true, models.SandboxStatusStopped, false, false},
 		{"gone: no spec, no pod", nil, false, "", false, true},
 		{"another worker's pod, no spec", podOf("worker-7", testID), false, "", false, true},
@@ -786,11 +788,16 @@ func TestListManaged(t *testing.T) {
 		t.Errorf("list calls = %d, want 2 pages", n)
 	}
 
+	// One damaged spec leaves the rest listed; that sandbox's Inspect is an
+	// unknown answer, so reconcile keeps its row.
 	if err := os.WriteFile(d.specs.path("sb-bad"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.ListManaged(context.Background()); err == nil {
-		t.Error("ListManaged with an unreadable spec: want an error")
+	if got, err := d.ListManaged(context.Background()); err != nil || len(got) != listPageSize+5+2 {
+		t.Errorf("ListManaged with one damaged spec = %d, %v; want the other %d", len(got), err, listPageSize+5+2)
+	}
+	if st, err := d.Inspect(context.Background(), "sb-bad"); err == nil || sbruntime.InstanceGone(st, err) {
+		t.Errorf("Inspect of the damaged one = %v, %v: want unknown, not gone", st, err)
 	}
 	f.setFail("GET ", 403, false)
 	if _, err := d.ListManaged(context.Background()); err == nil || !strings.Contains(err.Error(), "403") {

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/opencontainers/go-digest"
+
 	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -57,13 +59,15 @@ var initResources = map[string]string{"cpu": "100m", "memory": "64Mi"}
 // emptyDir, which needs no root.
 const nobodyUID int64 = 65532
 
-// droppedCapabilities are dropped from the sandbox container. The
-// container runtime's default set is the sandbox set
-// (rootpolicy.SandboxCapabilities) plus these, so a sandbox pod gets the
-// same capabilities as a sandbox on the default install.
-func droppedCapabilities() []string {
-	out := make([]string, 0, len(rootpolicy.DroppedCapabilities()))
-	for _, c := range rootpolicy.DroppedCapabilities() {
+// sandboxCapabilities is what the sandbox container adds back after
+// dropping every capability: the sandbox set of the default install
+// (rootpolicy.SandboxCapabilities), in Kubernetes' spelling. An allow-list,
+// so a container runtime whose default set is larger (or grows) gives a
+// sandbox nothing more. Every one of them is in Pod Security "baseline"'s
+// allowed list, so the sandbox namespace can enforce baseline.
+func sandboxCapabilities() []string {
+	out := make([]string, 0, len(rootpolicy.SandboxCapabilities()))
+	for _, c := range rootpolicy.SandboxCapabilities() {
 		out = append(out, strings.TrimPrefix(c, "CAP_"))
 	}
 	return out
@@ -98,12 +102,61 @@ var (
 	ErrGPUsNotSupported         = errors.New("kubepod: GPUs are not offered in pod mode")
 	ErrRegistryAuthNotSupported = errors.New("kubepod: per-create registry credentials are not taken in pod mode: they would need a Kubernetes Secret per sandbox")
 	ErrRuntimeNotOffered        = errors.New("kubepod: this runtime has no RuntimeClass in this install")
+	// ErrNetworkRulesNotSupported: pod mode has no host firewall and no
+	// egress gateway yet (M4 PR 8 brings egress through NetworkPolicy and
+	// the gateway), so none of a create's network rules would hold.
+	ErrNetworkRulesNotSupported = errors.New("kubepod: pod mode does not enforce network rules yet")
+	ErrMountsNotSupported       = errors.New("kubepod: pod mode has no external storage or platform volumes yet")
+	ErrImageDigestMismatch      = errors.New("kubepod: the image names another digest than the one the create pins")
 )
+
+// networkRuleFields names the network settings of req, by their wire
+// names: the host-firewall fields the service checks
+// (internal/service firewallPolicyFields), the byte limits, and the env
+// the egress gateway would inject.
+func networkRuleFields(req models.CreateSandboxRequest) []string {
+	var out []string
+	add := func(on bool, name string) {
+		if on {
+			out = append(out, name)
+		}
+	}
+	add(req.NetworkBlockAll, "network_block_all")
+	add(len(req.NetworkAllowOut) > 0, "network_allow_out")
+	add(len(req.NetworkDenyOut) > 0, "network_deny_out")
+	add(len(req.EgressProfiles) > 0, "egress_profiles")
+	add(req.NetworkEgressMode != "", "network_egress_mode")
+	add(len(req.NetworkEgressRules) > 0, "network_egress_rules")
+	add(len(req.EgressWithheldEnv) > 0, "egress_withheld_env")
+	add(req.NetworkBytesInLimit > 0, "network_bytes_in_limit")
+	add(req.NetworkBytesOutLimit > 0, "network_bytes_out_limit")
+	return out
+}
+
+// pinnedImage returns image pinned to digest: the kubelet then pulls
+// exactly that manifest. An image naming another digest is refused, as
+// the default install refuses it.
+func pinnedImage(image, pin string) (string, error) {
+	if pin == "" {
+		return image, nil
+	}
+	if _, err := digest.Parse(pin); err != nil {
+		return "", fmt.Errorf("kubepod: image digest %q: %w", pin, err)
+	}
+	if _, has, ok := strings.Cut(image, "@"); ok {
+		if has != pin {
+			return "", fmt.Errorf("%w: %s, pinned %s", ErrImageDigestMismatch, has, pin)
+		}
+		return image, nil
+	}
+	return image + "@" + pin, nil
+}
 
 // renderPod builds the pod for a create. Nothing secret goes in it: the
 // object is stored in etcd and anyone who may read pods in the namespace
 // sees it (plan D8). So the toolbox token and env are not here; the worker
-// hands them to toolboxd over mTLS after the pod starts.
+// hands them to toolboxd over mTLS after the pod starts. Every create
+// input is either put in the pod or refused here: none is dropped.
 func (d *Driver) renderPod(req models.CreateSandboxRequest, sandboxID string) (*Pod, error) {
 	if len(req.Env) > 0 {
 		return nil, ErrEnvNotSupported
@@ -114,7 +167,16 @@ func (d *Driver) renderPod(req models.CreateSandboxRequest, sandboxID string) (*
 	if req.Registry != nil {
 		return nil, ErrRegistryAuthNotSupported
 	}
-	image := strings.TrimSpace(req.Image)
+	if fields := networkRuleFields(req); len(fields) > 0 {
+		return nil, fmt.Errorf("%w: %s", ErrNetworkRulesNotSupported, strings.Join(fields, ", "))
+	}
+	if len(req.Mounts) > 0 || len(req.PlatformVolumes) > 0 {
+		return nil, ErrMountsNotSupported
+	}
+	image, err := pinnedImage(strings.TrimSpace(req.Image), strings.TrimSpace(req.ImageDigest))
+	if err != nil {
+		return nil, err
+	}
 	if image == "" {
 		return nil, errors.New("kubepod: image is required")
 	}
@@ -202,13 +264,7 @@ func (d *Driver) renderPod(req models.CreateSandboxRequest, sandboxID string) (*
 				VolumeMounts: []VolumeMount{{
 					Name: toolboxVolume, MountPath: toolboxMountDir, ReadOnly: true,
 				}},
-				SecurityContext: &SecurityContext{
-					Privileged: boolPtr(false),
-					// The default install sets no_new_privs on every
-					// sandbox too.
-					AllowPrivilegeEscalation: boolPtr(false),
-					Capabilities:             &Capabilities{Drop: droppedCapabilities()},
-				},
+				SecurityContext: sandboxSecurity(req.RequireNonRootUser),
 			}},
 			Volumes: []Volume{{
 				Name:     toolboxVolume,
@@ -216,6 +272,23 @@ func (d *Driver) renderPod(req models.CreateSandboxRequest, sandboxID string) (*
 			}},
 		},
 	}, nil
+}
+
+// sandboxSecurity is the sandbox container's security settings. With
+// nonRoot (the operator's create policy, RequireNonRootUser) the kubelet
+// refuses to start an image that would run as root, and the create fails
+// with CreateContainerConfigError (progress) instead of running it.
+func sandboxSecurity(nonRoot bool) *SecurityContext {
+	sc := &SecurityContext{
+		Privileged: boolPtr(false),
+		// The default install sets no_new_privs on every sandbox too.
+		AllowPrivilegeEscalation: boolPtr(false),
+		Capabilities:             &Capabilities{Drop: []string{"ALL"}, Add: sandboxCapabilities()},
+	}
+	if nonRoot {
+		sc.RunAsNonRoot = boolPtr(true)
+	}
+	return sc
 }
 
 // installCommand is the init container's command: toolboxd copies itself
@@ -230,7 +303,10 @@ func cpuQuantity(cores float64) string {
 	if cores <= 0 {
 		cores = models.DefaultCPU
 	}
-	m := int64(math.Ceil(cores * 1000))
+	// Rounded, not rounded up: a start reads the size back from the kept
+	// spec (sandboxRequestOf), and 2007m must render as 2007m again, where
+	// 2.007*1000 is a hair over 2007 in floating point.
+	m := int64(math.Round(cores * 1000))
 	if m < 1 {
 		m = 1
 	}

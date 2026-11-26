@@ -104,6 +104,9 @@ type Driver struct {
 	// watch's own retries. Tests shrink them.
 	pollMin, pollMax   time.Duration
 	retryMin, retryMax time.Duration
+	// undoWait bounds a failed create's clean-up (undoTimeout; tests
+	// shrink it).
+	undoWait time.Duration
 	// shortWatch is the shortWatch constant; tests shrink it.
 	shortWatch time.Duration
 }
@@ -197,6 +200,7 @@ func New(cfg Config, client *Client, logger *slog.Logger) (*Driver, error) {
 		pollMax:    time.Second,
 		retryMin:   watchRetryMin,
 		retryMax:   watchRetryMax,
+		undoWait:   undoTimeout,
 		shortWatch: shortWatch,
 	}, nil
 }
@@ -379,13 +383,16 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	if err != nil {
 		return nil, err
 	}
-	d.refreshToolbox(kept)
-	created, err := d.client.CreatePod(ctx, d.cfg.Namespace, kept)
+	fresh, err := d.rebuild(kept, name)
+	if err != nil {
+		return nil, err
+	}
+	created, err := d.client.CreatePod(ctx, d.cfg.Namespace, fresh)
 	if err != nil {
 		if isAlreadyExists(err) {
 			return nil, fmt.Errorf("%w: pod %s came back while starting", ErrOldPodPresent, name)
 		}
-		d.undoUnanswered(ctx, err, name, sandboxIDOf(kept))
+		d.undoUnanswered(ctx, err, name, sandboxIDOf(fresh))
 		return nil, err
 	}
 	state, err := d.waitRunning(ctx, name, created.Metadata.UID)
@@ -397,18 +404,29 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 	return state, nil
 }
 
-// refreshToolbox points a kept spec's init container at this worker's
-// toolbox image. toolboxd is AerolVM's own code, not the sandbox's: a
-// sandbox started after a worker upgrade gets the new toolboxd, as a
-// restarted container on the default install does (its toolboxd is
-// mounted from the agent image).
-func (d *Driver) refreshToolbox(p *Pod) {
-	for i := range p.Spec.InitContainers {
-		if c := &p.Spec.InitContainers[i]; c.Name == initContainer {
-			c.Image = d.cfg.ToolboxImage
-			c.Command = d.installCommand()
-		}
+// rebuild makes a start's pod from a kept spec: it reads back only the
+// sandbox's own inputs (sandboxRequestOf) and renders the pod again with
+// renderPod, so the pod sent is never the file's other content. The pod
+// gets this worker's label, its toolbox image (a sandbox started after a
+// worker upgrade gets the new toolboxd, as a restarted container on the
+// default install does) and the current security settings; whatever else
+// the file holds is not sent. The new spec is kept in place of the old.
+func (d *Driver) rebuild(kept *Pod, name string) (*Pod, error) {
+	req, id, err := sandboxRequestOf(kept)
+	if err == nil && podName(id) != name {
+		err = fmt.Errorf("it names sandbox %q, whose pod is %s", id, podName(id))
 	}
+	if err != nil {
+		return nil, fmt.Errorf("kubepod: the kept spec %s cannot be used: %w", name, err)
+	}
+	fresh, err := d.renderPod(req, id)
+	if err != nil {
+		return nil, fmt.Errorf("kubepod: sandbox %s cannot start here as it was made: %w", id, err)
+	}
+	if err := d.specs.put(fresh); err != nil {
+		return nil, err
+	}
+	return fresh, nil
 }
 
 // Stop deletes the sandbox's pod and waits until it is gone, so a stopped
@@ -498,9 +516,15 @@ func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRun
 			out[st.SandboxID] = st
 		}
 	}
-	kept, err := d.specs.list()
+	kept, bad, err := d.specs.list()
 	if err != nil {
 		return nil, err
+	}
+	for _, name := range bad {
+		// Left out, not fatal: reconcile asks Inspect about a row the list
+		// misses, and Inspect answers "unknown" for this file, so the row
+		// stays.
+		d.logger.Warn("kubepod: a kept pod spec cannot be read; its sandbox cannot start until it is fixed", "pod", name)
 	}
 	for _, k := range kept {
 		id := sandboxIDOf(k)
@@ -531,17 +555,32 @@ func (d *Driver) Resize(context.Context, string, models.ResizeSandboxRequest) er
 // removes unused ones itself.
 func (d *Driver) RemoveImage(context.Context, string) error { return nil }
 
+var _ sbruntime.NetRulesReporter = (*Driver)(nil)
+
+// NetRulesEnabled is false: pod mode has no host firewall, so the service
+// refuses a create's network policy (network_policy_enforcement.go) before
+// it reaches the driver, which refuses it too (networkRuleFields).
+func (d *Driver) NetRulesEnabled() bool { return false }
+
 // stateOf maps a pod to a sandbox state. A pod still starting, or one whose
 // node stopped reporting (phase Unknown), still exists: it is started with
-// no address, never gone (runtime.InstanceGone).
+// no address, never gone (runtime.InstanceGone). A pod being deleted that
+// is not running is stopped: nothing of it runs, and it is on its way out.
 func stateOf(p *Pod) *models.SandboxRuntimeState {
 	st := &models.SandboxRuntimeState{SandboxID: sandboxIDOf(p), ContainerID: p.Metadata.Name, Status: models.SandboxStatusStarted}
 	if p.Status == nil {
+		if p.Metadata.DeletionTimestamp != nil {
+			st.Status = models.SandboxStatusStopped
+		}
 		return st
 	}
 	switch p.Status.Phase {
 	case PhaseSucceeded, PhaseFailed:
 		st.Status = models.SandboxStatusStopped
+	case PhasePending, "":
+		if p.Metadata.DeletionTimestamp != nil {
+			st.Status = models.SandboxStatusStopped
+		}
 	case PhaseRunning:
 		st.ContainerIP = p.Status.PodIP
 		for _, cs := range p.Status.ContainerStatuses {
@@ -705,14 +744,24 @@ func (d *Driver) waitGone(ctx context.Context, name, uid string, timeout time.Du
 	}
 }
 
-// undo deletes the pod of a create or start that failed, without waiting,
-// and with forgetSpec also forgets its spec. It runs on a context of its
-// own: the caller's may be the one that ran out.
+// undo deletes the pod of a create or start that failed and waits, up to
+// undoTimeout, until it is gone; with forgetSpec it also forgets its spec.
+// So a failed create leaves nothing behind when it returns, and a retry of
+// the same sandbox ID is not refused as "old pod still stopping". A pod
+// that outlives the wait (its node cannot be reached) is listed, and
+// reconcile's orphan sweep finishes it. It runs on a context of its own:
+// the caller's may be the one that ran out.
 func (d *Driver) undo(ctx context.Context, name, uid string, forgetSpec bool) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.undoWait)
 	defer cancel()
-	if err := d.client.DeletePod(ctx, d.cfg.Namespace, name, uid, destroyGrace); err != nil && !isNotFound(err) && !isConflict(err) {
-		d.logger.Warn("kubepod: could not delete the pod of a failed start; the worker's list still shows it",
+	err := d.client.DeletePod(ctx, d.cfg.Namespace, name, uid, destroyGrace)
+	if err == nil {
+		err = d.waitGone(ctx, name, uid, d.undoWait)
+	} else if isNotFound(err) || isConflict(err) {
+		err = nil
+	}
+	if err != nil {
+		d.logger.Warn("kubepod: the pod of a failed start is not gone yet; the worker's list still shows it",
 			"pod", name, "error", err)
 	}
 	if forgetSpec {
@@ -727,12 +776,18 @@ func (d *Driver) undo(ctx context.Context, name, uid string, forgetSpec bool) {
 // create, and Start's spec is this sandbox's. So it is deleted, by its
 // UID, and the caller is told the create failed. An answer from the API
 // server (an *APIError) means nothing was made.
+//
+// The API server may store the pod only after this read found nothing.
+// That pod is this worker's, with no spec and no store row: ListManaged
+// lists it (it lists every pod with this worker's label), and reconcile's
+// orphan sweep destroys every listed instance that has no row, so it goes
+// at the next pass (TestLatePodIsListedAndDestroyed).
 func (d *Driver) undoUnanswered(ctx context.Context, createErr error, name, sandboxID string) {
 	var answered *APIError
 	if errors.As(createErr, &answered) {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.undoWait)
 	defer cancel()
 	p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
 	switch {
