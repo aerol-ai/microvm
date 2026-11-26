@@ -1213,7 +1213,7 @@ SP-A (KVM Firecracker v1.15.1, 20 creates per step, pause/resume 40 busy +
 | Warm-pool create p50 (20 of 20 hits) | 31 ms | 76 ms | 81 ms |
 | Pause/resume intact, busy | 40 of 40 | 25 of 40 | 38 of 40 |
 | Pause/resume intact, idle | 19 of 20 | 11 of 20 | 19 of 20 |
-| Verdict | no go | no go | no go |
+| Verdict (run m2-spa-1126) | no go | no go | no go |
 
 - **Warm pool: proven.** It works on both machines and is well under the
   100 ms bar.
@@ -1224,9 +1224,15 @@ SP-A (KVM Firecracker v1.15.1, 20 creates per step, pause/resume 40 busy +
   never helped; with the redial there were none. #1491 makes the redial.
 - **A second loss, also on bare metal:** after a good handshake, the guest
   hand-over times out (`adopt guest (3 attempts): read ack: ... i/o
-  timeout`), 1 in 60 on c5.metal and 3 in 60 nested with the redial. It is
-  in shipped code and is being investigated next. Until it is fixed, (a) has
-  no go.
+  timeout`), 1 in 60 on c5.metal and 3 in 60 nested with the redial. The
+  agent logs a line before it sends its ack, and in a VM the log goes to the
+  serial console; a console that stops taking writes held the ack back.
+  #1493 makes the agent's logging unable to block.
+- **Confirmed with both fixes** (run m2-spa-fix-1126, about $0.10, nested
+  m8i.xlarge, a build with #1491 and #1493): pause/resume intact 80 of 80
+  busy and 40 of 40 idle, warm create p50 75.0 ms. **(a) has a go** once
+  #1491 and #1493 merge. (The run's summary line said NO GO only because
+  the verdict script read its own output file as a leg; #1494 fixes that.)
 
 SP-B (one m7i.xlarge with Nitro Enclaves, a 6 GiB pool, Firecracker v1.18
 direct mode, AerolVM's jailer argv):
