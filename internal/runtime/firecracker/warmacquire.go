@@ -240,14 +240,19 @@ func (d *Driver) tryAcquireWarm(
 	// rootfs copy on the create path, and either would take the template's
 	// file as it is now rather than the one this VM was loaded against.
 	// The PATCH below still binds the root drive to it before Resume, as
-	// the cold load does.
+	// the cold load does. WarmSpawn left it root's with the jailer's group
+	// (chrootSharedFile), so the claim changes nothing on it: it only
+	// names it as Firecracker sees it, by its chroot name under the jailer
+	// (as in split mode, where the refill shared it) or by its host path
+	// without one. A slot from before a sandboxd restart is never claimed
+	// (its handle is gone), so no slot staged another way reaches here.
 	warmRootfsPath := filepath.Join(slot.RunDir, rootfsFileName)
 	if _, err := os.Stat(warmRootfsPath); err != nil {
 		return nil, false, fmt.Errorf("firecracker runtime: warm slot rootfs: %w", err)
 	}
-	warmRootfsAPIPath, err := d.chrootSharedFile(slot.RunDir, warmRootfsPath, rootfsFileName)
-	if err != nil {
-		return nil, false, fmt.Errorf("firecracker runtime: warm stage rootfs for API: %w", err)
+	warmRootfsAPIPath := rootfsFileName
+	if d.split == nil && !d.cfg.UseJailer {
+		warmRootfsAPIPath = warmRootfsPath
 	}
 	if err := client.PatchDrive(ctx, rootDriveID, firecracker.DrivePatch{
 		DriveID:    rootDriveID,
