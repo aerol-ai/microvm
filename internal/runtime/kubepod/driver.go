@@ -254,6 +254,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if isAlreadyExists(err) {
 			return nil, d.nameTaken(ctx, name, sandboxID)
 		}
+		d.undoUnanswered(ctx, err, name, sandboxID)
 		d.forget(name)
 		return nil, err
 	}
@@ -332,6 +333,7 @@ func (d *Driver) Start(ctx context.Context, containerRef string) (*models.Sandbo
 		if isAlreadyExists(err) {
 			return nil, fmt.Errorf("%w: pod %s came back while starting", ErrOldPodPresent, name)
 		}
+		d.undoUnanswered(ctx, err, name, sandboxIDOf(kept))
 		return nil, err
 	}
 	state, err := d.waitRunning(ctx, name, created.Metadata.UID)
@@ -652,6 +654,34 @@ func (d *Driver) undo(ctx context.Context, name, uid string, forgetSpec bool) {
 	if forgetSpec {
 		d.forget(name)
 	}
+}
+
+// undoUnanswered cleans up after a pod create that got no answer: the call
+// ended (the caller's context, a dropped connection) after the API server
+// may have made the pod. A pod of that name for this sandbox that this
+// worker made can only be that one: there was no kept spec before the
+// create, and Start's spec is this sandbox's. So it is deleted, by its
+// UID, and the caller is told the create failed. An answer from the API
+// server (an *APIError) means nothing was made.
+func (d *Driver) undoUnanswered(ctx context.Context, createErr error, name, sandboxID string) {
+	var answered *APIError
+	if errors.As(createErr, &answered) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), undoTimeout)
+	defer cancel()
+	p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
+	switch {
+	case isNotFound(err):
+		return
+	case err != nil:
+		d.logger.Warn("kubepod: a pod create got no answer, and the pod cannot be read to clean it up; the worker's list still shows it",
+			"pod", name, "error", err)
+		return
+	case !d.owns(p) || sandboxIDOf(p) != sandboxID:
+		return
+	}
+	d.undo(ctx, name, p.Metadata.UID, false)
 }
 
 // forget drops a kept spec, logging a failure: the caller is already

@@ -300,6 +300,76 @@ func TestCreateCallerContextEnds(t *testing.T) {
 	}
 }
 
+// TestCreateGetsNoAnswer: the caller's deadline ends the create call after
+// the API server made the pod but before its answer came. The pod must not
+// be left behind with no spec.
+func TestCreateGetsNoAnswer(t *testing.T) {
+	f := newFakeAPI(t)
+	f.setCreateDelay(200 * time.Millisecond)
+	d := newTestDriver(t, f, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := d.Create(ctx, testReq, testID, "tok", nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Create = %v, want the caller's deadline", err)
+	}
+	if dc := f.deleteCalls(); len(dc) != 1 || dc[0].uid != "uid-1" {
+		t.Errorf("deletes = %+v, want the unanswered pod deleted by its UID", dc)
+	}
+	if hasSpec(d, testID) {
+		t.Error("spec kept for a create that failed")
+	}
+
+	t.Run("start", func(t *testing.T) {
+		f := newFakeAPI(t)
+		f.setCreateDelay(200 * time.Millisecond)
+		d := newTestDriver(t, f, nil)
+		keepSpec(t, d, testID)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		defer cancel()
+		if _, err := d.Start(ctx, testID); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Start = %v, want the caller's deadline", err)
+		}
+		if dc := f.deleteCalls(); len(dc) != 1 {
+			t.Errorf("deletes = %+v, want the unanswered pod deleted", dc)
+		}
+		if !hasSpec(d, testID) {
+			t.Error("a stopped sandbox lost its spec")
+		}
+	})
+	t.Run("nothing made", func(t *testing.T) {
+		f := newFakeAPI(t)
+		d := newTestDriver(t, f, nil)
+		f.srv.Close() // no answer, and no pod either
+		if _, err := d.Create(context.Background(), testReq, testID, "tok", nil); err == nil {
+			t.Fatal("want an error")
+		}
+		if hasSpec(d, testID) {
+			t.Error("spec kept")
+		}
+	})
+	t.Run("another sandbox holds the name", func(t *testing.T) {
+		f := newFakeAPI(t)
+		d := newTestDriver(t, f, nil)
+		f.put(podOf("worker-0", "sb-ffffffffffffffff"))
+		// Rename it to testID's pod name, as a pod made by someone else.
+		f.mu.Lock()
+		p := f.pods[testNS+"/sb-ffffffffffffffff"]
+		delete(f.pods, testNS+"/sb-ffffffffffffffff")
+		p.Metadata.Name = testID
+		f.pods[testNS+"/"+testID] = p
+		f.mu.Unlock()
+		d.undoUnanswered(context.Background(), errors.New("no answer"), testID, testID)
+		if dc := f.deleteCalls(); len(dc) != 0 {
+			t.Errorf("deleted a pod that is not this sandbox's: %+v", dc)
+		}
+		f.setFail("GET ", 500, false)
+		d.undoUnanswered(context.Background(), errors.New("no answer"), testID, testID)
+		if dc := f.deleteCalls(); len(dc) != 0 {
+			t.Errorf("deleted with no read: %+v", dc)
+		}
+	})
+}
+
 func TestStop(t *testing.T) {
 	t.Run("deletes and waits until gone", func(t *testing.T) {
 		f := newFakeAPI(t)

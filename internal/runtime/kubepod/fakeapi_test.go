@@ -38,7 +38,9 @@ type fakeAPI struct {
 	failOnce bool
 	// token is the bearer token every call must carry, when set.
 	token string
-	calls []string
+	// createDelay holds back a create's answer after the pod is stored.
+	createDelay time.Duration
+	calls       []string
 	// deletes records each delete's grace and precondition.
 	deletes []deleteCall
 }
@@ -239,8 +241,17 @@ func (f *fakeAPI) create(w http.ResponseWriter, r *http.Request, ns string) {
 	p.Status = &PodStatus{Phase: PhasePending}
 	f.putLocked(&p)
 	raw, _ := json.Marshal(&p)
+	delay := f.createDelay
 	f.mu.Unlock()
+	// The pod exists; the answer is late (a slow API server or network).
+	time.Sleep(delay)
 	_, _ = w.Write(raw)
+}
+
+func (f *fakeAPI) setCreateDelay(d time.Duration) {
+	f.mu.Lock()
+	f.createDelay = d
+	f.mu.Unlock()
 }
 
 func (f *fakeAPI) read(w http.ResponseWriter, ns, name string) {
