@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,10 +16,13 @@ import (
 )
 
 // budgetFor is a budget for a host of hostVcpus with the device reporting
-// poolMiB and slots (0: not reported).
-func budgetFor(hostVcpus, poolMiB, slots int) *nitroBudget {
+// poolMiB and slotsTotal (0: not reported) and no current slot count, so
+// nothing is grown.
+func budgetFor(hostVcpus, poolMiB, slotsTotal int) *nitroBudget {
 	b := newNitroBudget(hostVcpus, nil)
-	b.readDevice = func() (int, int) { return poolMiB, slots }
+	b.readLimits = func() (int, int) { return poolMiB, slotsTotal }
+	b.readSlots = func() int { return 0 }
+	b.writeSlots = func(int) error { return errors.New("not grown in this test") }
 	return b
 }
 
@@ -54,15 +58,15 @@ func TestNitroBudgetLimits(t *testing.T) {
 			t.Fatalf("after a release: %v", err)
 		}
 	})
-	t.Run("memory pool, with each VM's 2 MiB control page", func(t *testing.T) {
+	t.Run("memory pool", func(t *testing.T) {
 		b := budgetFor(64, 1024, 0)
-		if err := b.reserve("a", 1, 510); err != nil { // 512 with its page
+		if err := b.reserve("a", 1, nitroPoolNeed(510, 3, false)); err != nil { // 512 with its page
 			t.Fatal(err)
 		}
-		if err := b.reserve("b", 1, 510); err != nil { // 1024: full
+		if err := b.reserve("b", 1, 512); err != nil { // 1024: full
 			t.Fatal(err)
 		}
-		refusedBy(t, b.reserve("c", 1, 64), nitroMemPool)
+		refusedBy(t, b.reserve("c", 1, 258), nitroMemPool)
 	})
 	t.Run("PCIe slots: one per running VM", func(t *testing.T) {
 		b := budgetFor(64, 0, 2)
@@ -115,6 +119,9 @@ func TestReadNitroDevice(t *testing.T) {
 	if pool, slots := readNitroDevice(); pool != 0 || slots != 0 {
 		t.Fatalf("no device: %d, %d", pool, slots)
 	}
+	if err := writeNitroSlots(12); err == nil {
+		t.Fatal("grew slots on a machine with no device")
+	}
 	if err := os.MkdirAll(filepath.Join(dir, "mem_pool"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +133,133 @@ func TestReadNitroDevice(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(dir, "pcie_slots_total"), []byte("many\n"), 0o644)
 	if _, slots := readNitroDevice(); slots != 0 {
 		t.Fatalf("a bad number read as %d", slots)
+	}
+	_ = os.WriteFile(filepath.Join(dir, "pcie_slots"), []byte("4\n"), 0o644)
+	if err := writeNitroSlots(5); err != nil {
+		t.Fatal(err)
+	}
+	if got := readNitroSysfs("pcie_slots"); got != 5 { // a plain file keeps the write; the driver rounds it up
+		t.Fatalf("pcie_slots = %d after writing 5", got)
+	}
+}
+
+// fakeSlots is the Nitro driver's pcie_slots: 4 at boot, grown in steps of
+// 8 up to total by a write, each step from the pool; fail is the next
+// write's error.
+type fakeSlots struct {
+	cur, total int
+	writes     []int
+	fail       error
+}
+
+func (f *fakeSlots) budget(hostVcpus, poolMiB int) *nitroBudget {
+	b := newNitroBudget(hostVcpus, nil)
+	b.readLimits = func() (int, int) { return poolMiB, f.total }
+	b.readSlots = func() int { return f.cur }
+	b.writeSlots = func(target int) error {
+		f.writes = append(f.writes, target)
+		if f.fail != nil {
+			return f.fail
+		}
+		for f.cur < target && f.cur < f.total {
+			f.cur += nitroSlotStep
+		}
+		return nil
+	}
+	return b
+}
+
+// A machine starts with 4 PCIe slots (live run m2-nitro-adm-1126 stopped
+// there): the 5th VM grows them a step first, and the step's 128 MiB of
+// the pool is counted; a step the pool cannot give, or one past the
+// total, is a capacity refusal; a write that fails otherwise too.
+func TestNitroBudgetGrowsSlots(t *testing.T) {
+	t.Run("the fifth VM grows the slots a step", func(t *testing.T) {
+		dev := &fakeSlots{cur: 4, total: 20}
+		b := dev.budget(64, 2048)
+		for i := 0; i < 4; i++ {
+			if err := b.reserve(fmt.Sprint("v", i), 1, 258); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if len(dev.writes) != 0 {
+			t.Fatalf("grew slots with room: %v", dev.writes)
+		}
+		if err := b.reserve("v4", 1, 258); err != nil {
+			t.Fatal(err)
+		}
+		if len(dev.writes) != 1 || dev.writes[0] != 5 || dev.cur != 12 {
+			t.Fatalf("writes %v, slots %d; want one write of 5 and 12 slots", dev.writes, dev.cur)
+		}
+		// 2048 MiB: 128 for the step, 7 VMs of 258 = 1806; the 8th needs 258 more.
+		for i := 5; i < 7; i++ {
+			if err := b.reserve(fmt.Sprint("v", i), 1, 258); err != nil {
+				t.Fatalf("VM %d: %v", i, err)
+			}
+		}
+		refusedBy(t, b.reserve("v7", 1, 258), nitroMemPool)
+		if len(dev.writes) != 1 {
+			t.Fatalf("grew again inside the step: %v", dev.writes)
+		}
+	})
+	t.Run("the pool cannot give the step", func(t *testing.T) {
+		dev := &fakeSlots{cur: 4, total: 20, fail: syscall.ENOMEM}
+		b := dev.budget(64, 8192)
+		for i := 0; i < 4; i++ {
+			_ = b.reserve(fmt.Sprint("v", i), 1, 258)
+		}
+		refusedBy(t, b.reserve("v4", 1, 258), nitroMemPool)
+		if _, ok := b.holding("v4"); ok {
+			t.Fatal("a refused VM is held")
+		}
+	})
+	t.Run("a step that would not leave room for the VM is not taken", func(t *testing.T) {
+		dev := &fakeSlots{cur: 4, total: 20}
+		b := dev.budget(64, 4*258+128) // room for the step, not for a 5th VM
+		for i := 0; i < 4; i++ {
+			_ = b.reserve(fmt.Sprint("v", i), 1, 258)
+		}
+		refusedBy(t, b.reserve("v4", 1, 258), nitroMemPool)
+		if len(dev.writes) != 0 {
+			t.Fatalf("donated a step for a VM that did not fit: %v", dev.writes)
+		}
+	})
+	t.Run("past the total", func(t *testing.T) {
+		dev := &fakeSlots{cur: 4, total: 4}
+		b := dev.budget(64, 8192)
+		for i := 0; i < 4; i++ {
+			_ = b.reserve(fmt.Sprint("v", i), 1, 258)
+		}
+		refusedBy(t, b.reserve("v4", 1, 258), nitroSlotsPool)
+		if len(dev.writes) != 0 {
+			t.Fatalf("tried to grow past the total: %v", dev.writes)
+		}
+	})
+	t.Run("a read-only sysfs", func(t *testing.T) {
+		dev := &fakeSlots{cur: 4, total: 20, fail: syscall.EROFS}
+		b := dev.budget(64, 8192)
+		for i := 0; i < 4; i++ {
+			_ = b.reserve(fmt.Sprint("v", i), 1, 258)
+		}
+		refusedBy(t, b.reserve("v4", 1, 258), nitroSlotsPool)
+	})
+}
+
+// A VM's pool need: its memory and control page, and in confidential mode
+// a 16 MiB buffer per device.
+func TestNitroPoolNeed(t *testing.T) {
+	if got := nitroPoolNeed(512, 3, false); got != 514 {
+		t.Fatalf("direct: %d", got)
+	}
+	if got := nitroPoolNeed(512, 4, true); got != 514+64 {
+		t.Fatalf("confidential with an overlay: %d", got)
+	}
+	d := New(Config{Backend: "nitro", NitroMode: "confidential"}, nil)
+	if got := d.nitroNeed(256, false); got != 258+48 {
+		t.Fatalf("nitroNeed = %d", got)
+	}
+	if slotStepsMiB(4) != 0 || slotStepsMiB(5) != 128 || slotStepsMiB(12) != 128 || slotStepsMiB(20) != 256 {
+		t.Fatal("slot steps")
 	}
 }
 
@@ -198,7 +332,7 @@ func TestNitroStopStartBudget(t *testing.T) {
 	if _, err := f.driver.StartWithIdentityEnv(context.Background(), "sb-a", "sb-a", "tok", func(context.Context) (map[string]string, error) { return nil, nil }); err != nil {
 		t.Fatalf("start with room: %v", err)
 	}
-	if h, ok := f.driver.budget.holding("sb-a"); !ok || h.vcpus != 2 || h.memMiB != 768 {
+	if h, ok := f.driver.budget.holding("sb-a"); !ok || h.vcpus != 2 || h.memMiB != 770 {
 		t.Fatalf("started VM holds %+v, %v; want its saved shape", h, ok)
 	}
 }
@@ -206,17 +340,17 @@ func TestNitroStopStartBudget(t *testing.T) {
 // Firecracker refuses odd or tiny memory on Nitro at InstanceStart; the
 // driver says so before any work.
 func TestCreate_NitroMemoryShape(t *testing.T) {
-	for _, mem := range []int{0, 63, 513} {
+	for _, mem := range []int{0, 254, 513} {
 		f := nitroFixture(t, 8)
 		_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro, MemoryMB: mem}, "sb-m", "tok", nil)
-		if err == nil || !strings.Contains(err.Error(), "needs memory_mb to be an even number, at least 64") {
+		if err == nil || !strings.Contains(err.Error(), "needs memory_mb to be an even number, at least 256") {
 			t.Fatalf("memory %d: err = %v", mem, err)
 		}
 		if f.pool.alloc != 0 {
 			t.Fatalf("memory %d: a refused create took a slot", mem)
 		}
 	}
-	for _, mem := range []int{64, 512} {
+	for _, mem := range []int{256, 512} {
 		if err := checkNitroShape(mem); err != nil {
 			t.Fatalf("memory %d refused: %v", mem, err)
 		}

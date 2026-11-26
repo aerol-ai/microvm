@@ -1,6 +1,7 @@
 package firecracker
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -8,7 +9,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
+	"github.com/aerol-ai/microvm/internal/config"
 	"github.com/aerol-ai/microvm/pkg/capacity"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
@@ -16,26 +19,37 @@ import (
 // Admission on the Nitro backend (plans/security-gaps-m1-m4.md §4.3). A
 // Nitro VM's vCPUs and memory come from the Nitro System, not from what the
 // node's admitter counts, and it has limits of its own (Firecracker's Nitro
-// Sandboxes guide, "Sandbox limits"; the SP-B spike hit them):
+// Sandboxes guide and the AWS user guide):
 //
 //   - all sandboxes together get at most 5 vCPUs per host vCPU (CPU
 //     overcommit is always on here, nitro.go putEnclave);
-//   - each takes its memory plus a 2 MiB control page from the memory pool
-//     reserved at boot (nitro_enclaves.mempool), never from free memory;
-//   - each holds one of the device's PCIe slots while it runs.
+//   - each takes from the memory pool reserved at boot
+//     (nitro_enclaves.mempool) its memory, a 2 MiB control page and, in
+//     confidential mode, a 16 MiB buffer per virtual device;
+//   - each holds one of the device's PCIe slots while it runs. A freshly
+//     booted machine has 4 (pcie_slots); writing a higher target to
+//     pcie_slots grows them in steps of 8, up to pcie_slots_total, and each
+//     step takes 128 MiB of the pool until the machine reboots.
 //
 // nitroBudget holds each running Nitro VM's share and refuses a boot (a
-// create, or the start of a stopped sandbox) that would pass any limit, as
-// a capacity refusal (503, retried elsewhere by the cluster). A stopped VM
-// holds nothing: its enclave is gone. The share is written in the VM's
+// create, or the start of a stopped sandbox) that would pass a limit, as a
+// capacity refusal (503, retried elsewhere by the cluster). When the next
+// VM needs a slot past the current ones, it grows them one step first: the
+// live run m2-nitro-adm-1126 stopped at 4 sandboxes without that. A stopped
+// VM holds nothing: its enclave is gone. The share is written in the VM's
 // record, so a restarted sandboxd takes it back with the VM (adoptVM).
 
 const (
 	nitroVcpusPerHostVcpu = 5
 	nitroControlPageMiB   = 2
-	// nitroMinMemoryMiB and the 2 MiB step are Firecracker's own rules for
-	// a Nitro Sandbox; checked here so a create learns before any work.
-	nitroMinMemoryMiB = 64
+	nitroDeviceBufferMiB  = 16
+	nitroBaseSlots        = 4
+	nitroSlotStep         = 8
+	nitroSlotStepMiB      = 128
+	// nitroMinMemoryMiB is AWS's floor for a Nitro Sandbox ("Give each
+	// Nitro Sandbox at least 256 MiB of memory"); memory comes in 2 MiB
+	// steps. Checked here so a create learns before any work.
+	nitroMinMemoryMiB = 256
 )
 
 // The refusals name the limit, not the node's numbers: a tenant learns
@@ -50,40 +64,63 @@ const (
 // variable for tests.
 var nitroSysfsDir = "/sys/class/misc/nitro_enclaves"
 
+// nitroHold is one VM's share: its vCPUs, and the pool memory it takes
+// (memory, control page and device buffers).
 type nitroHold struct{ vcpus, memMiB int }
 
 type nitroBudget struct {
 	mu        sync.Mutex
 	loaded    bool
 	hostVcpus int
-	// poolMiB and slots are 0 when the device does not report them: that
-	// limit is then not checked (Firecracker still refuses past it).
-	poolMiB int
-	slots   int
-	held    map[string]nitroHold
-	logger  *slog.Logger
-	// readDevice reads the device's limits; a seam for tests.
-	readDevice func() (poolMiB, slots int)
+	// poolMiB and slotsTotal are 0 when the device does not report them:
+	// that limit is then not checked (Firecracker still refuses past it,
+	// nitroOutOfResources).
+	poolMiB    int
+	slotsTotal int
+	held       map[string]nitroHold
+	logger     *slog.Logger
+	// The device, as seams for tests: its fixed limits; its current slots
+	// (0: not reported, so never grown); growing them.
+	readLimits func() (poolMiB, slotsTotal int)
+	readSlots  func() int
+	writeSlots func(target int) error
 }
 
 func newNitroBudget(hostVcpus int, logger *slog.Logger) *nitroBudget {
-	return &nitroBudget{hostVcpus: hostVcpus, held: map[string]nitroHold{}, logger: logger, readDevice: readNitroDevice}
+	return &nitroBudget{hostVcpus: hostVcpus, held: map[string]nitroHold{}, logger: logger,
+		readLimits: readNitroDevice, readSlots: func() int { return readNitroSysfs("pcie_slots") }, writeSlots: writeNitroSlots}
+}
+
+func readNitroSysfs(name string) int {
+	raw, err := os.ReadFile(filepath.Join(nitroSysfsDir, name))
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return int(n)
 }
 
 // readNitroDevice reads mem_pool/total (bytes) and pcie_slots_total.
-func readNitroDevice() (poolMiB, slots int) {
-	read := func(name string) int {
-		raw, err := os.ReadFile(filepath.Join(nitroSysfsDir, name))
-		if err != nil {
-			return 0
-		}
-		n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
-		if err != nil || n < 0 {
-			return 0
-		}
-		return int(n)
+func readNitroDevice() (poolMiB, slotsTotal int) {
+	return readNitroSysfs("mem_pool/total") >> 20, readNitroSysfs("pcie_slots_total")
+}
+
+// writeNitroSlots asks the driver for at least target slots; it rounds up
+// to the next step of 8. ENOMEM: the pool cannot give the step's memory.
+func writeNitroSlots(target int) error {
+	// Never create it: a missing attribute is a missing driver.
+	f, err := os.OpenFile(filepath.Join(nitroSysfsDir, "pcie_slots"), os.O_WRONLY, 0)
+	if err != nil {
+		return err
 	}
-	return read("mem_pool/total") >> 20, read("pcie_slots_total")
+	_, werr := f.Write([]byte(strconv.Itoa(target)))
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
 }
 
 // load reads the device's limits once, at the first boot rather than at
@@ -93,10 +130,10 @@ func (b *nitroBudget) loadLocked() {
 		return
 	}
 	b.loaded = true
-	b.poolMiB, b.slots = b.readDevice()
+	b.poolMiB, b.slotsTotal = b.readLimits()
 	if b.logger != nil {
 		b.logger.Info("firecracker nitro: limits", "sandbox_vcpus", b.hostVcpus*nitroVcpusPerHostVcpu,
-			"memory_pool_mib", b.poolMiB, "pcie_slots", b.slots)
+			"memory_pool_mib", b.poolMiB, "pcie_slots_total", b.slotsTotal, "pcie_slots", b.readSlots())
 	}
 }
 
@@ -104,14 +141,34 @@ func (b *nitroBudget) usedLocked() nitroHold {
 	var used nitroHold
 	for _, h := range b.held {
 		used.vcpus += h.vcpus
-		used.memMiB += h.memMiB + nitroControlPageMiB
+		used.memMiB += h.memMiB
 	}
 	return used
 }
 
-// reserve holds a share for id, or refuses with the limit it would pass.
-// A second reserve for the same id holds nothing more.
-func (b *nitroBudget) reserve(id string, vcpus, memMiB int) error {
+// slotStepsMiB is the pool memory that slots took to grow to slots.
+func slotStepsMiB(slots int) int {
+	if slots <= nitroBaseSlots {
+		return 0
+	}
+	return (slots - nitroBaseSlots + nitroSlotStep - 1) / nitroSlotStep * nitroSlotStepMiB
+}
+
+// nitroPoolNeed is the pool memory a VM of memMiB with devices virtual
+// devices takes: its memory, the control page and, in confidential mode,
+// a buffer per device.
+func nitroPoolNeed(memMiB, devices int, confidential bool) int {
+	need := memMiB + nitroControlPageMiB
+	if confidential {
+		need += devices * nitroDeviceBufferMiB
+	}
+	return need
+}
+
+// reserve holds a share for id, growing the PCIe slots a step when the VM
+// needs one past them, or refuses with the limit it would pass. A second
+// reserve for the same id holds nothing more.
+func (b *nitroBudget) reserve(id string, vcpus, needMiB int) error {
 	if b == nil {
 		return nil
 	}
@@ -122,24 +179,43 @@ func (b *nitroBudget) reserve(id string, vcpus, memMiB int) error {
 		return nil
 	}
 	used := b.usedLocked()
+	running := len(b.held)
+	slots := b.readSlots()
+	grow := slots > 0 && running+1 > slots
+	stepsMiB := slotStepsMiB(slots)
+	if grow {
+		stepsMiB = slotStepsMiB(running + 1)
+	}
 	pool := ""
 	switch {
 	case used.vcpus+vcpus > b.hostVcpus*nitroVcpusPerHostVcpu:
 		pool = nitroVcpuPool
-	case b.poolMiB > 0 && used.memMiB+memMiB+nitroControlPageMiB > b.poolMiB:
-		pool = nitroMemPool
-	case b.slots > 0 && len(b.held)+1 > b.slots:
+	case b.slotsTotal > 0 && running+1 > b.slotsTotal:
 		pool = nitroSlotsPool
+	case b.poolMiB > 0 && used.memMiB+needMiB+stepsMiB > b.poolMiB:
+		pool = nitroMemPool
+	}
+	if pool == "" && grow {
+		if err := b.writeSlots(running + 1); err != nil {
+			pool = nitroSlotsPool
+			if errors.Is(err, syscall.ENOMEM) {
+				pool = nitroMemPool
+			}
+			if b.logger != nil {
+				b.logger.Warn("firecracker nitro: growing the PCIe slots failed", "sandbox_id", id, "pcie_slots", slots, "target", running+1, "error", err)
+			}
+		}
 	}
 	if pool != "" {
 		if b.logger != nil {
 			b.logger.Info("firecracker nitro: boot refused", "sandbox_id", id, "limit", pool,
-				"ask_vcpus", vcpus, "ask_memory_mib", memMiB, "used_vcpus", used.vcpus, "used_memory_mib", used.memMiB,
-				"running", len(b.held), "sandbox_vcpus", b.hostVcpus*nitroVcpusPerHostVcpu, "memory_pool_mib", b.poolMiB, "pcie_slots", b.slots)
+				"ask_vcpus", vcpus, "ask_pool_mib", needMiB, "used_vcpus", used.vcpus, "used_pool_mib", used.memMiB,
+				"slot_steps_mib", stepsMiB, "running", running, "pcie_slots", slots, "pcie_slots_total", b.slotsTotal,
+				"sandbox_vcpus", b.hostVcpus*nitroVcpusPerHostVcpu, "memory_pool_mib", b.poolMiB)
 		}
 		return capacity.NewSlotPoolExhausted(pool)
 	}
-	b.held[id] = nitroHold{vcpus: vcpus, memMiB: memMiB}
+	b.held[id] = nitroHold{vcpus: vcpus, memMiB: needMiB}
 	return nil
 }
 
@@ -208,6 +284,16 @@ func (b *nitroBudget) slotPool() capacity.SlotPool {
 		Total:    total,
 		Free:     max(total-b.usedLocked().vcpus, 0),
 	}
+}
+
+// nitroNeed is the pool memory one of this node's VMs takes: the root
+// disk, the network and vsock, and an overlay disk when it has one.
+func (d *Driver) nitroNeed(memMiB int, overlay bool) int {
+	devices := 3
+	if overlay {
+		devices++
+	}
+	return nitroPoolNeed(memMiB, devices, d.cfg.NitroMode == config.FirecrackerNitroModeConfidential)
 }
 
 // NitroSlotPool is the driver's Nitro vCPU budget for the service's slot

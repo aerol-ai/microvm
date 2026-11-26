@@ -266,7 +266,7 @@ func (d *Driver) startNitro(ctx context.Context, sandboxID, toolboxToken string,
 	if slot == nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: tap slot missing; cannot start with the sandbox's address", sandboxID)
 	}
-	if err := d.budget.reserve(sandboxID, manifest.VcpuCount, manifest.MemSizeMib); err != nil {
+	if err := d.budget.reserve(sandboxID, manifest.VcpuCount, d.nitroNeed(manifest.MemSizeMib, manifest.HasOverlay)); err != nil {
 		return nil, err
 	}
 	committed := false

@@ -577,7 +577,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		if err := checkNitroShape(req.MemoryMB); err != nil {
 			return nil, err
 		}
-		if err := d.budget.reserve(allocID, vcpuFromRequest(req.CPU), req.MemoryMB); err != nil {
+		if err := d.budget.reserve(allocID, vcpuFromRequest(req.CPU), d.nitroNeed(req.MemoryMB, req.OverlaySizeGB > 0)); err != nil {
 			return nil, err
 		}
 	}
