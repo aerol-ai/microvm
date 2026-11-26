@@ -34,8 +34,12 @@ func unitWouldStart(unit string) bool {
 // systemd start sandboxd as root on them. Root's unit now does not start
 // while the switch-back marker is there, and the marker is there for the
 // whole window: mark_switch_back runs before the unit is written, and
-// leave_split_mode removes the marker last. A plain single node and a
-// finished switch start as before; split's unit has no such condition.
+// leave_split_mode removes the marker last. Split's unit, which stays on
+// disk until write_systemd_unit replaces it, has the same condition: a
+// reboot after write_environment, a little earlier in the switch, would
+// otherwise start sandboxd as split's user with settings that say single.
+// A plain single node, a plain split node and a finished switch start as
+// before.
 func TestInstallRootUnitWaitsForTheSwitchBack(t *testing.T) {
 	src := installShSource(t)
 
@@ -118,12 +122,38 @@ func TestInstallRootUnitWaitsForTheSwitchBack(t *testing.T) {
 		}
 	})
 
-	t.Run("split's unit has no condition", func(t *testing.T) {
+	t.Run("switch back: split's unit, still on disk, waits too", func(t *testing.T) {
 		h, unit, write := newHost(t, "SB_PRIVILEGE_MODE=split\n")
+		// A split run writes split's unit. With no marker, it starts.
 		h.run("split", write+writeEnvMarks+"setup_privilege_mode\nwrite_environment\nwrite_systemd_unit\n", unitVars...)
+		split := read(t, unit)
+		if !strings.Contains(split, "Description=AerolVM daemon (privilege mode split)") ||
+			!strings.Contains(split, "\nConditionPathExists=!"+h.marker+"\n") {
+			t.Fatalf("split's unit has no condition on the marker:\n%s", split)
+		}
+		if !unitWouldStart(split) {
+			t.Fatal("a split node's unit would not start")
+		}
+
+		// The switch back stops after write_environment, before
+		// write_systemd_unit replaces split's unit, as a reboot there would
+		// stop it. sandboxd.env already says single.
+		h.run("single", write+writeEnvMarks+"setup_privilege_mode\nwrite_environment\nexit 0\n", unitVars...)
+		if read(t, unit) != split {
+			t.Fatal("split's unit changed before write_systemd_unit")
+		}
+		if !h.markerThere() {
+			t.Fatal("the switch back changed the settings and wrote no marker")
+		}
+		if unitWouldStart(split) {
+			t.Fatal("after a reboot here, systemd would start split's sandboxd with settings that say single")
+		}
+
+		// The next run finishes the switch: root's unit, no marker, starts.
+		h.run("single", write+writeEnvMarks+"setup_privilege_mode\nwrite_environment\nwrite_systemd_unit\nleave_split_mode\n", unitVars...)
 		text := read(t, unit)
-		if !strings.Contains(text, "Description=AerolVM daemon (privilege mode split)") || strings.Contains(text, "Condition") {
-			t.Fatalf("split's unit:\n%s", text)
+		if !strings.HasPrefix(text, "[Unit]\nDescription=AerolVM daemon\n") || h.markerThere() || !unitWouldStart(text) {
+			t.Fatalf("the finished switch back left a unit that would not start, or the marker (there: %v):\n%s", h.markerThere(), text)
 		}
 	})
 }

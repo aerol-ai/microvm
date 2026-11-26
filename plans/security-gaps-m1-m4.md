@@ -1173,6 +1173,32 @@ stopped before step 1.
   nested vsock EOF, then run SP-B steps 1–4. Until then neither (a) nor (b)
   has a go.
 
+**Diagnosis (2026-11-26, offline, no AWS).**
+
+- **Warm pool: a bug, already fixed.** The spike's setup was right (the pool
+  was on and picked the template). The warm spawn did not put the template's
+  disk in the VM's folder before loading the snapshot. #1379 fixed that on
+  2026-11-21, after the spike ran; its test fails on the spike's build with
+  the same error and passes on main.
+- **Nested resume: most likely a torn first connection.** The error means the
+  guest accepted the host's first connection after the resume, then closed
+  it before answering. Firecracker resets every guest vsock connection on
+  resume, and the guest handles that reset a little later; on a nested
+  machine it can come after the first connection. The host's handshake
+  dials again only when the dial fails, not when an accepted connection is
+  torn. The proposed fix (dial again after a torn connection, inside the same
+  5 s budget) is in the KVM fast path and waits for the owner. The rerun has
+  an opt-in leg that tries it on one throwaway build.
+- **The kit for the next runs** is `integration-tests/k8s/m2/`: `spa.sh`
+  (SP-A on main: nested and metal benches with the warm pool, a failed start
+  tried three more times, busy and idle guests; a move on nested) and
+  `spb.sh` (SP-B steps 1–4 and the parked claim on one Nitro machine, no
+  SSH). Both print their cost first, refuse to start without
+  `--i-have-owner-approval`, have `--dry-run`, tag everything
+  `owner=aerolvm-spike`, stage through S3, power their machines off at a
+  deadline and check for leaks at the end. Estimates: SP-A about $3 planned,
+  $6.60 at worst; SP-B about $0.20 planned, $0.45 at worst.
+
 ### 4.3 Building (b): one driver, two backends
 
 | Change | Where |

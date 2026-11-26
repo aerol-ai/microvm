@@ -755,7 +755,11 @@ chmod 0755 /usr/local/bin/kind /usr/local/bin/kubectl /usr/local/lib/docker/cli-
 export PATH=/usr/local/go/bin:/usr/local/bin:$PATH GOTOOLCHAIN=auto
 
 say "tools ready: $(go version | cut -d' ' -f3), helm $(helm version --short), kind $(kind version | cut -d' ' -f2), $(docker buildx version | cut -d' ' -f2)"
-mkdir -p src && curl -fsSL --retry 5 '@SRC_URL@' | tar -xz -C src || { say "source download failed"; finish; }
+# The staged source, checked against the SHA-256 the launching script took
+# (not with pinned: its message would print the presigned link).
+curl -fsSL --retry 5 -o src.tgz '@SRC_URL@' && echo '@SRC_SHA@  src.tgz' | sha256sum -c --quiet - ||
+  { say "source download failed or checksum wrong"; finish; }
+mkdir -p src && tar -xzf src.tgz -C src || { say "source unpack failed"; finish; }
 cd src
 proof='@PROOF@'
 if [ "$proof" = gmove ]; then

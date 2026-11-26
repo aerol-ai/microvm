@@ -52,8 +52,10 @@ key="builds/fckind-${ref:0:12}/src.tgz"
 git -C "$root" archive --format=tar.gz -o "$sd/src.tgz" "$ref"
 aws s3 cp --only-show-errors "$sd/src.tgz" "s3://$bucket/$key"
 url="$(aws s3 presign "s3://$bucket/$key" --expires-in 7200)"
+# The machine checks the source against this before it unpacks it.
+sum="$( (sha256sum "$sd/src.tgz" 2>/dev/null || shasum -a 256 "$sd/src.tgz") | cut -d' ' -f1)"
 # Not sed: a presigned link is full of "&", which sed reads as the match.
-URL="$url" PROOF="${AEROL_FCKIND_PROOF:-pod}" python3 -c 'import os, sys; sys.stdout.write(open(sys.argv[1]).read().replace("@SRC_URL@", os.environ["URL"]).replace("@PROOF@", os.environ["PROOF"]))' \
+URL="$url" SUM="$sum" PROOF="${AEROL_FCKIND_PROOF:-pod}" python3 -c 'import os, sys; sys.stdout.write(open(sys.argv[1]).read().replace("@SRC_URL@", os.environ["URL"]).replace("@SRC_SHA@", os.environ["SUM"]).replace("@PROOF@", os.environ["PROOF"]))' \
   "$root/integration-tests/k8s/fckind/userdata.sh" > "$sd/userdata.sh"
 say "source ${ref:0:12} staged; launching $itype with nested virtualization"
 
