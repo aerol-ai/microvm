@@ -50,6 +50,9 @@ func (d *Driver) ExportSandboxSnapshot(ctx context.Context, sandboxID string, w 
 	if err := validateSandboxID(sandboxID); err != nil {
 		return fmt.Errorf("firecracker runtime: export %s: %w", sandboxID, err)
 	}
+	if d.nitro() {
+		return errNitroUnsupported("move with its memory")
+	}
 	d.mu.Lock()
 	_, running := d.vmms[sandboxID]
 	d.mu.Unlock()
@@ -183,6 +186,9 @@ func readSparseTable(r io.Reader, size, entry int64) ([]byteRange, error) {
 func (d *Driver) ImportSandboxSnapshot(ctx context.Context, sandboxID string, r io.Reader) error {
 	if err := validateSandboxID(sandboxID); err != nil {
 		return fmt.Errorf("firecracker runtime: import %s: %w", sandboxID, err)
+	}
+	if d.nitro() {
+		return errNitroUnsupported("move with its memory")
 	}
 	if d.pool == nil {
 		return fmt.Errorf("firecracker runtime: import %s: TAP pool not registered: %w", sandboxID, models.ErrRuntimeNotImplemented)

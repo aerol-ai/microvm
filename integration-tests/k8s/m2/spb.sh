@@ -23,7 +23,8 @@
 # Settings: AEROL_BUILD_REF (default HEAD), AEROL_PYTHON (for boto3),
 # M2_SPB_TYPE (m7i.xlarge), M2_SPB_POOL (6G@0: 20 VMs of 256 MiB fit after
 # the slot donations), M2_SPB_STEPS ("step1 step2 step3a step3b step4
-# parked"; step5, step6 and probe-* are there too), M2_PRICE_<TYPE>.
+# parked"; step5, step6, probe-* and sandboxd too; sandboxd runs AerolVM's
+# own sandboxd on the Nitro backend, plan §4.3), M2_PRICE_<TYPE>.
 # Results: integration-tests/k8s/.state/<run>/ (report.txt, spb.txt,
 # spb-results.tgz). Go (plan §4.2): steps 1-4 pass and a cold create is
 # under 2 s end to end.
@@ -45,7 +46,7 @@ pool="${M2_SPB_POOL:-6G@0}"
 steps="${M2_SPB_STEPS:-step1 step2 step3a step3b step4 parked}"
 [[ "$pool" =~ ^[0-9]+[GM](@[0-9]+)?(,[0-9]+[GM](@[0-9]+)?)*$ ]] || { echo "M2_SPB_POOL looks wrong: $pool" >&2; exit 2; }
 for s in $steps; do
-  case "$s" in step1 | step2 | step3a | step3b | step4 | step5 | step6 | parked | probe-pci-off | probe-dirty-pages | probe-min-mem | probe-pause) ;;
+  case "$s" in step1 | step2 | step3a | step3b | step4 | step5 | step6 | parked | sandboxd | probe-pci-off | probe-dirty-pages | probe-min-mem | probe-pause) ;;
     *) echo "unknown step \"$s\" in M2_SPB_STEPS" >&2; exit 2 ;;
   esac
 done
@@ -67,7 +68,7 @@ m2_bucket="aerol-itest-artifacts-$(m2_account)"
 m2_stage_src "$sha"
 src_sum="$M2_SUM"
 src_url="$(m2_get_url "$M2_KEY")"
-m2_stage_kit kit "$here" spb-run.sh spb-setup.sh spb.py spb_attest.py nsm-attest.go
+m2_stage_kit kit "$here" spb-run.sh spb-setup.sh spb.py spb_attest.py nsm-attest.go spb-sandboxd.sh spb_sandboxd.py
 kit_sum="$M2_SUM"
 kit_url="$(m2_get_url "$M2_KEY")"
 results_url="$(m2_put_url "spike-m2/$run/spb-results.tgz")"

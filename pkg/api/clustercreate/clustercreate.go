@@ -1119,7 +1119,7 @@ func writePlacementUnsatisfiable(w http.ResponseWriter, err error, writeError Er
 }
 
 func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
-	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+	if models.IsFirecracker(runtimeName) && overlaySizeGB > 0 {
 		return base + overlaySizeGB
 	}
 	return base

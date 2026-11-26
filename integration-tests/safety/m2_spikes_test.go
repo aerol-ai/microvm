@@ -484,6 +484,9 @@ func TestM2SpikeUserDataHasADeadlineAndChecksums(t *testing.T) {
 		// the results: the installer's output, the journal and the log
 		// copy all go through mask.
 		"m2/spa-userdata.sh": {"--build-from-source 2>&1 | mask", "| mask | gzip", "mask </var/log/spa.log"},
+		// The same for the sandboxd step: its log and its setup log go
+		// up masked, and so does a failed setup's tail on the console.
+		"m2/spb-run.sh": {`for f in /var/log/sandboxd.log /root/spb-sandboxd-setup.log; do`, `sed "s/$(cat /root/pat 2>/dev/null || echo NOPAT)/<pat>/g" "$f" | gzip`, `tail -15 /root/spb-sandboxd-setup.log | sed "s/$(cat /root/pat`},
 	} {
 		b, err := os.ReadFile(k8sFile(t, f))
 		if err != nil {
@@ -495,9 +498,120 @@ func TestM2SpikeUserDataHasADeadlineAndChecksums(t *testing.T) {
 			}
 		}
 	}
-	for _, f := range []string{"spa.sh", "spb.sh", "leak-check.sh", "lib.sh", "spa-userdata.sh", "spb-userdata.sh", "spb-run.sh", "spb-setup.sh"} {
+	for _, f := range []string{"spa.sh", "spb.sh", "leak-check.sh", "lib.sh", "spa-userdata.sh", "spb-userdata.sh", "spb-run.sh", "spb-setup.sh", "spb-sandboxd.sh"} {
 		if out, err := exec.Command("bash", "-n", k8sFile(t, "m2", f)).CombinedOutput(); err != nil {
 			t.Errorf("bash -n %s: %v\n%s", f, err, out)
 		}
+	}
+}
+
+// nitroStandIn is sandboxd on a Nitro node, as far as the SP-B "sandboxd"
+// step (spb_sandboxd.py, plan §4.3) asks it things. noEgress makes every
+// guest fail to reach the internet.
+type nitroStandIn struct {
+	mu       sync.Mutex
+	next     int
+	noEgress bool
+}
+
+func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	reply := func(code int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	var body map[string]any
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	refuse := func(op string) {
+		reply(http.StatusNotImplemented, map[string]string{"error": `runtime "firecracker-nitro" cannot ` + op + ` yet on this build: runtime not yet implemented on this build`})
+	}
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/runtimes":
+		reply(200, map[string]any{"runtimes": []map[string]any{
+			{"name": "docker", "available": true},
+			{"name": "firecracker", "backend": "kvm", "available": false},
+			{"name": "firecracker-nitro", "backend": "nitro", "available": true},
+		}})
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/sandboxes":
+		if body["runtime"] != "firecracker-nitro" {
+			reply(http.StatusNotImplemented, map[string]string{"error": fmt.Sprintf(`runtime %q is not offered here (offered: docker, firecracker-nitro)`, body["runtime"])})
+			return
+		}
+		s.mu.Lock()
+		s.next++
+		id := fmt.Sprintf("sb-%d", s.next)
+		s.mu.Unlock()
+		reply(http.StatusCreated, map[string]any{"id": id, "status": "started", "runtime": "firecracker-nitro", "backend": "nitro"})
+	case strings.HasSuffix(r.URL.Path, "/toolbox/process/execute"):
+		cmd, _ := body["command"].(string)
+		out := ""
+		switch {
+		case strings.Contains(cmd, "ran-"):
+			out = "ran-42"
+		case strings.Contains(cmd, "nitro-file"):
+			out = "nitro-file"
+		case strings.Contains(cmd, "wget"):
+			out = "net-ok"
+			if s.noEgress {
+				out = "net-fail"
+			}
+		case cmd == "uname -r":
+			out = "6.18.62"
+		case cmd == "cat /proc/cmdline":
+			out = "console=ttyS0 reboot=k panic=1 nomodules quiet ipv6.disable_ipv6=1 init=/usr/local/bin/toolboxd-init root=/dev/vda"
+		default:
+			out = "0"
+		}
+		reply(200, map[string]any{"stdout": out, "exit_code": 0})
+	case strings.HasSuffix(r.URL.Path, "/stop"):
+		refuse("stop")
+	case strings.HasSuffix(r.URL.Path, "/snapshot"):
+		refuse("take a snapshot")
+	case r.Method == http.MethodDelete:
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		reply(http.StatusNotFound, map[string]string{"error": "stand-in: " + r.Method + " " + r.URL.Path})
+	}
+}
+
+// The SP-B "sandboxd" step (plan §4.3) judges AerolVM's own sandboxd on a
+// Nitro node through its API: run against a stand-in that behaves, the
+// verdict is go; with guests that cannot reach the internet it is NO GO.
+// Only the steps asked for are judged, so a sandboxd-only run is not a
+// failed SP-B for steps 1-4 it never ran.
+func TestM2SPBSandboxdStepVerdict(t *testing.T) {
+	needTools(t, "python3")
+	for _, c := range []struct {
+		name     string
+		noEgress bool
+		want     string
+	}{
+		{"guests reach the internet", false, "VERDICT SP-B: go"},
+		{"guests cannot reach the internet", true, "VERDICT SP-B: NO GO"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(&nitroStandIn{noEgress: c.noEgress})
+			defer srv.Close()
+			dir := t.TempDir()
+			pat, results := filepath.Join(dir, "pat"), filepath.Join(dir, "results.jsonl")
+			if err := os.WriteFile(pat, []byte("standin\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			spb := k8sFile(t, "m2", "spb.py")
+			// Not -I: spb.py imports spb_sandboxd from its own folder, as
+			// it does on the node (spb-run.sh).
+			run := exec.Command("python3", spb, "sandboxd", "--samples", "3", "--results", results)
+			run.Env = append(os.Environ(), "SPB_API="+srv.URL, "SPB_PAT_FILE="+pat)
+			run.Dir = filepath.Dir(spb)
+			if out, err := run.CombinedOutput(); err != nil {
+				t.Fatalf("spb.py sandboxd: %v\n%s", err, out)
+			}
+			v := exec.Command("python3", spb, "verdict", "--results", results, "--steps", "sandboxd")
+			v.Dir = filepath.Dir(spb)
+			out, _ := v.CombinedOutput()
+			if !strings.Contains(string(out), c.want) || strings.Contains(string(out), "VERDICT step1") {
+				t.Fatalf("verdict: want %q and no step1 line\n%s", c.want, out)
+			}
+		})
 	}
 }

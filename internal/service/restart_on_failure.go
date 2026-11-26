@@ -77,7 +77,7 @@ func restartBackoff(failures int) time.Duration {
 // runtime (config refuses firecracker, wasm and isolate as the default).
 func restartOnFailureRuntimeSupported(runtime string) bool {
 	switch runtime {
-	case models.RuntimeFirecracker, models.RuntimeWasm, models.RuntimeIsolate:
+	case models.RuntimeFirecracker, models.RuntimeFirecrackerNitro, models.RuntimeWasm, models.RuntimeIsolate:
 		return false
 	}
 	return true

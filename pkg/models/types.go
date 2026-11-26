@@ -164,8 +164,9 @@ const (
 	// KVM, on ordinary (not metal) EC2 machines
 	// (plans/security-gaps-m1-m4.md §4.3). A separate name, so a create for
 	// "firecracker" always gets today's KVM VM with snapshots and pause, and
-	// is never moved to a backend that has neither. Reserved until the Nitro
-	// driver lands: every create refuses it (ErrRuntimeNotImplemented).
+	// is never moved to a backend that has neither. A node offers it only
+	// with SB_FIRECRACKER_BACKEND=nitro, and then does not offer
+	// "firecracker".
 	RuntimeFirecrackerNitro = "firecracker-nitro"
 	// RuntimeWasm selects the WASM/WASI runtime (plans/wasm-runtime.md).
 	// ValidRuntime accepts the identifier ahead of the implementation; create
@@ -300,6 +301,14 @@ func (g *GPURequest) Validate() error {
 		return fmt.Errorf("gpu count must be -1 (all), 0 (default 1), or a positive integer")
 	}
 	return nil
+}
+
+// IsFirecracker reports a Firecracker VM on either backend: the same driver,
+// the same TAP networking, egress rules and agent. Use it where the backend
+// does not matter; compare with RuntimeFirecracker where it does (templates,
+// memory snapshots, memory moves: KVM only).
+func IsFirecracker(runtime string) bool {
+	return runtime == RuntimeFirecracker || runtime == RuntimeFirecrackerNitro
 }
 
 // ValidRuntime normalizes and validates a user-facing runtime identifier.

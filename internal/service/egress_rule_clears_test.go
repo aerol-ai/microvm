@@ -378,6 +378,7 @@ func TestRuleScopes(t *testing.T) {
 		want string
 	}{
 		{models.Sandbox{Runtime: models.RuntimeFirecracker}, models.RuntimeFirecracker},
+		{models.Sandbox{Runtime: models.RuntimeFirecrackerNitro}, models.RuntimeFirecracker},
 		{models.Sandbox{Runtime: models.RuntimeDocker}, models.ContainerEngineDocker},
 		{models.Sandbox{Runtime: models.RuntimeDocker, Engine: models.ContainerEngineContainerd}, models.ContainerEngineContainerd},
 	} {

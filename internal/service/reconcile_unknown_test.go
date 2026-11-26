@@ -318,11 +318,12 @@ func TestReconcileUnknownMarkFailures(t *testing.T) {
 
 func TestReconcileRuntimeLabel(t *testing.T) {
 	cases := map[string]*models.Sandbox{
-		"docker":      {Runtime: models.RuntimeDocker},
-		"containerd":  {Runtime: models.RuntimeGvisor, Engine: models.ContainerEngineContainerd},
-		"firecracker": {Runtime: models.RuntimeFirecracker},
-		"wasm":        {Runtime: models.RuntimeWasm},
-		"isolate":     {Runtime: models.RuntimeIsolate},
+		"docker":            {Runtime: models.RuntimeDocker},
+		"containerd":        {Runtime: models.RuntimeGvisor, Engine: models.ContainerEngineContainerd},
+		"firecracker":       {Runtime: models.RuntimeFirecracker},
+		"firecracker-nitro": {Runtime: models.RuntimeFirecrackerNitro},
+		"wasm":              {Runtime: models.RuntimeWasm},
+		"isolate":           {Runtime: models.RuntimeIsolate},
 	}
 	for want, sb := range cases {
 		if got := reconcileRuntimeLabel(sb); got != want {

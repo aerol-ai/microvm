@@ -151,6 +151,24 @@ type Vsock struct {
 	UDSPath  string `json:"uds_path"`
 }
 
+// Enclave is the PUT /enclave request (Firecracker v1.18+): sent before
+// InstanceStart, it runs the VM as a Nitro Sandbox through
+// /dev/nitro_enclaves instead of on KVM. Every field is sent, so the
+// request never leans on Firecracker's defaults (confidential mode,
+// dedicated cores). Firecracker refuses unknown fields.
+type Enclave struct {
+	// DirectMode keeps the host's read/write access to the VM's memory.
+	// False is confidential mode.
+	DirectMode bool `json:"direct_mode"`
+	// DebugMode turns on the serial console; in confidential mode it also
+	// zeroes the attestation PCRs. Never on for a tenant sandbox.
+	DebugMode bool `json:"debug_mode"`
+	// CPUOvercommit time-shares vCPUs over the host's CPUs instead of
+	// taking whole dedicated cores, so any vCPU count fits, up to 5 vCPUs
+	// per host vCPU in all.
+	CPUOvercommit bool `json:"cpu_overcommit"`
+}
+
 // Logger attaches a file-backed logger. Optional; useful for capturing
 // Firecracker's own diagnostic output (boot errors, snapshot fault messages)
 // alongside the VMM process group's stderr.

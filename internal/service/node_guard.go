@@ -367,7 +367,7 @@ func (s *Service) requireNodeGuard(chosenRuntime string) error {
 // guarded in-process.
 func (s *Service) nodeGuardRuntimeName(chosenRuntime string) string {
 	switch chosenRuntime {
-	case models.RuntimeFirecracker:
+	case models.RuntimeFirecracker, models.RuntimeFirecrackerNitro:
 		return models.RuntimeFirecracker
 	case models.RuntimeWasm, models.RuntimeIsolate:
 		return ""

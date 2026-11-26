@@ -28,7 +28,7 @@ func firecrackerVMKeeper(db sandboxGetter) fcruntime.VMMKeeper {
 		if err != nil {
 			return false, err
 		}
-		if sandbox.Runtime != models.RuntimeFirecracker {
+		if !models.IsFirecracker(sandbox.Runtime) {
 			return false, nil
 		}
 		switch sandbox.Status {

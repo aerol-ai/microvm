@@ -118,7 +118,7 @@ func TestRuntimeTableValues(t *testing.T) {
 		{RuntimeGvisor, IsolationUserSpaceKernel, "", RuntimeFeatures{Moves: MovesMemory, WarmPool: WarmPoolKindParked}, nil, false},
 		{RuntimeKata, IsolationHardwareVM, "", RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindNone}, nil, true},
 		{RuntimeFirecracker, IsolationHardwareVM, "kvm", RuntimeFeatures{Snapshots: true, Pause: true, Moves: MovesMemory, WarmPool: WarmPoolKindSnapshot}, nil, false},
-		{RuntimeFirecrackerNitro, IsolationHardwareVM, "nitro", RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindNone}, nil, true},
+		{RuntimeFirecrackerNitro, IsolationHardwareVM, "nitro", RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindNone}, nil, false},
 		{RuntimeWasm, IsolationWasm, "", RuntimeFeatures{Moves: MovesMemory, WarmPool: WarmPoolKindParked}, &RuntimeLimits{MaxCheckpointMemoryMB: 1024}, false},
 		{RuntimeIsolate, IsolationV8Isolate, "", RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindParked}, nil, false},
 	} {
@@ -179,7 +179,7 @@ func TestListRuntimes(t *testing.T) {
 		RuntimeDocker:           3,
 		RuntimeFirecracker:      1,
 		RuntimeKata:             2,  // listed in SB_HOST_RUNTIMES, but reserved
-		RuntimeFirecrackerNitro: 1,  // reserved until its driver lands
+		RuntimeFirecrackerNitro: 2,  // a Nitro node pool
 		RuntimeWasm:             -1, // never trusted below zero
 		"runc":                  4,  // free text no create accepts
 	}
@@ -190,10 +190,10 @@ func TestListRuntimes(t *testing.T) {
 		available map[string]bool
 		nodes     map[string]int
 	}{
-		{name: "tenant", offers: offers, available: map[string]bool{RuntimeDocker: true, RuntimeFirecracker: true}},
+		{name: "tenant", offers: offers, available: map[string]bool{RuntimeDocker: true, RuntimeFirecracker: true, RuntimeFirecrackerNitro: true}},
 		{name: "fleet admin", offers: offers, withNodes: true,
-			available: map[string]bool{RuntimeDocker: true, RuntimeFirecracker: true},
-			nodes:     map[string]int{RuntimeDocker: 3, RuntimeGvisor: 0, RuntimeKata: 0, RuntimeFirecracker: 1, RuntimeFirecrackerNitro: 0, RuntimeWasm: 0, RuntimeIsolate: 0}},
+			available: map[string]bool{RuntimeDocker: true, RuntimeFirecracker: true, RuntimeFirecrackerNitro: true},
+			nodes:     map[string]int{RuntimeDocker: 3, RuntimeGvisor: 0, RuntimeKata: 0, RuntimeFirecracker: 1, RuntimeFirecrackerNitro: 2, RuntimeWasm: 0, RuntimeIsolate: 0}},
 		{name: "nothing offered", offers: nil, available: map[string]bool{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

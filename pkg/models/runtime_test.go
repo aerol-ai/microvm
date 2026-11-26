@@ -112,3 +112,15 @@ func TestRuntimeUsesEgressGateway(t *testing.T) {
 		}
 	}
 }
+
+// Either backend is a Firecracker VM; nothing else is.
+func TestIsFirecracker(t *testing.T) {
+	for rt, want := range map[string]bool{
+		RuntimeFirecracker: true, RuntimeFirecrackerNitro: true,
+		"": false, RuntimeDocker: false, RuntimeGvisor: false, RuntimeKata: false, RuntimeWasm: false, RuntimeIsolate: false, "firecracker-kvm": false,
+	} {
+		if got := IsFirecracker(rt); got != want {
+			t.Errorf("IsFirecracker(%q) = %v, want %v", rt, got, want)
+		}
+	}
+}

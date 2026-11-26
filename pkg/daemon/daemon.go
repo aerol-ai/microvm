@@ -2209,7 +2209,9 @@ func supportedRuntimesForConfig(cfg config.Config) (runtimes, switchedOff []stri
 		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeGvisor)
 	}
 	if cfg.EnableFirecracker {
-		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeFirecracker)
+		// One name per node: firecracker-nitro on the Nitro backend, so a
+		// create that asked for KVM's snapshots and pause never lands here.
+		runtimes = appendRuntimeIfMissing(runtimes, cfg.FirecrackerRuntime())
 	}
 	if cfg.EnableWasm && cfg.IsWorker() {
 		runtimes = appendRuntimeIfMissing(runtimes, models.RuntimeWasm)
@@ -2222,11 +2224,12 @@ func supportedRuntimesForConfig(cfg config.Config) (runtimes, switchedOff []stri
 
 // runtimeSwitchedOff reports whether name is a runtime with its own switch
 // that this node has off. Names with no switch (docker, gvisor, the reserved
-// kata, free text) are never switched off here.
+// kata, free text) are never switched off here. The two Firecracker names
+// are one switch and the backend: only the node's own backend is on.
 func runtimeSwitchedOff(cfg config.Config, name string) bool {
 	switch name {
-	case models.RuntimeFirecracker:
-		return !cfg.EnableFirecracker
+	case models.RuntimeFirecracker, models.RuntimeFirecrackerNitro:
+		return !cfg.EnableFirecracker || name != cfg.FirecrackerRuntime()
 	case models.RuntimeWasm:
 		return !cfg.EnableWasm || !cfg.IsWorker()
 	case models.RuntimeIsolate:
@@ -2241,7 +2244,7 @@ func warnSwitchedOffRuntimes(logger *slog.Logger, switchedOff []string) {
 	if logger == nil || len(switchedOff) == 0 {
 		return
 	}
-	logger.Warn("SB_HOST_RUNTIMES lists runtimes this node cannot run, so it does not advertise them: turn on SB_ENABLE_FIRECRACKER, SB_ENABLE_WASM or SB_ENABLE_ISOLATE (WASM and isolate run only on a worker), or remove them from SB_HOST_RUNTIMES",
+	logger.Warn("SB_HOST_RUNTIMES lists runtimes this node cannot run, so it does not advertise them: turn on SB_ENABLE_FIRECRACKER, SB_ENABLE_WASM or SB_ENABLE_ISOLATE (WASM and isolate run only on a worker; firecracker-nitro only with SB_FIRECRACKER_BACKEND=nitro, firecracker only without it), or remove them from SB_HOST_RUNTIMES",
 		"runtimes", strings.Join(switchedOff, ","))
 }
 

@@ -164,6 +164,10 @@ func TestSupportedRuntimesForConfig(t *testing.T) {
 		{name: "wasm_enabled_ingress_does_not_advertise_wasm", cfg: config.Config{EnableWasm: true, NodeRole: config.NodeRoleIngress}, want: []string{models.RuntimeDocker}},
 		{name: "wasm_enabled_server_does_not_advertise_wasm", cfg: config.Config{EnableWasm: true, NodeRole: config.NodeRoleServer}, want: []string{models.RuntimeDocker}},
 		{name: "firecracker_enabled_advertises_fc", cfg: config.Config{EnableFirecracker: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
+		{name: "firecracker_kvm_backend_advertises_fc", cfg: config.Config{EnableFirecracker: true, FirecrackerBackend: config.FirecrackerBackendKVM}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker}},
+		// A Nitro node offers only its own name: a create that asked for
+		// KVM's snapshots and pause must never be placed on it.
+		{name: "firecracker_nitro_backend_advertises_nitro_only", cfg: config.Config{EnableFirecracker: true, FirecrackerBackend: config.FirecrackerBackendNitro}, want: []string{models.RuntimeDocker, models.RuntimeFirecrackerNitro}},
 		{name: "both_enabled", cfg: config.Config{EnableFirecracker: true, EnableWasm: true}, want: []string{models.RuntimeDocker, models.RuntimeFirecracker, models.RuntimeWasm}},
 		// The isolate flag must advertise like wasm's — same placement-bug
 		// class if omitted: cluster mode would reject every isolate create
@@ -223,6 +227,15 @@ func TestSupportedRuntimesDropsSwitchedOffRuntimes(t *testing.T) {
 		{name: "only a switched-off runtime listed: docker, as with none listed",
 			cfg:  config.Config{HostSupportedRuntimes: []string{" firecracker ", ""}},
 			want: []string{models.RuntimeDocker}, dropped: []string{models.RuntimeFirecracker}},
+		{name: "nitro listed on a kvm node",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeFirecrackerNitro}, EnableFirecracker: true},
+			want: []string{models.RuntimeDocker, models.RuntimeFirecracker}, dropped: []string{models.RuntimeFirecrackerNitro}},
+		{name: "firecracker listed on a nitro node",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeFirecracker}, EnableFirecracker: true, FirecrackerBackend: config.FirecrackerBackendNitro},
+			want: []string{models.RuntimeDocker, models.RuntimeFirecrackerNitro}, dropped: []string{models.RuntimeFirecracker}},
+		{name: "nitro listed, switch off",
+			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeDocker, models.RuntimeFirecrackerNitro}, FirecrackerBackend: config.FirecrackerBackendNitro},
+			want: []string{models.RuntimeDocker}, dropped: []string{models.RuntimeFirecrackerNitro}},
 		{name: "names with no switch stay",
 			cfg:  config.Config{HostSupportedRuntimes: []string{models.RuntimeGvisor, models.RuntimeKata, "custom"}},
 			want: []string{models.RuntimeGvisor, models.RuntimeKata, "custom"}},

@@ -224,7 +224,8 @@ func (s *Service) isCheckpointMovable(sb *models.Sandbox) bool {
 func (s *Service) snapshotMoverFor(sb *models.Sandbox) (snapshotMover, error) {
 	var rt any
 	switch {
-	case s.isFirecrackerSandbox(sb):
+	// KVM only: a Nitro VM has no memory snapshot to move.
+	case sb != nil && sb.Runtime == models.RuntimeFirecracker:
 		if s.firecracker != nil {
 			rt = s.firecracker
 		}

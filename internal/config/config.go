@@ -1342,9 +1342,9 @@ type Config struct {
 	// (the default; /dev/kvm on metal or with nested virtualization) or
 	// "nitro" (Nitro Enclaves' direct mode on ordinary EC2 machines,
 	// plans/security-gaps-m1-m4.md §4.3). Per node: a machine cannot have
-	// both. A KVM node keeps today's whole fast path. A Nitro node will
-	// offer the firecracker-nitro runtime instead of firecracker; until its
-	// driver lands, Load refuses "nitro". SB_FIRECRACKER_BACKEND.
+	// both. A KVM node keeps today's whole fast path. A Nitro node offers
+	// the firecracker-nitro runtime instead of firecracker
+	// (FirecrackerRuntime). SB_FIRECRACKER_BACKEND.
 	FirecrackerBackend string
 	// FirecrackerNitroMode is how a Nitro node runs its VMs: "direct" (the
 	// default; the host can still read the VM's memory) or "confidential"
@@ -3074,7 +3074,7 @@ func load(keyTool bool) (Config, error) {
 	if cfg.FirecrackerSnapshotVerifyMode != "once" && cfg.FirecrackerSnapshotVerifyMode != "always" {
 		return Config{}, errors.New("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE must be either once or always")
 	}
-	if err := validateFirecrackerBackend(cfg.FirecrackerBackend, cfg.FirecrackerNitroMode); err != nil {
+	if err := validateFirecrackerBackend(cfg); err != nil {
 		return Config{}, err
 	}
 	if cfg.AutoImportEnabled {

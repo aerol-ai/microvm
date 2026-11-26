@@ -590,10 +590,22 @@ def probe(a):
 COLD_GO_MS = 2000.0
 
 
-def verdict(path):
+def asked_steps(path="/opt/spb/steps"):
+    """The steps this run was asked for (spb-userdata.sh writes them), or
+    None when the file is not there (a verdict read off the machine)."""
+    try:
+        with open(path) as f:
+            return set(f.read().split())
+    except OSError:
+        return None
+
+
+def verdict(path, asked=None):
     """Plan §4.2's go for SP-B: steps 1-4 pass and a cold create (process
     start to toolboxd's ping) is under 2 s at the p50. One SPB VERDICT line
-    per step, then the overall one. Returns True on go."""
+    per step, then the overall one. Returns True on go. With asked (the
+    steps the run was asked for), only those are judged: a run of the
+    sandboxd step alone (plan §4.3) is not a failed SP-B."""
     last = {}
     try:
         for line in open(path):
@@ -610,6 +622,13 @@ def verdict(path):
         return ok
 
     oks = []
+    if asked is not None and asked.isdisjoint({"step1", "step2", "step3a", "step3b", "step4"}):
+        if "sandboxd" in asked:
+            import spb_sandboxd
+            oks.append(line("sandboxd", *spb_sandboxd.verdict(last.get("sandboxd"))))
+        go = bool(oks) and all(oks)
+        say("VERDICT SP-B: %s" % ("go" if go else "NO GO"))
+        return go
     r = last.get("step1-direct-overcommit-1vcpu")
     if r:
         p50 = (r.get("total_ms") or {}).get("p50_ms")
@@ -646,12 +665,16 @@ def verdict(path):
     if r:
         say("VERDICT parked (R19, information): %s booted ahead; claim p50 %s ms, claim + first exec p50 %s ms"
             % (r.get("booted"), (r.get("claim_ms") or {}).get("p50_ms"), (r.get("claim_plus_first_exec_ms") or {}).get("p50_ms")))
+    if asked is not None and "sandboxd" in asked:
+        import spb_sandboxd
+        oks.append(line("sandboxd", *spb_sandboxd.verdict(last.get("sandboxd"))))
     go = all(oks)
     say("VERDICT SP-B: %s" % ("go" if go else "NO GO"))
     return go
 
 
 def main():
+    global RESULTS  # the sandboxd step records to --results
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd")
     ap.add_argument("--samples", type=int, default=20)
@@ -664,9 +687,18 @@ def main():
     ap.add_argument("--kernel", default="bzImage")
     ap.add_argument("--initrd", default="")
     ap.add_argument("--results", default=RESULTS)
+    # --steps: the steps to judge, for a verdict read off the machine.
+    ap.add_argument("--steps", default=None)
     a = ap.parse_args()
     if a.cmd == "verdict":
-        sys.exit(0 if verdict(a.results) else 1)
+        sys.exit(0 if verdict(a.results, set(a.steps.split()) if a.steps is not None else asked_steps()) else 1)
+    if a.cmd == "sandboxd":
+        # sandboxd's own VMs through its API: no root, and no clean()
+        # around it (that kills the spb- VMs, not sandboxd's).
+        RESULTS = a.results
+        import spb_sandboxd
+        spb_sandboxd.run(a, record, say)
+        return
     if os.geteuid() != 0:
         sys.exit("spb.py: run as root")
     os.makedirs(os.path.join(JAIL, "firecracker"), exist_ok=True)

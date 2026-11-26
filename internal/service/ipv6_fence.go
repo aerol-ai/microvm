@@ -48,7 +48,7 @@ func (s *Service) requireIPv6Fence(chosenRuntime string) error {
 // on the node.
 func ipv6FenceRuntime(chosenRuntime, engine string) string {
 	switch chosenRuntime {
-	case models.RuntimeFirecracker:
+	case models.RuntimeFirecracker, models.RuntimeFirecrackerNitro:
 		return models.RuntimeFirecracker
 	case models.RuntimeWasm, models.RuntimeIsolate:
 		return ""
