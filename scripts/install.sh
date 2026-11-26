@@ -3128,9 +3128,11 @@ write_systemd_unit() {
 	# first, and leave_split_mode removes the marker last). A reboot in that
 	# window would start this root sandboxd on folders split's user still
 	# owns; the condition makes systemd skip the start instead, so the node
-	# waits for the installer. A skipped start is no failure: Restart= and
-	# the healthcheck timer leave the unit alone. Defaulted: the unit render
-	# tests run this under set -u without the flag parsing that sets it.
+	# waits for the installer. Split's unit, on disk until this function
+	# replaces it, has the same condition (split_sandboxd_unit). A skipped
+	# start is no failure: Restart= and the healthcheck timer leave the
+	# unit alone. Defaulted: the unit render tests run this under set -u
+	# without the flag parsing that sets it.
 	if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
 		split_sandboxd_unit > /etc/systemd/system/sandboxd.service
 		return 0
@@ -4049,9 +4051,12 @@ stage_switch_back_kernel() {
 # finish_firecracker_after_switch_back puts single's guest kernel and
 # templates folder in place, now that leave_split_mode has given sandboxd's
 # folders back to root: a copy of the kernel stage_switch_back_kernel chose.
-# leave_split_mode has already removed the old kernel, before it removed the
-# switch-back marker, so a run cut off before this copy leaves no kernel,
-# and the next run installs the pinned one instead of keeping the old one.
+# leave_split_mode has already removed the old kernel and its config, before
+# it removed the switch-back marker, so a run cut off before this copy
+# leaves no kernel, and the next run installs the pinned one instead of
+# keeping the old one. Nothing is at either path now (leave_split_mode
+# stopped at anything it could not remove), so install writes new files
+# there and never copies into a folder.
 finish_firecracker_after_switch_back() {
 	[[ -n "${FIRECRACKER_KERNEL_FOR_SWITCH_BACK:-}" ]] || return 0
 	local from="$FIRECRACKER_KERNEL_FOR_SWITCH_BACK"
@@ -4851,6 +4856,12 @@ EOF
 # left in its folders, and make the folder for the egress gateway's lookup
 # socket. RuntimeDirectory makes /run/sandboxd sandboxd's and keeps it
 # across restarts: the sandboxes' files there outlive a sandboxd restart.
+# Like root's unit, it does not start while PRIVILEGE_SWITCH_BACK_MARKER is
+# there. On a switch back, mark_switch_back and write_environment run
+# before write_systemd_unit replaces this unit: a reboot in between would
+# start sandboxd as split's user with settings that already say single.
+# A split node never has the marker (check_privilege_mode_change refuses
+# a split run while it is there), so split runs as before.
 split_sandboxd_unit() {
 	local groups="$ROOTD_SOCKET_GROUP $WASM_WORKER_GROUP" runtime="sandboxd" writable=""
 	# --pat-scope host: sandboxd gives Caddy its public API socket by group.
@@ -4874,6 +4885,10 @@ Description=AerolVM daemon (privilege mode split)
 After=aerolvm-rootd.service containerd.service caddy.service network-online.target
 Wants=network-online.target
 Requires=aerolvm-rootd.service
+# The file named below exists only while a switch back to privilege mode
+# single is unfinished. sandboxd does not start until install.sh
+# --privilege-mode single finishes the switch and removes the file.
+ConditionPathExists=!$PRIVILEGE_SWITCH_BACK_MARKER
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
@@ -5080,20 +5095,30 @@ leave_split_mode() {
 		done
 	fi
 	systemctl disable --now aerolvm-rootd.service 2>/dev/null || true
-	# Single's guest kernel was sandboxd's user's to change in split, and
-	# every new VM boots it: it goes while the marker still says the switch
-	# is unfinished, so no run, however it stops, keeps it.
-	# finish_firecracker_after_switch_back copies the new one in.
+	# Single's guest kernel and its build config were sandboxd's user's to
+	# change in split, and every new VM boots that kernel: both go while the
+	# marker still says the switch is unfinished, so no run, however it
+	# stops, keeps them. finish_firecracker_after_switch_back copies the
+	# new pair in.
 	# Only a file or a link goes here. sandboxd's user could have made a
-	# folder (or a pipe, a socket, a device) at this path in split; rm -f
-	# cannot remove it, and root does not go into it. A link is removed,
-	# never followed. The run stops with the marker still there, so the
-	# next run, after the operator has looked, finishes the switch.
-	if [[ ! -L "$FIRECRACKER_KERNEL_PATH" && -e "$FIRECRACKER_KERNEL_PATH" && ! -f "$FIRECRACKER_KERNEL_PATH" ]]; then
-		echo "The switch back to privilege mode single stopped: $FIRECRACKER_KERNEL_PATH should be Firecracker's guest kernel file, but it is a folder or another kind of file. sandboxd's user could change it while this node ran in split mode, so the installer does not remove it or look inside it. Check what it holds, remove it (sudo rm -r $FIRECRACKER_KERNEL_PATH), then run install.sh --privilege-mode single again, with your other flags, to finish the switch back." >&2
+	# folder (or a pipe, a socket, a device) at either path in split; rm -f
+	# cannot remove it, and root does not go into it. At the config's path
+	# a folder would also fool the copy: install puts the new config inside
+	# the folder and reports success, then sandboxd's VMGENID check and the
+	# next run both find no config. A link is removed, never followed. Both
+	# paths are checked before either goes, so a stop removes nothing; the
+	# marker stays, and the next run, after the operator has looked,
+	# finishes the switch.
+	local f what
+	for f in "$FIRECRACKER_KERNEL_PATH" "${FIRECRACKER_KERNEL_PATH}.config"; do
+		[[ ! -L "$f" && -e "$f" && ! -f "$f" ]] || continue
+		what="Firecracker's guest kernel file"
+		[[ "$f" == "$FIRECRACKER_KERNEL_PATH" ]] || what="the build config file of Firecracker's guest kernel"
+		echo "The switch back to privilege mode single stopped: $f should be $what, but it is a folder or another kind of file. sandboxd's user could change it while this node ran in split mode, so the installer does not remove it or look inside it. Check what it holds, remove it (sudo rm -r $f), then run install.sh --privilege-mode single again, with your other flags, to finish the switch back." >&2
 		exit 1
-	fi
+	done
 	rm -f "$FIRECRACKER_KERNEL_PATH"
+	rm -f "${FIRECRACKER_KERNEL_PATH}.config"
 	# Done: from here sandboxd.env alone says this node runs single.
 	rm -f "$PRIVILEGE_SWITCH_BACK_MARKER"
 }
