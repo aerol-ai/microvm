@@ -2,6 +2,7 @@ package kubepod
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -35,7 +36,19 @@ const (
 	// (Driver.retryMin and retryMax, which tests shrink).
 	watchRetryMin = 200 * time.Millisecond
 	watchRetryMax = 30 * time.Second
+	// shortWatch: a watch the server ends this soon with no event is an
+	// error (Driver.shortWatch).
+	shortWatch = time.Second
+	// ExitLost is the exit code a sandbox gets when its pod goes away with
+	// no end seen (removed by force, or its node lost): the kubelet's own
+	// code for a container it cannot find (ContainerStatusUnknown). Never 0:
+	// the service reads 0 as "the program exited", and restart-on-failure
+	// would not restart a sandbox that was lost.
+	ExitLost = 137
 )
+
+// errShortWatch is a watch the server ended at once with no event.
+var errShortWatch = errors.New("kubepod: the pod watch ended at once with no events")
 
 // podCache is the watch's view of this worker's pods. Each pod in it is
 // the object one event carried and is never changed after it is stored,
@@ -218,11 +231,11 @@ func (c *podCache) observeLocked(p *Pod, emit bool) {
 
 // removedLocked records that p is gone. A sandbox seen running whose exit
 // was never seen (a pod removed by force, or on a node that went away)
-// exits now, at the time its deletion was asked for.
+// exits now, with ExitLost, at the time its deletion was asked for.
 func (c *podCache) removedLocked(p *Pod) {
 	uid := p.Metadata.UID
 	if run := c.runs[uid]; run != nil && run.started && !run.ended {
-		c.publishLocked(eventOf(p, "die", 0, p.Metadata.DeletionTimestamp))
+		c.publishLocked(eventOf(p, "die", ExitLost, p.Metadata.DeletionTimestamp))
 	}
 	delete(c.runs, uid)
 	now := c.now()
@@ -276,12 +289,18 @@ func (d *Driver) RunWatch(ctx context.Context) {
 			d.cache.replace(pods, rv)
 			relist = false
 		}
-		d.cache.setLive(true)
 		delivered := false
-		err := d.client.WatchPods(ctx, d.cfg.Namespace, d.selector(), d.cache.version(), func(ev WatchEvent) error {
-			delivered = true
-			return d.cache.apply(ev)
-		})
+		began := time.Now()
+		// The view goes live only once the server has answered the watch:
+		// while a new watch is still being opened (it may hang until its
+		// header timeout), reads go to the API server, never to a view
+		// that stopped changing when the last watch failed.
+		err := d.client.WatchPods(ctx, d.cfg.Namespace, d.selector(), d.cache.version(),
+			func() { d.cache.setLive(true) },
+			func(ev WatchEvent) error {
+				delivered = true
+				return d.cache.apply(ev)
+			})
 		d.cache.setLive(false)
 		switch {
 		case ctx.Err() != nil:
@@ -291,10 +310,16 @@ func (d *Driver) RunWatch(ctx context.Context) {
 			relist = true
 			retry = d.retryAfter(ctx, d.retryMin)
 			continue
-		case err == nil:
+		case err == nil && (delivered || time.Since(began) >= d.shortWatch):
 			// The server's own end of a watch: resume at once.
 			retry = d.retryMin
 			continue
+		case err == nil:
+			// Ended at once, with nothing in it. As client-go does, that
+			// counts as an error and backs off: a server that ends every
+			// watch at once would otherwise get thousands of requests a
+			// second.
+			err = errShortWatch
 		}
 		if delivered {
 			retry = d.retryMin

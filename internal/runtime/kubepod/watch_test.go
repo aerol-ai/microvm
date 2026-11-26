@@ -179,9 +179,10 @@ func TestWatchEvents(t *testing.T) {
 	f.change(testNS, testID, func(p *Pod) { p.Status.Phase = PhaseFailed })
 	noEvent(t, events)
 
-	// A running pod removed with no end seen exits at its deletion time.
+	// A running pod removed with no end seen exits at its deletion time,
+	// with ExitLost: never 0, which the service reads as a clean exit.
 	f.forceRemove(testNS, "sb-a000000000000000")
-	if ev := nextEvent(t, events); ev.Action != "die" || ev.SandboxID != "sb-a000000000000000" || ev.ExitCode != 0 ||
+	if ev := nextEvent(t, events); ev.Action != "die" || ev.SandboxID != "sb-a000000000000000" || ev.ExitCode != ExitLost ||
 		!ev.Time.Equal(time.Date(2026, 11, 26, 11, 0, 0, 0, time.UTC)) {
 		t.Fatalf("event = %+v, want die at the deletion time", ev)
 	}
@@ -477,7 +478,7 @@ func TestWatchPodsStream(t *testing.T) {
 			}))
 			defer srv.Close()
 			var got []WatchEvent
-			err := NewClient(srv.URL, nil, nil).WatchPods(context.Background(), "ns", "a=b", "4", func(ev WatchEvent) error {
+			err := NewClient(srv.URL, nil, nil).WatchPods(context.Background(), "ns", "a=b", "4", nil, func(ev WatchEvent) error {
 				got = append(got, ev)
 				return nil
 			})
@@ -491,7 +492,7 @@ func TestWatchPodsStream(t *testing.T) {
 		defer srv.Close()
 		calls := 0
 		stop := errors.New("stop")
-		err := NewClient(srv.URL, nil, nil).WatchPods(context.Background(), "ns", "", "", func(WatchEvent) error {
+		err := NewClient(srv.URL, nil, nil).WatchPods(context.Background(), "ns", "", "", nil, func(WatchEvent) error {
 			calls++
 			return stop
 		})
@@ -502,7 +503,7 @@ func TestWatchPodsStream(t *testing.T) {
 	t.Run("transport error", func(t *testing.T) {
 		srv := httptest.NewServer(http.NotFoundHandler())
 		srv.Close()
-		if err := NewClient(srv.URL, nil, nil).WatchPods(context.Background(), "ns", "", "", nil); err == nil {
+		if err := NewClient(srv.URL, nil, nil).WatchPods(context.Background(), "ns", "", "", nil, nil); err == nil {
 			t.Fatal("want an error")
 		}
 	})

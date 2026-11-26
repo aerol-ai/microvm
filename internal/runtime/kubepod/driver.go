@@ -107,6 +107,8 @@ type Driver struct {
 	// undoWait bounds a failed create's clean-up (undoTimeout; tests
 	// shrink it).
 	undoWait time.Duration
+	// shortWatch is the shortWatch constant; tests shrink it.
+	shortWatch time.Duration
 }
 
 var _ sbruntime.Runtime = (*Driver)(nil)
@@ -189,16 +191,17 @@ func New(cfg Config, client *Client, logger *slog.Logger) (*Driver, error) {
 		return nil, err
 	}
 	return &Driver{
-		cfg:      cfg,
-		client:   client,
-		specs:    specs,
-		logger:   logger,
-		cache:    newPodCache(),
-		pollMin:  100 * time.Millisecond,
-		pollMax:  time.Second,
-		retryMin: watchRetryMin,
-		retryMax: watchRetryMax,
-		undoWait: undoTimeout,
+		cfg:        cfg,
+		client:     client,
+		specs:      specs,
+		logger:     logger,
+		cache:      newPodCache(),
+		pollMin:    100 * time.Millisecond,
+		pollMax:    time.Second,
+		retryMin:   watchRetryMin,
+		retryMax:   watchRetryMax,
+		undoWait:   undoTimeout,
+		shortWatch: shortWatch,
 	}, nil
 }
 

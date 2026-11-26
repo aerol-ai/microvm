@@ -35,6 +35,10 @@ type fakeAPI struct {
 	cut       chan struct{} // closed to end every open watch
 	watches   int           // watches opened
 	failWatch int           // answer every watch with this status until cleared
+	// hangWatch: a watch gets no answer at all (no status, no headers)
+	// until cut or the client gives up. endWatch: a watch is answered 200
+	// and ended at once, empty.
+	hangWatch, endWatch bool
 	// kubelet, when set, runs on each GET of a pod (under mu), and on each
 	// tick of runKubelet.
 	kubelet func(p *Pod)
@@ -286,6 +290,18 @@ func (f *fakeAPI) setToken(tok string) {
 	f.mu.Unlock()
 }
 
+func (f *fakeAPI) setHangWatch(on bool) {
+	f.mu.Lock()
+	f.hangWatch = on
+	f.mu.Unlock()
+}
+
+func (f *fakeAPI) setEndWatch(on bool) {
+	f.mu.Lock()
+	f.endWatch = on
+	f.mu.Unlock()
+}
+
 func (f *fakeAPI) setFailWatch(code int) {
 	f.mu.Lock()
 	f.failWatch = code
@@ -534,9 +550,20 @@ func (f *fakeAPI) watch(w http.ResponseWriter, r *http.Request, ns string) {
 	}
 	expired := from < f.compacted
 	cut := f.cut
+	hang, end := f.hangWatch, f.endWatch
 	f.mu.Unlock()
+	if hang {
+		select {
+		case <-cut:
+		case <-r.Context().Done():
+		}
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
+	if end {
+		return
+	}
 	enc := json.NewEncoder(w)
 	flush := func() {
 		if fl, ok := w.(http.Flusher); ok {
