@@ -40,7 +40,10 @@ def main(argv):
     d = argv[1]
     go = True
     files = sorted(glob.glob(os.path.join(d, "*.txt")))
-    legs = [f for f in files if os.path.basename(f) not in ("report.txt", "cost.txt")]
+    # verdict.txt is this script's own output: spa.sh redirects into it, so
+    # it already exists (empty) while this runs, and read as a leg it has no
+    # DONE line and turns every run into NO GO.
+    legs = [f for f in files if os.path.basename(f) not in ("report.txt", "cost.txt", "verdict.txt")]
     if not legs:
         print("verdict: no leg output in %s" % d)
         return 1

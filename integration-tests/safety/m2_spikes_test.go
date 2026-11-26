@@ -407,6 +407,26 @@ func TestM2BenchFailsWhenAResumeLosesTheGuestsMemory(t *testing.T) {
 	}
 }
 
+// spa.sh runs verdict.py with its output redirected into verdict.txt in the
+// same folder, so that file exists (empty) while verdict.py reads the legs.
+// It must not be read as a leg: runs m2-spa-1126 and m2-spa-fix-1126 printed
+// "VERDICT verdict: no DONE line" and NO GO with every real leg a go.
+func TestM2VerdictIgnoresItsOwnOutputFile(t *testing.T) {
+	needTools(t, "python3")
+	state := t.TempDir()
+	leg := "SPA VERDICT pause/resume: busy 80 of 80 intact (0 lost); idle 40 of 40 intact (0 lost) (go: every cycle intact) -> PASS\n" +
+		"SPA VERDICT warm create p50 75.0 ms over 10 hits of 10 (go: under 100 ms) -> PASS\nSPA DONE\n"
+	for name, body := range map[string]string{"bench-m8i.txt": leg, "report.txt": "report\n", "cost.txt": "cost\n", "verdict.txt": ""} {
+		if err := os.WriteFile(filepath.Join(state, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out, err := exec.Command("python3", "-I", k8sFile(t, "m2", "verdict.py"), state).CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "VERDICT SP-A: go") || strings.Contains(string(out), "VERDICT verdict:") {
+		t.Fatalf("want SP-A go with no verdict.txt leg; err %v\n%s", err, out)
+	}
+}
+
 // A hangup (the terminal closed) runs the cleanup to its end and reports the
 // run's own exit code: stderr is gone, so every write to it fails, and the
 // machines, the group and the kit must still be removed and the leak check
