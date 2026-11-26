@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -237,6 +238,36 @@ func TestWarmSlot_TemplateRootfsNeverJailersFile(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A template rootfs that cannot be kept root's (its chown fails) fails the
+// refill before LoadSnapshot, and the slot's VM, run dir and TAP go with it.
+func TestWarmSpawn_TemplateRootfsOwnerFailureCleansUpSlot(t *testing.T) {
+	recordOwnerHistory(t)
+	chownStaged = func(path string, _, _ int) error {
+		if filepath.Base(path) == rootfsFileName {
+			return syscall.EPERM
+		}
+		return nil
+	}
+	f, _ := newJailedWarmFixture(t)
+	f.driver.cfg.JailerUID, f.driver.cfg.JailerGID = warmOwnerJailerUID, warmOwnerJailerGID
+	rootfs, mem, state := writeWarmTemplate(t)
+	loaded := false
+	f.client.loadSnapshotHook = func() error { loaded = true; return nil }
+	_, err := f.driver.WarmSpawn(context.Background(), WarmSpawnRequest{
+		SlotID: "vmms-warm-owner-fail", TemplateID: "tpl-owner", RootfsPath: rootfs,
+		SnapshotMemoryPath: mem, SnapshotStatePath: state, VsockCID: 200, HasOverlay: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "stage template rootfs") || !strings.Contains(err.Error(), "root:990") {
+		t.Fatalf("warm spawn = %v, want a stage template rootfs error", err)
+	}
+	if loaded {
+		t.Fatal("LoadSnapshot ran with the root drive's file not root's")
+	}
+	if !f.vmm.shutdown || !f.vmm.cleaned || f.tapHost.removeCalls != 1 || f.pool.release != 1 {
+		t.Fatalf("cleanup: vmm shutdown=%v cleaned=%v, tap remove/release=%d/%d", f.vmm.shutdown, f.vmm.cleaned, f.tapHost.removeCalls, f.pool.release)
 	}
 }
 
