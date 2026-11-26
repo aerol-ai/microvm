@@ -211,6 +211,13 @@ func main() {
 		case "--version", "-v", "version":
 			fmt.Println(version.Version)
 			return
+		case "--install-to":
+			// A pod-mode sandbox's init container (install_self.go).
+			if err := installSelf(os.Args[2:]); err != nil {
+				fmt.Fprintln(os.Stderr, "toolboxd:", err)
+				os.Exit(1)
+			}
+			return
 		}
 	}
 
