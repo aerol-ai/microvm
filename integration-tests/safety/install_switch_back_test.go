@@ -413,3 +413,90 @@ func TestInstallSwitchBackRemovesTheOldKernelWithTheMarkerThere(t *testing.T) {
 		})
 	}
 }
+
+// TestInstallSwitchBackStopsAtAKernelThatIsNotAFile: sandboxd's user could
+// make a folder where single's old guest kernel sits. rm -f cannot remove
+// it, so the switch back stops there with a message that names the path and
+// what to do. It does not go into the folder, and the marker stays, so the
+// run after the operator removes the folder finishes the switch. A link
+// there is removed and never followed: what it points at stays.
+func TestInstallSwitchBackStopsAtAKernelThatIsNotAFile(t *testing.T) {
+	const splitEnv = "SB_PRIVILEGE_MODE=split\n"
+	const switchBack = writeEnvMarks + "setup_privilege_mode\nwrite_environment\n"
+	// The cleanup runs in a subshell with errexit on, as in the installer;
+	// the test's shell goes on to print how it ended.
+	const stoppable = switchBack + "set +e\n(set -e; leave_split_mode)\necho \"leave_split_mode exit=$?\"\n"
+
+	t.Run("a folder: the run stops, then finishes once it is gone", func(t *testing.T) {
+		h := newSwitchBackHost(t, splitEnv)
+		kernel := filepath.Join(h.dir, "varlib-firecracker", "vmlinux")
+		mustMkdir(t, kernel)
+		inside := filepath.Join(kernel, "inside")
+		mustWrite(t, inside, "made by sandboxd's user\n")
+
+		calls, stdout, stderr := h.run("single", stoppable)
+		if !strings.Contains(stdout, "leave_split_mode exit=1") {
+			t.Fatalf("the switch back did not stop at the folder:\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		for _, want := range []string{kernel + " should be Firecracker's guest kernel file", "install.sh --privilege-mode single again"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("the message does not say %q:\n%s", want, stderr)
+			}
+		}
+		checkCalls(t, calls, []string{"systemctl disable --now aerolvm-rootd.service"}, []string{"rm -f " + kernel, "rm -f " + h.marker})
+		if got, err := os.ReadFile(inside); err != nil || string(got) != "made by sandboxd's user\n" {
+			t.Fatalf("the folder's file changed: %q, %v", got, err)
+		}
+		if !h.markerThere() {
+			t.Fatal("the marker went with the switch unfinished")
+		}
+
+		// The operator removes the folder; the next run finishes.
+		if err := os.RemoveAll(kernel); err != nil {
+			t.Fatal(err)
+		}
+		calls, _, _ = h.run("single", switchBack+"leave_split_mode\n")
+		checkCalls(t, calls, []string{"rm -f " + kernel + " marker=yes", "rm -f " + h.marker + " marker=yes"}, nil)
+		if h.markerThere() {
+			t.Fatal("the marker is still there after the switch finished")
+		}
+	})
+
+	for _, tc := range []struct {
+		name   string
+		target func(h *switchBackHost) string
+	}{
+		{name: "a link to a folder", target: func(h *switchBackHost) string {
+			d := filepath.Join(h.dir, "elsewhere")
+			mustMkdir(t, d)
+			mustWrite(t, filepath.Join(d, "keep"), "keep\n")
+			return d
+		}},
+		{name: "a link to a file", target: func(h *switchBackHost) string {
+			f := filepath.Join(h.dir, "elsewhere-file")
+			mustWrite(t, f, "keep\n")
+			return f
+		}},
+	} {
+		t.Run(tc.name+": removed, not followed", func(t *testing.T) {
+			h := newSwitchBackHost(t, splitEnv)
+			kernel := filepath.Join(h.dir, "varlib-firecracker", "vmlinux")
+			mustMkdir(t, filepath.Dir(kernel))
+			target := tc.target(h)
+			if err := os.Symlink(target, kernel); err != nil {
+				t.Fatal(err)
+			}
+			calls, _, _ := h.run("single", switchBack+"leave_split_mode\n")
+			checkCalls(t, calls, []string{"rm -f " + kernel + " marker=yes", "rm -f " + h.marker + " marker=yes"}, nil)
+			if _, err := os.Lstat(kernel); err == nil {
+				t.Fatal("the link is still there")
+			}
+			if _, err := os.Stat(target); err != nil {
+				t.Fatalf("what the link pointed at is gone: %v", err)
+			}
+			if h.markerThere() {
+				t.Fatal("the marker is still there after the switch")
+			}
+		})
+	}
+}
