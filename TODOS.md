@@ -12,29 +12,6 @@ Every entry was re-verified against `main` at `704c9e74` on 2026-10-06.
 
 ---
 
-## Daytona delete and Runloop shutdown of a sandbox on a deleted node (API, cluster)
-
-- **What:** the v1 DELETE and the E2B kill of a sandbox left on a node an
-  operator deleted are sent to a server, which deletes its placement
-  (`pkg/api/clusterroute/abandoned.go`, `destroyAbandoned`). The Daytona
-  DELETE and the Runloop shutdown are not: they still answer 503 while
-  the leader hands the node's sandboxes off, and 410 after.
-- **Why:** both handlers read the local sandbox row first, and the server
-  that would take the delete has none. Daytona needs it to resolve a
-  name and to build the Sandbox body it answers with
-  (`pkg/api/daytona/handlers.go`, `destroySandbox`); Runloop needs it to
-  build the devbox view it answers with and records as its tombstone
-  (`pkg/api/runloop/devboxes.go`, `shutdownDevbox`). With
-  `Destroy: true` they would answer 404 and leave the placement.
-- **Fix sketch:** on a store miss, delete through `DestroySandbox` (it
-  handles a row-less abandoned placement) and build the answer from the
-  replicated spec in the placement. Check the body against each SDK's
-  model first: the Daytona Python SDK parses the delete answer as a
-  Sandbox.
-- **Effort:** human M / CC S. **Priority:** P3.
-
----
-
 ## An orphaned recreate-policy sandbox answers 410 while it waits for room (API, cluster)
 
 - **What:** a `failover.policy=recreate` sandbox orphaned because no node had
@@ -935,6 +912,26 @@ the skip.
 ---
 
 ## Done
+
+## Daytona delete and Runloop shutdown of a sandbox on a deleted node (API, cluster)
+
+- **Done:** both routes are now the delete for the router
+  (`clusterroute.Options.Destroy`), as v1's DELETE and E2B's kill are: a
+  sandbox left on a node an operator deleted goes to a server. The server
+  has no row, so on a store miss the handler asks
+  `Service.DestroyAbandonedSandbox` (`internal/service/destroy_abandoned_view.go`):
+  it finds the placement by id, or for Daytona by the caller's name for it,
+  checks the tenant (another tenant's is 404), deletes the placement and
+  returns the sandbox built from the placement and its replicated spec,
+  with the facade's own state when the spec carries it. Daytona answers the
+  same Sandbox body (the SDK's model accepts it); Runloop answers the same
+  terminal view and records it as the tombstone. The router now keeps the
+  id a name lookup returns with `ErrOrphaned`, so a delete by name of an
+  orphan reaches the server too (`clusterroute.Wrap`). Tests:
+  `TestDestroyAbandonedSandbox*`, `TestDaytonaDelete*`,
+  `TestRunloopShutdown*`, `TestWrapDeleteByNameOfAnOrphanOnADeletedNode`.
+
+---
 
 ## Recreate-policy WASM and isolate sandboxes made before the refusal run unfenced (cluster, Kubernetes)
 
