@@ -9,7 +9,7 @@ import (
 
 // jailerUserFiles are the host's user and group files the start check
 // reads; tests point them at their own.
-var jailerUserFiles = struct{ passwd, group string }{"/etc/passwd", "/etc/group"}
+var jailerUserFiles = struct{ users, groups string }{"/etc/passwd", "/etc/group"}
 
 // checkFirecrackerJailerUser refuses to start Firecracker when the jailer
 // would run every VM as a user that is not one of its own
@@ -23,6 +23,6 @@ func checkFirecrackerJailerUser(cfg config.Config, split bool) error {
 	}
 	return fcruntime.CheckJailerUser(fcruntime.JailerUserCheck{
 		UID: cfg.JailerUID, GID: cfg.JailerGID, AgentUID: os.Geteuid(),
-		PasswdPath: jailerUserFiles.passwd, GroupPath: jailerUserFiles.group,
+		UsersFile: jailerUserFiles.users, GroupsFile: jailerUserFiles.groups,
 	})
 }

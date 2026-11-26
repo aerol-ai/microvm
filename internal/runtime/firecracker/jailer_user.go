@@ -28,9 +28,9 @@ type JailerUserCheck struct {
 	// AgentUID is sandboxd's own uid: root in privilege mode single,
 	// sandboxd's user in split.
 	AgentUID int
-	// PasswdPath and GroupPath are the host's user and group files,
+	// UsersFile and GroupsFile are the host's user and group files,
 	// /etc/passwd and /etc/group.
-	PasswdPath, GroupPath string
+	UsersFile, GroupsFile string
 }
 
 // adminGroups are the groups whose members can become root, or do as much
@@ -54,11 +54,11 @@ const JailerUserFix = "make a system user for it and point sandboxd at that user
 // user file is a user of its own (the Kubernetes chart's 990 is one). The
 // error names the settings and how to fix them.
 func CheckJailerUser(c JailerUserCheck) error {
-	users, err := readPasswd(c.PasswdPath)
+	users, err := readUsers(c.UsersFile)
 	if err != nil {
 		return fmt.Errorf("firecracker: check the jailer's user (SB_JAILER_UID=%d): %w", c.UID, err)
 	}
-	groups, err := readGroup(c.GroupPath)
+	groups, err := readGroups(c.GroupsFile)
 	if err != nil {
 		return fmt.Errorf("firecracker: check the jailer's user (SB_JAILER_UID=%d): %w", c.UID, err)
 	}
@@ -102,7 +102,7 @@ func CheckJailerUser(c JailerUserCheck) error {
 		c.UID, c.GID, strings.Join(why, "; "), JailerUserFix)
 }
 
-type passwdEntry struct {
+type userEntry struct {
 	name     string
 	uid, gid int
 	shell    string
@@ -114,11 +114,11 @@ type groupEntry struct {
 	members map[string]bool
 }
 
-// readPasswd reads name:x:uid:gid:gecos:home:shell lines. A missing file is
-// no users (a container image may have none), a line it cannot read is
-// skipped, as getpwent does.
-func readPasswd(path string) ([]passwdEntry, error) {
-	var out []passwdEntry
+// readUsers reads the user file's name:x:uid:gid:gecos:home:shell lines. A
+// missing file is no users (a container image may have none), a line it
+// cannot read is skipped, as getpwent does.
+func readUsers(path string) ([]userEntry, error) {
+	var out []userEntry
 	err := eachLine(path, func(f []string) {
 		if len(f) < 7 {
 			return
@@ -128,13 +128,13 @@ func readPasswd(path string) ([]passwdEntry, error) {
 		if err1 != nil || err2 != nil {
 			return
 		}
-		out = append(out, passwdEntry{name: f[0], uid: uid, gid: gid, shell: f[6]})
+		out = append(out, userEntry{name: f[0], uid: uid, gid: gid, shell: f[6]})
 	})
 	return out, err
 }
 
-// readGroup reads name:x:gid:member,member lines, like readPasswd.
-func readGroup(path string) ([]groupEntry, error) {
+// readGroups reads name:x:gid:member,member lines, like readUsers.
+func readGroups(path string) ([]groupEntry, error) {
 	var out []groupEntry
 	err := eachLine(path, func(f []string) {
 		if len(f) < 4 {

@@ -10,7 +10,7 @@ import (
 // A host's user and group files, as a common cloud image ships them plus
 // the users the installers make.
 const (
-	testPasswd = `root:x:0:0:root:/root:/bin/bash
+	testUsers = `root:x:0:0:root:/root:/bin/bash
 # a comment line
 daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
 broken line with no fields
@@ -26,7 +26,7 @@ dockeruser:x:2003:2003::/:/usr/sbin/nologin
 wheelprimary:x:2004:10::/:/sbin/nologin
 quiet1000:x:3000:3000::/:/usr/sbin/nologin
 `
-	testGroup = `root:x:0:
+	testGroups = `root:x:0:
 wheel:x:10:ec2-user
 sudo:x:27:ubuntu
 adm:x:4:syslog,ubuntu
@@ -44,21 +44,21 @@ short:x
 `
 )
 
-func writeUserFiles(t *testing.T) (passwd, group string) {
+func writeUserFiles(t *testing.T) (users, groups string) {
 	t.Helper()
 	dir := t.TempDir()
-	passwd, group = filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
-	if err := os.WriteFile(passwd, []byte(testPasswd), 0o644); err != nil {
+	users, groups = filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
+	if err := os.WriteFile(users, []byte(testUsers), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(group, []byte(testGroup), 0o644); err != nil {
+	if err := os.WriteFile(groups, []byte(testGroups), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return passwd, group
+	return users, groups
 }
 
 func TestCheckJailerUser(t *testing.T) {
-	passwd, group := writeUserFiles(t)
+	users, groups := writeUserFiles(t)
 	for _, tc := range []struct {
 		name     string
 		uid, gid int
@@ -86,7 +86,7 @@ func TestCheckJailerUser(t *testing.T) {
 		{name: "the admin group as the jailer's group", uid: 990, gid: 115, want: []string{"gid 115 is the admin group"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := CheckJailerUser(JailerUserCheck{UID: tc.uid, GID: tc.gid, AgentUID: tc.agent, PasswdPath: passwd, GroupPath: group})
+			err := CheckJailerUser(JailerUserCheck{UID: tc.uid, GID: tc.gid, AgentUID: tc.agent, UsersFile: users, GroupsFile: groups})
 			if tc.want == nil {
 				if err != nil {
 					t.Fatalf("refused: %v", err)
@@ -109,14 +109,14 @@ func TestCheckJailerUser(t *testing.T) {
 // not stop a node whose uid 1000 is nobody.
 func TestCheckJailerUserOldDefaultWithNoUser(t *testing.T) {
 	dir := t.TempDir()
-	passwd, group := filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
-	if err := os.WriteFile(passwd, []byte("root:x:0:0:root:/root:/bin/bash\n"), 0o644); err != nil {
+	users, groups := filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
+	if err := os.WriteFile(users, []byte("root:x:0:0:root:/root:/bin/bash\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(group, []byte("root:x:0:\nsudo:x:27:\n"), 0o644); err != nil {
+	if err := os.WriteFile(groups, []byte("root:x:0:\nsudo:x:27:\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckJailerUser(JailerUserCheck{UID: 1000, GID: 1000, PasswdPath: passwd, GroupPath: group}); err != nil {
+	if err := CheckJailerUser(JailerUserCheck{UID: 1000, GID: 1000, UsersFile: users, GroupsFile: groups}); err != nil {
 		t.Fatalf("refused uid 1000 with no user: %v", err)
 	}
 }
@@ -126,28 +126,28 @@ func TestCheckJailerUserOldDefaultWithNoUser(t *testing.T) {
 func TestCheckJailerUserFiles(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing")
-	if err := CheckJailerUser(JailerUserCheck{UID: 990, GID: 990, PasswdPath: missing, GroupPath: missing}); err != nil {
+	if err := CheckJailerUser(JailerUserCheck{UID: 990, GID: 990, UsersFile: missing, GroupsFile: missing}); err != nil {
 		t.Fatalf("missing files: %v", err)
 	}
-	passwd, group := writeUserFiles(t)
+	users, groups := writeUserFiles(t)
 	for name, c := range map[string]JailerUserCheck{
-		"passwd": {UID: 990, GID: 990, PasswdPath: dir, GroupPath: group},
-		"group":  {UID: 990, GID: 990, PasswdPath: passwd, GroupPath: dir},
+		"user":  {UID: 990, GID: 990, UsersFile: dir, GroupsFile: groups},
+		"group": {UID: 990, GID: 990, UsersFile: users, GroupsFile: dir},
 	} {
 		err := CheckJailerUser(c)
 		if err == nil || !strings.Contains(err.Error(), "check the jailer's user (SB_JAILER_UID=990)") {
 			t.Errorf("%s file is a folder: %v", name, err)
 		}
 	}
-	if _, err := readPasswd(filepath.Join(dir, "nope")); err != nil {
+	if _, err := readUsers(filepath.Join(dir, "nope")); err != nil {
 		t.Fatal(err)
 	}
 	if os.Geteuid() != 0 {
 		closed := filepath.Join(dir, "closed")
-		if err := os.WriteFile(closed, []byte(testPasswd), 0o000); err != nil {
+		if err := os.WriteFile(closed, []byte(testUsers), 0o000); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readPasswd(closed); err == nil {
+		if _, err := readUsers(closed); err == nil {
 			t.Fatal("a user file sandboxd cannot open read as no users")
 		}
 	}
@@ -156,7 +156,7 @@ func TestCheckJailerUserFiles(t *testing.T) {
 	if err := os.WriteFile(long, []byte(strings.Repeat("x", 70*1024)+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readGroup(long); err == nil {
+	if _, err := readGroups(long); err == nil {
 		t.Fatal("a line past the scanner's limit read as nothing")
 	}
 }

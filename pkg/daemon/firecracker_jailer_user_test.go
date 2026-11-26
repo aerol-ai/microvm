@@ -15,17 +15,17 @@ import (
 func fakeJailerUserFiles(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
-	passwd, group := filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
-	if err := os.WriteFile(passwd, []byte("root:x:0:0:root:/root:/bin/bash\n"+
+	users, groups := filepath.Join(dir, "passwd"), filepath.Join(dir, "group")
+	if err := os.WriteFile(users, []byte("root:x:0:0:root:/root:/bin/bash\n"+
 		"ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n"+
 		"sandboxd-jailer:x:996:996::/home/sandboxd-jailer:/usr/sbin/nologin\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(group, []byte("root:x:0:\nsudo:x:27:ubuntu\nubuntu:x:1000:\nsandboxd-jailer:x:996:\n"), 0o644); err != nil {
+	if err := os.WriteFile(groups, []byte("root:x:0:\nsudo:x:27:ubuntu\nubuntu:x:1000:\nsandboxd-jailer:x:996:\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	old := jailerUserFiles
-	jailerUserFiles.passwd, jailerUserFiles.group = passwd, group
+	jailerUserFiles.users, jailerUserFiles.groups = users, groups
 	t.Cleanup(func() { jailerUserFiles = old })
 }
 
