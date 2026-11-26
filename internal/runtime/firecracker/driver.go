@@ -1337,6 +1337,16 @@ func (d *Driver) probeToolboxTCP(ctx context.Context, operation, sandboxID strin
 // (or its own deadline if ctx has none). Cold-boot is usually under
 // 500ms but the headroom keeps a slow host (CI under load) from
 // flaking.
+//
+// A connection the guest accepted and then closed before answering (EOF,
+// reset, broken pipe) is dialed again inside the same deadline. On every
+// snapshot restore Firecracker has the guest reset all its vsock
+// connections, and the guest does that a moment after it resumes; when
+// that moment comes after it accepted this first connection (more often
+// under nested virtualization), the connection is torn. In the M2 spike
+// (SP-A, 2026-11-26, m8i.xlarge nested) 24 of 60 resumes were lost to
+// that tear with no redial and none with it. The success path is unchanged:
+// one dial, one ping, one answer.
 func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID uint32) error {
 	deadline := 5 * time.Second
 	if dl, ok := ctx.Deadline(); ok {
@@ -1359,10 +1369,19 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 	for {
 		conn, err = d.vsockDial.Dial(dialCtx, socketPath, guestCID, defaultVsockPort)
 		if err == nil {
-			break
+			err = pingVsock(conn)
+			_ = conn.Close()
+			// Only a torn connection is dialed again (see above); a
+			// refusal, a bad answer or a timeout keeps today's result.
+			if err == nil || !isTornVsockConn(err) {
+				return err
+			}
+			if d.logger != nil {
+				d.logger.Info("firecracker: vsock handshake connection torn; redialing", "error", err)
+			}
 		}
 		if dialCtx.Err() != nil {
-			return fmt.Errorf("vsock dial cid=%d port=%d: %w", guestCID, defaultVsockPort, dialCtx.Err())
+			return fmt.Errorf("vsock dial cid=%d port=%d: %w (last error: %v)", guestCID, defaultVsockPort, dialCtx.Err(), err)
 		}
 		// Bounded sleep so a kernel that's permanently failing
 		// doesn't burn the CPU.
@@ -1373,8 +1392,17 @@ func (d *Driver) vsockHandshake(ctx context.Context, socketPath string, guestCID
 		}
 		delay = nextRetryDelay(delay, vsockPollMax)
 	}
-	defer conn.Close()
+}
 
+// isTornVsockConn reports a connection the guest closed under us: the end
+// of the stream, a reset or a broken pipe. A read deadline is not one.
+func isTornVsockConn(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
+// pingVsock sends one ping on conn and checks the guest's answer.
+func pingVsock(conn io.ReadWriter) error {
 	// Send Ping.
 	if _, err := conn.Write([]byte(`{"op":"ping"}` + "\n")); err != nil {
 		return fmt.Errorf("vsock write: %w", err)
