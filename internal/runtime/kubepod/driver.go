@@ -96,9 +96,14 @@ type Driver struct {
 	client *Client
 	specs  *specStore
 	logger *slog.Logger
+	// cache is the watch's view of this worker's pods (watch.go), used
+	// while RunWatch keeps it live.
+	cache *podCache
 	// pollMin and pollMax bound the backoff of the waits for a pod to run
-	// or to go. Tests shrink them.
-	pollMin, pollMax time.Duration
+	// or to go while there is no live watch; retryMin and retryMax, the
+	// watch's own retries. Tests shrink them.
+	pollMin, pollMax   time.Duration
+	retryMin, retryMax time.Duration
 }
 
 var _ sbruntime.Runtime = (*Driver)(nil)
@@ -181,13 +186,57 @@ func New(cfg Config, client *Client, logger *slog.Logger) (*Driver, error) {
 		return nil, err
 	}
 	return &Driver{
-		cfg:     cfg,
-		client:  client,
-		specs:   specs,
-		logger:  logger,
-		pollMin: 100 * time.Millisecond,
-		pollMax: time.Second,
+		cfg:      cfg,
+		client:   client,
+		specs:    specs,
+		logger:   logger,
+		cache:    newPodCache(),
+		pollMin:  100 * time.Millisecond,
+		pollMax:  time.Second,
+		retryMin: watchRetryMin,
+		retryMax: watchRetryMax,
 	}, nil
+}
+
+// notFound is the answer of the watch's view for a pod it does not hold:
+// the same as the API server's 404, so callers need not tell them apart.
+func notFound(name string) error {
+	return &APIError{Method: "GET", Path: "(watch view) " + name, Code: 404, Reason: "NotFound", Message: "not in this worker's pods"}
+}
+
+// getPod reads one of this worker's pods: from the watch's view while it
+// is live, else from the API server. The view holds only this worker's
+// pods, so another worker's pod of the name reads as not found; callers
+// treat the two alike.
+func (d *Driver) getPod(ctx context.Context, name string) (*Pod, error) {
+	if p, found, live := d.cache.lookup(name); live {
+		if !found {
+			return nil, notFound(name)
+		}
+		return p, nil
+	}
+	return d.client.GetPod(ctx, d.cfg.Namespace, name)
+}
+
+// pause waits for the next change while the watch is live (wake was taken
+// before the read the caller is acting on), else for delay.
+func (d *Driver) pause(ctx context.Context, wake <-chan struct{}, live bool, delay time.Duration) error {
+	if live {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-wake:
+			return nil
+		}
+	}
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 func sortedKeys(m map[string]string) []string {
@@ -300,7 +349,7 @@ func (d *Driver) nameTaken(ctx context.Context, name, sandboxID string) error {
 // stopping, must be gone first, since the new one takes its name.
 func (d *Driver) Start(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
 	name := podName(strings.TrimSpace(containerRef))
-	p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
+	p, err := d.getPod(ctx, name)
 	switch {
 	case err == nil:
 		if !d.owns(p) {
@@ -364,7 +413,7 @@ func (d *Driver) refreshToolbox(p *Pod) {
 // kept for Start. Stopping a sandbox with no pod here is a no-op.
 func (d *Driver) Stop(ctx context.Context, containerRef string) error {
 	name := podName(strings.TrimSpace(containerRef))
-	p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
+	p, err := d.getPod(ctx, name)
 	if isNotFound(err) {
 		return nil
 	}
@@ -390,7 +439,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 		ref = strings.TrimSpace(sandbox.ID)
 	}
 	name := podName(ref)
-	p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
+	p, err := d.getPod(ctx, name)
 	switch {
 	case isNotFound(err):
 	case err != nil:
@@ -407,7 +456,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 // spec is a stopped sandbox and no spec is a sandbox that is gone.
 func (d *Driver) Inspect(ctx context.Context, containerRef string) (*models.SandboxRuntimeState, error) {
 	name := podName(strings.TrimSpace(containerRef))
-	p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
+	p, err := d.getPod(ctx, name)
 	if err == nil && d.owns(p) {
 		return stateOf(p), nil
 	}
@@ -424,17 +473,25 @@ func (d *Driver) Inspect(ctx context.Context, containerRef string) (*models.Sand
 	return &models.SandboxRuntimeState{SandboxID: sandboxIDOf(kept), ContainerID: name, Status: models.SandboxStatusStopped}, nil
 }
 
-// ListManaged returns this worker's sandboxes: its pods, and its kept
-// specs with no pod as stopped.
+// ListManaged returns this worker's sandboxes: its pods (from the watch's
+// view while it is live, else one list), and its kept specs with no pod as
+// stopped.
 func (d *Driver) ListManaged(ctx context.Context) (map[string]*models.SandboxRuntimeState, error) {
-	pods, err := d.client.ListPods(ctx, d.cfg.Namespace, d.selector())
-	if err != nil {
-		return nil, err
+	pods, live := d.cache.all()
+	if !live {
+		listed, _, err := d.client.ListPods(ctx, d.cfg.Namespace, d.selector())
+		if err != nil {
+			return nil, err
+		}
+		pods = make([]*Pod, len(listed))
+		for i := range listed {
+			pods[i] = &listed[i]
+		}
 	}
 	out := make(map[string]*models.SandboxRuntimeState, len(pods))
-	for i := range pods {
-		if d.owns(&pods[i]) {
-			st := stateOf(&pods[i])
+	for _, p := range pods {
+		if d.owns(p) {
+			st := stateOf(p)
 			out[st.SandboxID] = st
 		}
 	}
@@ -564,20 +621,25 @@ func endReason(p *Pod) string {
 	return strings.TrimSpace(p.Status.Phase + " " + p.Status.Reason + " " + p.Status.Message)
 }
 
-// waitRunning polls the pod (uid) until it runs with an address, it cannot,
-// or StartTimeout passes. A failed read is tried again until then: one
-// API server hiccup must not fail a create.
+// waitRunning waits until the pod (uid) runs with an address, it cannot,
+// or StartTimeout passes: on the watch's changes while it is live, else by
+// reading the pod with backoff. A failed read is tried again until then:
+// one API server hiccup must not fail a create.
 func (d *Driver) waitRunning(ctx context.Context, name, uid string) (*models.SandboxRuntimeState, error) {
 	ctx, cancel := context.WithTimeout(ctx, d.cfg.StartTimeout)
 	defer cancel()
 	waiting := "not read yet"
 	for delay := d.pollMin; ; delay = min(delay*2, d.pollMax) {
-		p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
+		wake, live := d.cache.changes()
+		p, err := d.getPod(ctx, name)
 		switch {
 		case err != nil && ctx.Err() != nil:
 			// The read was cut short by the deadline: what the pod was
 			// waiting for is the answer worth giving.
 			return nil, fmt.Errorf("kubepod: pod %s did not start (%s): %w", name, waiting, ctx.Err())
+		case isNotFound(err) && live && !d.cache.deleted(uid):
+			// Made, but its first watch event has not come yet.
+			waiting = "not shown by the watch yet"
 		case isNotFound(err):
 			return nil, fmt.Errorf("kubepod: pod %s was deleted while it started", name)
 		case err != nil:
@@ -591,10 +653,8 @@ func (d *Driver) waitRunning(ctx context.Context, name, uid string) (*models.San
 			}
 			waiting = why
 		}
-		select {
-		case <-ctx.Done():
+		if d.pause(ctx, wake, live, delay) != nil {
 			return nil, fmt.Errorf("kubepod: pod %s did not start (%s): %w", name, waiting, ctx.Err())
-		case <-time.After(delay):
 		}
 	}
 }
@@ -613,16 +673,19 @@ func (d *Driver) deleteAndWait(ctx context.Context, p *Pod, grace time.Duration)
 	return d.waitGone(ctx, p.Metadata.Name, p.Metadata.UID, d.cfg.StopTimeout)
 }
 
-// waitGone polls until the pod (uid) no longer exists. A pod on a node
-// that cannot be reached stays until its node answers or someone removes
-// it; the wait then ends with an error and the sandbox is not reported
-// stopped.
+// waitGone waits until the pod (uid) no longer exists, on the watch's
+// changes while it is live, else by reading with backoff. The view holds
+// every pod of this worker's from the list on, so a pod of uid missing
+// from it is gone. A pod on a node that cannot be reached stays until its
+// node answers or someone removes it; the wait then ends with an error and
+// the sandbox is not reported stopped.
 func (d *Driver) waitGone(ctx context.Context, name, uid string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	last := "still there"
 	for delay := d.pollMin; ; delay = min(delay*2, d.pollMax) {
-		p, err := d.client.GetPod(ctx, d.cfg.Namespace, name)
+		wake, live := d.cache.changes()
+		p, err := d.getPod(ctx, name)
 		switch {
 		case err != nil && ctx.Err() != nil:
 			return fmt.Errorf("kubepod: pod %s is still stopping (%s); is its node reachable?: %w", name, last, ctx.Err())
@@ -633,10 +696,8 @@ func (d *Driver) waitGone(ctx context.Context, name, uid string, timeout time.Du
 		case p.Metadata.UID != uid:
 			return nil
 		}
-		select {
-		case <-ctx.Done():
+		if d.pause(ctx, wake, live, delay) != nil {
 			return fmt.Errorf("kubepod: pod %s is still stopping (%s); is its node reachable?: %w", name, last, ctx.Err())
-		case <-time.After(delay):
 		}
 	}
 }

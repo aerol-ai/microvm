@@ -26,6 +26,9 @@ type Client struct {
 	host  string
 	token func() (string, error)
 	http  *http.Client
+	// watchHTTP has the same transport and no overall timeout: a watch
+	// streams for minutes. Each watch bounds itself (WatchPods).
+	watchHTTP *http.Client
 }
 
 // NewClient is a Client for the API server at host (https://name:port).
@@ -35,13 +38,14 @@ func NewClient(host string, token func() (string, error), hc *http.Client) *Clie
 	if hc == nil {
 		hc = &http.Client{}
 	}
+	watch := &http.Client{Transport: hc.Transport}
 	if hc.Timeout == 0 {
 		hc.Timeout = callTimeout
 	}
-	return &Client{host: strings.TrimRight(host, "/"), token: token, http: hc}
+	return &Client{host: strings.TrimRight(host, "/"), token: token, http: hc, watchHTTP: watch}
 }
 
-// callTimeout bounds one call. No call the driver makes streams.
+// callTimeout bounds one call other than a watch.
 const callTimeout = 30 * time.Second
 
 // maxResponseBytes bounds a reply the client reads. A page of the largest
@@ -166,8 +170,10 @@ func (c *Client) DeletePod(ctx context.Context, namespace, name, uid string, gra
 // hundred sandboxes at most; pages keep each reply small either way.
 const listPageSize = 250
 
-// ListPods lists the pods in namespace that match selector, all pages.
-func (c *Client) ListPods(ctx context.Context, namespace, selector string) ([]Pod, error) {
+// ListPods lists the pods in namespace that match selector, all pages, and
+// returns the resource version the list was read at: a watch from it misses
+// nothing. Every page of a paged list is read at the first page's version.
+func (c *Client) ListPods(ctx context.Context, namespace, selector string) ([]Pod, string, error) {
 	var pods []Pod
 	cont := ""
 	for {
@@ -181,19 +187,100 @@ func (c *Client) ListPods(ctx context.Context, namespace, selector string) ([]Po
 		}
 		var page struct {
 			Metadata struct {
-				Continue string `json:"continue"`
+				Continue        string `json:"continue"`
+				ResourceVersion string `json:"resourceVersion"`
 			} `json:"metadata"`
 			Items []Pod `json:"items"`
 		}
 		if err := c.do(ctx, http.MethodGet, podsPath(namespace)+"?"+q.Encode(), nil, &page); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		pods = append(pods, page.Items...)
 		if page.Metadata.Continue == "" {
-			return pods, nil
+			return pods, page.Metadata.ResourceVersion, nil
 		}
 		cont = page.Metadata.Continue
 	}
+}
+
+// WatchEvent is one event of a pod watch: ADDED, MODIFIED, DELETED or
+// BOOKMARK (a resource version with no change, so a later watch can resume
+// from it).
+type WatchEvent struct {
+	Type   string
+	Object Pod
+}
+
+// watchSeconds is how long the API server keeps one watch open before it
+// ends it; the caller then watches again from the last version it saw.
+// Short enough that a connection a network silently dropped is found.
+const watchSeconds = 300
+
+// WatchPods watches the pods in namespace that match selector, from
+// resourceVersion, and calls fn for each event in order. It returns nil
+// when the server ends the watch, the error fn returns, or the stream's
+// error. An expired version is an *APIError with Code 410 (isGone): the
+// caller must list again.
+func (c *Client) WatchPods(ctx context.Context, namespace, selector, resourceVersion string, fn func(WatchEvent) error) error {
+	q := url.Values{}
+	q.Set("watch", "1")
+	q.Set("allowWatchBookmarks", "true")
+	q.Set("timeoutSeconds", strconv.Itoa(watchSeconds))
+	if selector != "" {
+		q.Set("labelSelector", selector)
+	}
+	if resourceVersion != "" {
+		q.Set("resourceVersion", resourceVersion)
+	}
+	path := podsPath(namespace) + "?" + q.Encode()
+	// The read deadline is the server's own end of the watch plus a
+	// margin: a stream that outlives it was cut without a word.
+	ctx, cancel := context.WithTimeout(ctx, (watchSeconds+30)*time.Second)
+	defer cancel()
+	resp, err := c.send(ctx, http.MethodGet, path, nil, c.watchHTTP)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return apiErrorOf(http.MethodGet, path, resp)
+	}
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var raw struct {
+			Type   string          `json:"type"`
+			Object json.RawMessage `json:"object"`
+		}
+		if err := dec.Decode(&raw); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return fmt.Errorf("kubepod: watch %s: %w", path, err)
+		}
+		if raw.Type == "ERROR" {
+			var st struct {
+				Code    int    `json:"code"`
+				Reason  string `json:"reason"`
+				Message string `json:"message"`
+			}
+			_ = json.Unmarshal(raw.Object, &st)
+			return &APIError{Method: http.MethodGet, Path: path, Code: st.Code, Reason: st.Reason, Message: st.Message}
+		}
+		ev := WatchEvent{Type: raw.Type}
+		if err := json.Unmarshal(raw.Object, &ev.Object); err != nil {
+			return fmt.Errorf("kubepod: watch %s: decode event: %w", path, err)
+		}
+		if err := fn(ev); err != nil {
+			return err
+		}
+	}
+}
+
+// isGone is a watch from a resource version the API server no longer
+// keeps: list again.
+func isGone(err error) bool {
+	code, _ := apiCode(err)
+	return code == http.StatusGone
 }
 
 // CanList is one list call for a single pod: it proves the API server
@@ -208,51 +295,17 @@ func (c *Client) CanList(ctx context.Context, namespace, selector string) error 
 }
 
 func (c *Client) do(ctx context.Context, method, path string, in, out any) error {
-	var body io.Reader
-	if in != nil {
-		raw, err := json.Marshal(in)
-		if err != nil {
-			return err
-		}
-		body = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.host+path, body)
+	resp, err := c.send(ctx, method, path, in, c.http)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/json")
-	if in != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if c.token != nil {
-		tok, err := c.token()
-		if err != nil {
-			return fmt.Errorf("kubepod: service account token: %w", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+tok)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("kubepod: %s %s: %w", method, path, err)
-	}
 	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return apiErrorOf(method, path, resp)
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return fmt.Errorf("kubepod: %s %s: read reply: %w", method, path, err)
-	}
-	if resp.StatusCode/100 != 2 {
-		ae := &APIError{Method: method, Path: path, Code: resp.StatusCode}
-		var st struct {
-			Reason  string `json:"reason"`
-			Message string `json:"message"`
-		}
-		if json.Unmarshal(raw, &st) == nil {
-			ae.Reason, ae.Message = st.Reason, st.Message
-		}
-		if ae.Message == "" {
-			ae.Message = strings.TrimSpace(string(raw))
-		}
-		return ae
 	}
 	if out == nil {
 		return nil
@@ -261,4 +314,55 @@ func (c *Client) do(ctx context.Context, method, path string, in, out any) error
 		return fmt.Errorf("kubepod: %s %s: decode reply: %w", method, path, err)
 	}
 	return nil
+}
+
+// send makes one authenticated request with hc and returns the response,
+// whatever its status.
+func (c *Client) send(ctx context.Context, method, path string, in any, hc *http.Client) (*http.Response, error) {
+	var body io.Reader
+	if in != nil {
+		raw, err := json.Marshal(in)
+		if err != nil {
+			return nil, err
+		}
+		body = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.host+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if in != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if c.token != nil {
+		tok, err := c.token()
+		if err != nil {
+			return nil, fmt.Errorf("kubepod: service account token: %w", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("kubepod: %s %s: %w", method, path, err)
+	}
+	return resp, nil
+}
+
+// apiErrorOf reads an error reply: the API server's Status when the body
+// is one, else the body as the message.
+func apiErrorOf(method, path string, resp *http.Response) error {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	ae := &APIError{Method: method, Path: path, Code: resp.StatusCode}
+	var st struct {
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &st) == nil {
+		ae.Reason, ae.Message = st.Reason, st.Message
+	}
+	if ae.Message == "" {
+		ae.Message = strings.TrimSpace(string(raw))
+	}
+	return ae
 }

@@ -156,9 +156,10 @@ type StateRunning struct {
 
 // StateTerminated is a container that ended.
 type StateTerminated struct {
-	ExitCode int32  `json:"exitCode"`
-	Reason   string `json:"reason,omitempty"`
-	Message  string `json:"message,omitempty"`
+	ExitCode   int32      `json:"exitCode"`
+	Reason     string     `json:"reason,omitempty"`
+	Message    string     `json:"message,omitempty"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
 }
 
 // Pod phases (core/v1 PodPhase).
