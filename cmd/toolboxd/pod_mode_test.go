@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/aerol-ai/microvm/internal/cluster"
 	"github.com/aerol-ai/microvm/internal/podtrust"
+	"github.com/aerol-ai/microvm/internal/testport"
 	"github.com/aerol-ai/microvm/pkg/readyproto"
 )
 
@@ -287,6 +289,105 @@ func TestStartPodAdoptErrors(t *testing.T) {
 	if _, err := startPodAdopt(logger, &server{}, &podModeConfig{worker: "w", cas: cas}); err == nil || !strings.Contains(err.Error(), "port taken") {
 		t.Errorf("listen failure = %v", err)
 	}
+}
+
+// main in pod mode holds the image's command back until its worker adopts
+// it: run toolboxd's main with a command that leaves a marker file. Before
+// the adopt, no marker (the command would run without its env); after it,
+// the marker. (Review of #1489: removing the line that parks pod mode in
+// main broke nothing before this test.)
+func TestMainPodModeHoldsTheCommandUntilAdopted(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	caPEM, sign := testCell(t)
+	dir := t.TempDir()
+	caPath := dir + "/ca.crt"
+	marker := dir + "/command-ran"
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	toolboxPort := testport.Reserve(t, false)
+	adoptPort := testport.Reserve(t, false)
+	cmd := exec.Command(os.Args[0], "-test.run=TestHelperProcessMainPodModeHolds")
+	cmd.Env = append(os.Environ(),
+		"GO_WANT_HELPER_PROCESS_POD_HOLD=1",
+		"POD_HOLD_MARKER="+marker,
+		"SB_POD_MODE=1",
+		"SB_POD_WORKER=worker-0",
+		"SB_POD_WORKER_CA="+caPath,
+		"SB_POD_ADOPT_PORT="+strconv.Itoa(adoptPort),
+		"SB_TOOLBOX_PORT="+strconv.Itoa(toolboxPort),
+		"SB_SANDBOX_ID=sb-pod",
+		"SB_RECORDING_DIR="+dir+"/recordings",
+		"SB_CLONE_GEN_PATH="+dir+"/clonegen",
+	)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	// A child toolboxd started could still hold the output pipe after the
+	// kill; do not wait on it.
+	cmd.WaitDelay = time.Second
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	cert := sign("worker-0")
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		InsecureSkipVerify: true, // the server's own identity is M4 PR 4's
+		Certificates:       []tls.Certificate{cert},
+	}}}
+	adoptURL := "https://127.0.0.1:" + strconv.Itoa(adoptPort) + podtrust.AdoptPath
+	healthURL := "http://127.0.0.1:" + strconv.Itoa(toolboxPort) + "/health"
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		resp, err := http.Get(healthURL)
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("toolboxd never came up: %v\n%s", err, out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Up and serving /health, adopt listener open: give a command that was
+	// not held back ample time to run.
+	time.Sleep(500 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatalf("the image's command ran before the worker adopted the pod\n%s", out.String())
+	}
+
+	body, _ := json.Marshal(readyproto.AdoptFrame{SandboxID: "sb-pod", Token: "tok", Nonce: "n"})
+	resp, err := client.Post(adoptURL, "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("adopt: %v\n%s", err, out.String())
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("adopt = %d", resp.StatusCode)
+	}
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the image's command did not run after the adopt\n%s", out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestHelperProcessMainPodModeHolds(t *testing.T) {
+	if os.Getenv("GO_WANT_HELPER_PROCESS_POD_HOLD") != "1" {
+		return
+	}
+	os.Args = []string{"toolboxd", "sh", "-c", "touch " + os.Getenv("POD_HOLD_MARKER")}
+	main()
+	os.Exit(0)
 }
 
 // A pod-mode toolboxd whose settings are missing exits at once instead of
