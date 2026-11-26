@@ -3122,9 +3122,15 @@ EOF
 }
 
 write_systemd_unit() {
-	# Privilege mode split has a unit of its own; single writes exactly
-	# what it always did. Defaulted: the unit render tests run this under
-	# set -u without the flag parsing that sets it.
+	# Privilege mode split has a unit of its own; single writes what it
+	# always did, plus one condition. On a switch back this unit is written
+	# while PRIVILEGE_SWITCH_BACK_MARKER is there (mark_switch_back runs
+	# first, and leave_split_mode removes the marker last). A reboot in that
+	# window would start this root sandboxd on folders split's user still
+	# owns; the condition makes systemd skip the start instead, so the node
+	# waits for the installer. A skipped start is no failure: Restart= and
+	# the healthcheck timer leave the unit alone. Defaulted: the unit render
+	# tests run this under set -u without the flag parsing that sets it.
 	if [[ "${PRIVILEGE_MODE:-single}" == "split" ]]; then
 		split_sandboxd_unit > /etc/systemd/system/sandboxd.service
 		return 0
@@ -3135,6 +3141,10 @@ Description=AerolVM daemon
 After=docker.service caddy.service network-online.target
 Wants=network-online.target
 Requires=docker.service
+# The file named below exists only while a switch back from privilege mode
+# split is unfinished. Root's sandboxd does not start until install.sh
+# --privilege-mode single finishes the switch and removes the file.
+ConditionPathExists=!$PRIVILEGE_SWITCH_BACK_MARKER
 StartLimitIntervalSec=300
 StartLimitBurst=10
 
