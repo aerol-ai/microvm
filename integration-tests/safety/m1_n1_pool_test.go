@@ -62,6 +62,9 @@ func TestM1PoolStateSplitsPinnedFromLearned(t *testing.T) {
 	script := `set -euo pipefail
 dry=0; sd=/nonexistent; workers=aerolvm-workers
 ALPINE=public.ecr.aws/docker/library/alpine:3.20
+# The time limit (m1-lib.sh bounded) would exec the real kubectl; here it
+# just runs the stub below.
+bounded() { shift; "$@"; }
 kubectl() {
   cat <<'OUT'
 TASK        PID    STATUS
