@@ -1199,6 +1199,57 @@ stopped before step 1.
   deadline and check for leaks at the end. Estimates: SP-A about $3 planned,
   $6.60 at worst; SP-B about $0.20 planned, $0.45 at worst.
 
+**Results (2026-11-26, runs m2-spa-1126 and m2-spb-1126).** Both runs on
+main (SP-A at c911dbb59, SP-B at f6fec54a1), owner-approved; SP-A cost about
+$1.60 and SP-B about $0.02; the leak check found nothing left after either.
+
+SP-A (KVM Firecracker v1.15.1, 20 creates per step, pause/resume 40 busy +
+20 idle cycles; go needs every cycle intact and warm create under 100 ms):
+
+| | c5.metal, bare metal | m8i.xlarge, nested | m8i.xlarge, nested, with the redial (#1491) |
+|---|---|---|---|
+| Cold create p50 | 1,494 ms | 1,599 ms | 1,598 ms |
+| Template-snapshot create p50 | 54 ms | 87 ms | 92 ms |
+| Warm-pool create p50 (20 of 20 hits) | 31 ms | 76 ms | 81 ms |
+| Pause/resume intact, busy | 40 of 40 | 25 of 40 | 38 of 40 |
+| Pause/resume intact, idle | 19 of 20 | 11 of 20 | 19 of 20 |
+| Verdict (run m2-spa-1126) | no go | no go | no go |
+
+- **Warm pool: proven.** It works on both machines and is well under the
+  100 ms bar.
+- **Move: proven.** A VM moved on an m8i.4xlarge with nested virtualization
+  kept its boot ID and memory (counter 4 before, 48 after).
+- **Nested resume: the torn first connection is confirmed.** Every nested
+  loss without the redial was `vsock handshake: vsock read: EOF`, and retries
+  never helped; with the redial there were none. #1491 makes the redial.
+- **A second loss, also on bare metal:** after a good handshake, the guest
+  hand-over times out (`adopt guest (3 attempts): read ack: ... i/o
+  timeout`), 1 in 60 on c5.metal and 3 in 60 nested with the redial. The
+  agent logs a line before it sends its ack, and in a VM the log goes to the
+  serial console; a console that stops taking writes held the ack back.
+  #1493 makes the agent's logging unable to block.
+- **Confirmed with both fixes** (run m2-spa-fix-1126, about $0.10, nested
+  m8i.xlarge, a build with #1491 and #1493): pause/resume intact 80 of 80
+  busy and 40 of 40 idle, warm create p50 75.0 ms. **(a) has a go** once
+  #1491 and #1493 merge. (The run's summary line said NO GO only because
+  the verdict script read its own output file as a leg; #1494 fixes that.)
+
+SP-B (one m7i.xlarge with Nitro Enclaves, a 6 GiB pool, Firecracker v1.18
+direct mode, AerolVM's jailer argv):
+
+| Step | Result |
+|---|---|
+| 1. Boot and toolboxd on vsock | 20 of 20; start to answer p50 674 ms, p90 711 ms (go: under 2 s) |
+| 2. TAP and an nft rule on it | the rule blocks the host port; removing it restores it |
+| 3a. Confidential mode | 10 of 10 boots |
+| 3b. Attestation | a document from `/dev/nsm` in a confidential sandbox; its 5-certificate chain checks to AWS's root (direct mode has no `/dev/nsm`) |
+| 4. 50 at once | 20 started, the cap of 5 per parent vCPU on 4 vCPUs; the other 30 got a clean refusal, and the 20 kept answering |
+| Parked claim (R19) | 11 booted ahead; claim p50 3.2 ms, claim plus first exec 11.5 ms |
+
+- **(b) has a go.** Steps 1–4 pass and a cold start is well under 2 s.
+  Building (b) (§4.3) can start, and M3 now has its base: a confidential
+  sandbox can get a document that checks to AWS's root.
+
 ### 4.3 Building (b): one driver, two backends
 
 | Change | Where |
