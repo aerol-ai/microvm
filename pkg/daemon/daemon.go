@@ -450,6 +450,9 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	} else if ctd != nil {
 		ctdWiring = ctd
 		defer ctd.Stop()
+		// Privilege mode single on Kubernetes: a restart of the runtime
+		// container alone moves the sandboxes' cgroup parent.
+		followCgroupParent(cfg, ctd.driver, logger, restart.request)
 		if ctd.warm != nil {
 			// API warm-pool entries (W1) configure this pool per image;
 			// StartWarmPoolSync below applies them.

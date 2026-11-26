@@ -565,6 +565,12 @@ containers:
       - { name: SB_EGRESS_GATEWAY_SOCKET, value: /run/aerolvm-egress/egress-gateway.sock }
       {{- else }}
       - { name: SB_MOUNTS_CRED_DIR, value: /run/sandboxd }
+      # Where the runtime container writes the sandboxes' cgroup parent
+      # each time it starts. A restart of the runtime container alone
+      # moves the parent; sandboxd reads this again on each new connection
+      # to containerd and starts again to follow it. Split hears the same
+      # from its root helper.
+      - { name: SB_CONTAINERD_CGROUP_PARENT_FILE, value: /run/aerolvm/cgroup-parent }
       {{- end }}
       {{- if $externalStorage }}
       # The runtime container's pid: a create answers only once each

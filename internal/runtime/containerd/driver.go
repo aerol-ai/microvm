@@ -40,6 +40,10 @@ type Config struct {
 	// CgroupParent, when set, puts every sandbox's cgroup at
 	// <CgroupParent>/<id> (see cgroup_parent.go).
 	CgroupParent string
+	// CgroupParentFile is where the runtime container publishes the
+	// parent; privilege mode single reads it again on each new
+	// connection to containerd (cgroup_parent_moved.go). Empty: no check.
+	CgroupParentFile string
 	// DiskQuota enforces DiskGB as an XFS project quota on each sandbox's
 	// writable layer (disk_quota.go).
 	DiskQuota bool
@@ -81,6 +85,7 @@ func FromDaemonConfig(cfg config.Config) Config {
 		RunDir:             runDir,
 		NativeNetnsPool:    cfg.ContainerdNativeNetnsPoolEnabled,
 		CgroupParent:       cfg.ContainerdCgroupParent,
+		CgroupParentFile:   cfg.ContainerdCgroupParentFile,
 		DiskQuota:          cfg.ContainerdDiskQuota,
 	}
 }
@@ -98,6 +103,9 @@ type Driver struct {
 	// client field and leaking all-but-one gRPC connection.
 	clientMu sync.Mutex
 	client   *Client
+	// parentMoved hears, once, that the runtime container names another
+	// cgroup parent (cgroup_parent_moved.go): privilege mode single only.
+	parentMoved cgroupParentWatch
 
 	// pullGroup collapses concurrent pulls of the same ref; pullSem caps
 	// concurrent pulls of distinct refs; pullFails rate-limits retries of a
@@ -233,9 +241,12 @@ func (d *Driver) ensureClient() (*Client, error) {
 	}
 	var c *Client
 	var err error
-	if d.helper != nil {
+	switch {
+	case d.helper != nil:
 		c, err = connectHelperFn(d.helper, d.cfg.Namespace)
-	} else {
+	case d.cfg.CgroupParentFile != "":
+		c, err = connectCheckedFn(d.cfg.Socket, d.cfg.Namespace, d.checkCgroupParent)
+	default:
 		c, err = connectFn(d.cfg.Socket, d.cfg.Namespace)
 	}
 	if err != nil {
