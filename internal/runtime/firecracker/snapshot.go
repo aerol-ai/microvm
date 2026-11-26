@@ -78,6 +78,9 @@ const snapshotVMMIDPrefix = "tpl-snap-"
 // snapshot at all because the integrity check at load time would
 // rightly reject it but the row would be marked has_snapshot=true.
 func (d *Driver) SnapshotTemplate(ctx context.Context, req TemplateSnapshotRequest) (*TemplateSnapshotResult, error) {
+	if d.nitro() {
+		return nil, errNitroUnsupported("build a template snapshot")
+	}
 	// Same seam preconditions as Create. SnapshotTemplate shares the
 	// pool, tapHost, and vsockDial dependencies — the rootfs builder
 	// is the only seam Create needs that snapshot does not (the rootfs

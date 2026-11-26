@@ -160,7 +160,7 @@ func TestRequireFirecrackerVersion_Errors(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := New(Config{FirecrackerBinary: badExec}, nil)
-	if err := d.requireFirecrackerVersion(context.Background(), 1, 8, 0); err == nil || !strings.Contains(err.Error(), "failed to exec") {
+	if err := d.requireFirecrackerVersion(context.Background(), "vmgenid", 1, 8, 0); err == nil || !strings.Contains(err.Error(), "failed to exec") {
 		t.Fatalf("exec failure: got %v", err)
 	}
 
@@ -169,7 +169,7 @@ func TestRequireFirecrackerVersion_Errors(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.cfg.FirecrackerBinary = garbage
-	if err := d.requireFirecrackerVersion(context.Background(), 1, 8, 0); err == nil || !strings.Contains(err.Error(), "could not parse") {
+	if err := d.requireFirecrackerVersion(context.Background(), "vmgenid", 1, 8, 0); err == nil || !strings.Contains(err.Error(), "could not parse") {
 		t.Fatalf("parse failure: got %v", err)
 	}
 
@@ -178,7 +178,7 @@ func TestRequireFirecrackerVersion_Errors(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.cfg.FirecrackerBinary = old
-	if err := d.requireFirecrackerVersion(context.Background(), 1, 8, 0); err == nil || !strings.Contains(err.Error(), "requires Firecracker >= 1.8.0") {
+	if err := d.requireFirecrackerVersion(context.Background(), "vmgenid", 1, 8, 0); err == nil || !strings.Contains(err.Error(), "requires Firecracker >= 1.8.0") {
 		t.Fatalf("version gate: got %v", err)
 	}
 }

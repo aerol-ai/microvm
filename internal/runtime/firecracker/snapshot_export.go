@@ -95,6 +95,10 @@ func (d *Driver) CreateSnapshot(ctx context.Context, sandboxID, imageRef string)
 	if err := validateSandboxID(sandboxID); err != nil {
 		return "", fmt.Errorf("firecracker runtime: snapshot: %w", err)
 	}
+	if d.nitro() {
+		// The export boots a helper VM the KVM way; not built for Nitro.
+		return "", errNitroNotYet("take a snapshot")
+	}
 	if d.images == nil {
 		return "", fmt.Errorf("firecracker runtime: snapshot %s: no image store registered: %w",
 			sandboxID, models.ErrRuntimeNotImplemented)

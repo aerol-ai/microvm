@@ -414,6 +414,9 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 		}, nil
 	}
 	d.mu.Unlock()
+	if d.nitro() {
+		return nil, errNitroNotYet("start a stopped sandbox")
+	}
 	// A restore must be able to adopt the guest it boots (see below).
 	if strings.TrimSpace(toolboxToken) == "" {
 		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, errGuestTokenMissing)

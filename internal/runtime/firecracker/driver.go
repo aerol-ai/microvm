@@ -295,6 +295,13 @@ type Config struct {
 	// Off, every VM this node boots hides them (nested_virt.go). Mirrors
 	// internal/config.Config.FirecrackerNestedVirt.
 	NestedVirt bool
+	// Backend is config.FirecrackerBackendKVM ("kvm", also when empty) or
+	// config.FirecrackerBackendNitro (nitro.go). NitroMode is
+	// config.FirecrackerNitroModeDirect or ...Confidential; only the Nitro
+	// backend reads it. Mirror SB_FIRECRACKER_BACKEND /
+	// SB_FIRECRACKER_NITRO_MODE.
+	Backend   string
+	NitroMode string
 }
 
 // FromDaemonConfig copies the Firecracker-relevant fields out of the full
@@ -321,6 +328,8 @@ func FromDaemonConfig(c config.Config) Config {
 		ToolboxBinaryPath:    c.ToolboxBinaryPath,
 		VMMCgroupParent:      c.HostProcessCgroupParent,
 		NestedVirt:           c.FirecrackerNestedVirt,
+		Backend:              c.FirecrackerBackend,
+		NitroMode:            c.FirecrackerNitroMode,
 	}
 }
 
@@ -551,6 +560,12 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	}
 	if err := validateSandboxID(allocID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: %w", err)
+	}
+	if err := d.checkRuntimeFits(req.Runtime); err != nil {
+		return nil, err
+	}
+	if d.nitro() && req.TemplateID != "" {
+		return nil, errNitroUnsupported("start from a template snapshot")
 	}
 
 	// Phase 0 (plans/firecracker-create-latency.md): per-stage boot
@@ -1061,12 +1076,17 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 		// snapshot; flipping it post-boot requires a snapshot+restore
 		// cycle. Phase 4 will use this; Phase 1 sandboxes don't
 		// snapshot but we pay the (small) overhead now for uniformity.
-		TrackDirtyPages: true,
+		// A Nitro VM is never snapshotted, and Firecracker refuses the
+		// setting there at InstanceStart.
+		TrackDirtyPages: !d.nitro(),
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutMachineConfig: %w", err)
 	}
-	if err := d.configureGuestCPU(ctx, client); err != nil {
-		return fmt.Errorf("firecracker runtime: %w", err)
+	if !d.nitro() {
+		// No CPU template on Nitro: Firecracker refuses one at InstanceStart.
+		if err := d.configureGuestCPU(ctx, client); err != nil {
+			return fmt.Errorf("firecracker runtime: %w", err)
+		}
 	}
 	// In jailer mode firecracker is chrooted into the runDir, so every file
 	// path handed to its API must be chroot-relative and the file must live
@@ -1092,7 +1112,7 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 	// override is present iff the shim is actually in the image.
 	if err := client.PutBootSource(ctx, firecracker.BootSource{
 		KernelImagePath: kernelAPIPath,
-		BootArgs:        coldBootArgs(slot, d.cfg.ToolboxBinaryPath != ""),
+		BootArgs:        d.bootArgs(slot),
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutBootSource: %w", err)
 	}
@@ -1146,6 +1166,9 @@ func (d *Driver) configureVMM(ctx context.Context, client VMMClient, req models.
 		UDSPath:  hostVsockUDSName, // chroot-relative; jailer resolves it
 	}); err != nil {
 		return fmt.Errorf("firecracker runtime: PutVsock: %w", err)
+	}
+	if err := d.putEnclave(ctx, client); err != nil {
+		return fmt.Errorf("firecracker runtime: %w", err)
 	}
 	return nil
 }
@@ -1552,6 +1575,9 @@ func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
 		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
 	}
 	defer release()
+	if d.nitro() {
+		return errNitroNotYet("stop")
+	}
 	return d.stopToSandboxSnapshot(ctx, sandboxID)
 }
 
@@ -1858,6 +1884,10 @@ func (d *Driver) RuntimeHealth(ctx context.Context) string {
 	status := "ok"
 	if err := d.Ping(ctx); err != nil {
 		status = err.Error()
+	} else if d.nitro() {
+		if err := d.nitroHealth(ctx); err != nil {
+			status = err.Error()
+		}
 	} else if err := d.validateVMGenIDCapability(ctx); err != nil {
 		status = err.Error()
 	}
@@ -1867,7 +1897,7 @@ func (d *Driver) RuntimeHealth(ctx context.Context) string {
 }
 
 func (d *Driver) validateVMGenIDCapability(ctx context.Context) error {
-	if err := d.requireFirecrackerVersion(ctx, 1, 8, 0); err != nil {
+	if err := d.requireFirecrackerVersion(ctx, "vmgenid", 1, 8, 0); err != nil {
 		return err
 	}
 	if err := d.requireKernelVMGenID(); err != nil {
@@ -1876,23 +1906,25 @@ func (d *Driver) validateVMGenIDCapability(ctx context.Context) error {
 	return nil
 }
 
-func (d *Driver) requireFirecrackerVersion(ctx context.Context, wantMajor, wantMinor, wantPatch int) error {
+// requireFirecrackerVersion checks the binary is at least the version
+// that what (a feature, named in the error) needs.
+func (d *Driver) requireFirecrackerVersion(ctx context.Context, what string, wantMajor, wantMinor, wantPatch int) error {
 	out, err := exec.CommandContext(ctx, d.cfg.FirecrackerBinary, "--version").CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("firecracker runtime: vmgenid capability check failed to exec %q --version: %w",
-			d.cfg.FirecrackerBinary, err)
+		return fmt.Errorf("firecracker runtime: %s capability check failed to exec %q --version: %w",
+			what, d.cfg.FirecrackerBinary, err)
 	}
 	m := firecrackerVersionRE.FindStringSubmatch(string(out))
 	if len(m) != 4 {
-		return fmt.Errorf("firecracker runtime: vmgenid capability check could not parse firecracker version from %q",
-			strings.TrimSpace(string(out)))
+		return fmt.Errorf("firecracker runtime: %s capability check could not parse firecracker version from %q",
+			what, strings.TrimSpace(string(out)))
 	}
 	gotMajor, _ := strconv.Atoi(m[1])
 	gotMinor, _ := strconv.Atoi(m[2])
 	gotPatch, _ := strconv.Atoi(m[3])
 	if versionLess(gotMajor, gotMinor, gotPatch, wantMajor, wantMinor, wantPatch) {
-		return fmt.Errorf("firecracker runtime: vmgenid requires Firecracker >= %d.%d.%d, found %d.%d.%d",
-			wantMajor, wantMinor, wantPatch, gotMajor, gotMinor, gotPatch)
+		return fmt.Errorf("firecracker runtime: %s requires Firecracker >= %d.%d.%d, found %d.%d.%d",
+			what, wantMajor, wantMinor, wantPatch, gotMajor, gotMinor, gotPatch)
 	}
 	return nil
 }

@@ -101,7 +101,7 @@ func (s *Service) readSlotPools(ctx context.Context) ([]capacity.SlotPool, error
 		if stats.Total > 0 {
 			pools = append(pools, capacity.SlotPool{
 				Name:     capacity.SlotPoolFirecrackerTap,
-				Runtimes: []string{models.RuntimeFirecracker},
+				Runtimes: []string{s.cfg.FirecrackerRuntime()},
 				Total:    stats.Total,
 				Free:     stats.Free,
 			})

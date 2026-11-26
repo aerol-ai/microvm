@@ -196,6 +196,11 @@ func (d *Driver) FenceReady(sandboxID string) error {
 // same group with sandboxd down (FenceGroup). A VM with no group of its own
 // answers sbruntime.ErrCannotFreeze.
 func (d *Driver) Freeze(_ context.Context, sandboxID string) error {
+	if d.nitro() {
+		// The Nitro System runs a Nitro VM's vCPUs; freezing the
+		// Firecracker process's group would not stop the guest.
+		return fmt.Errorf("firecracker VM %s runs on the Nitro backend: %w", sandboxID, sbruntime.ErrCannotFreeze)
+	}
 	if d.split != nil {
 		// The VM's group is root's: the lease stops the VM instead.
 		return fmt.Errorf("firecracker VM %s runs under the root helper: %w", sandboxID, sbruntime.ErrCannotFreeze)

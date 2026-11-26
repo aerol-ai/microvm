@@ -53,6 +53,10 @@ func TestRefuseUnfencedRecreate(t *testing.T) {
 		{"firecracker, default VMs' parent", true, recreate, models.RuntimeFirecracker, "", false},
 		{"firecracker, the containerd parent", true, recreate, models.RuntimeFirecracker, "/pod/sandboxes", false},
 		{"firecracker, another parent", true, recreate, models.RuntimeFirecracker, "/elsewhere", true},
+		// A Nitro VM's vCPUs are the Nitro System's: no cgroup stops them.
+		{"firecracker-nitro, recreate", true, recreate, models.RuntimeFirecrackerNitro, "", true},
+		{"firecracker-nitro, no failover", true, nil, models.RuntimeFirecrackerNitro, "", false},
+		{"firecracker-nitro, no lease file", false, recreate, models.RuntimeFirecrackerNitro, "", false},
 	} {
 		svc.cfg.OwnershipLeaseFile = ""
 		if tc.file {

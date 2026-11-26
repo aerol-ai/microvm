@@ -24,6 +24,10 @@ func (f *fenceStub) Ready(rt string) error {
 func TestIPv6FenceRuntime(t *testing.T) {
 	for _, tc := range []struct{ runtime, engine, want string }{
 		{models.RuntimeFirecracker, models.ContainerEngineContainerd, models.RuntimeFirecracker},
+		// Nitro guests sit on the same TAPs: the Firecracker fence, never
+		// the engine's.
+		{models.RuntimeFirecrackerNitro, models.ContainerEngineContainerd, models.RuntimeFirecracker},
+		{models.RuntimeFirecrackerNitro, models.ContainerEngineDocker, models.RuntimeFirecracker},
 		{models.RuntimeWasm, models.ContainerEngineDocker, ""},
 		{models.RuntimeIsolate, models.ContainerEngineContainerd, ""},
 		{models.RuntimeDocker, models.ContainerEngineDocker, models.ContainerEngineDocker},

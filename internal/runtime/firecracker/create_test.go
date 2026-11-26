@@ -362,6 +362,7 @@ type fakeClient struct {
 	drives   map[string]firecracker.Drive
 	nics     map[string]firecracker.NetworkInterface
 	vsock    *firecracker.Vsock
+	enclave  *firecracker.Enclave
 	actions  []string
 	vmStates []string
 	instance *firecracker.InstanceInfo
@@ -400,6 +401,7 @@ type fakeClient struct {
 	networkPatchErr   error
 	nicErr            error
 	vsockErr          error
+	enclaveErr        error
 	actionErr         error
 	patchVMErr        error
 	snapshotCreateErr error
@@ -462,6 +464,14 @@ func (c *fakeClient) PutVsock(_ context.Context, v firecracker.Vsock) error {
 	c.vsock = &v
 	c.restOrder = append(c.restOrder, "PutVsock")
 	return c.vsockErr
+}
+
+func (c *fakeClient) PutEnclave(_ context.Context, e firecracker.Enclave) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.enclave = &e
+	c.restOrder = append(c.restOrder, "PutEnclave")
+	return c.enclaveErr
 }
 
 func (c *fakeClient) Action(_ context.Context, a firecracker.Action) error {

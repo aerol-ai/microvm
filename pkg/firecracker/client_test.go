@@ -227,6 +227,17 @@ func TestWrapperMethods_RequestShape(t *testing.T) {
 			},
 		},
 		{
+			// Every field goes on the wire, false included: Firecracker's
+			// own defaults are confidential mode and dedicated cores.
+			name:   "put-enclave",
+			method: http.MethodPut,
+			path:   "/enclave",
+			body:   Enclave{DirectMode: true, CPUOvercommit: true},
+			invoke: func(ctx context.Context, c *Client) error {
+				return c.PutEnclave(ctx, Enclave{DirectMode: true, CPUOvercommit: true})
+			},
+		},
+		{
 			name:   "put-logger",
 			method: http.MethodPut,
 			path:   "/logger",
@@ -404,4 +415,17 @@ func errorsAs(err error, target **APIError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// A zero Enclave is confidential mode with dedicated cores, said out loud:
+// a field left off would fall back to Firecracker's default, and a future
+// default change would then change our VMs silently.
+func TestEnclaveSendsEveryField(t *testing.T) {
+	got, err := json.Marshal(Enclave{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"direct_mode":false,"debug_mode":false,"cpu_overcommit":false}`; string(got) != want {
+		t.Fatalf("Enclave{} = %s, want %s", got, want)
+	}
 }

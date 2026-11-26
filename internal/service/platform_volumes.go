@@ -45,7 +45,7 @@ func (s *Service) resolvePlatformVolumes(ctx context.Context, req *models.Create
 	// paths (isolates have no filesystem at all — plans/isolate-runtime.md
 	// §3), so a volume would silently never appear. Reject before we do any
 	// storage work.
-	if chosenRuntime == models.RuntimeFirecracker || chosenRuntime == models.RuntimeWasm || chosenRuntime == models.RuntimeIsolate {
+	if models.IsFirecracker(chosenRuntime) || chosenRuntime == models.RuntimeWasm || chosenRuntime == models.RuntimeIsolate {
 		return nil, fmt.Errorf("%w (got %q)", models.ErrPlatformVolumesUnsupportedRuntime, chosenRuntime)
 	}
 	// A volume is a mount: a node that cannot serve mounts (a Kubernetes

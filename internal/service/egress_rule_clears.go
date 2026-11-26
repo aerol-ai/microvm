@@ -47,9 +47,9 @@ type ruleClearKey struct{ scope, ip string }
 func (k ruleClearKey) String() string { return k.scope + "|" + k.ip }
 
 // ruleScope names the firewall a container sandbox's rules live in: its
-// engine's, or Firecracker's.
+// engine's, or Firecracker's (either backend: the same TAP firewall).
 func ruleScope(sb *models.Sandbox) string {
-	if sb.Runtime == models.RuntimeFirecracker {
+	if models.IsFirecracker(sb.Runtime) {
 		return models.RuntimeFirecracker
 	}
 	return models.SandboxEngine(sb)

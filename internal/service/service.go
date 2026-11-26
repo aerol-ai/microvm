@@ -1236,14 +1236,14 @@ func (s *Service) ociEngineForNewCreate() (runtime.Runtime, error) {
 }
 
 func (s *Service) isFirecrackerSandbox(sandbox *models.Sandbox) bool {
-	return sandbox != nil && sandbox.Runtime == models.RuntimeFirecracker
+	return sandbox != nil && models.IsFirecracker(sandbox.Runtime)
 }
 
 func (s *Service) runtimeForSandbox(sandbox *models.Sandbox) (runtime.Runtime, error) {
 	if s.isFirecrackerSandbox(sandbox) {
 		if s.firecracker == nil {
 			return nil, fmt.Errorf("runtime %q: driver not registered: %w",
-				models.RuntimeFirecracker, models.ErrRuntimeNotImplemented)
+				sandbox.Runtime, models.ErrRuntimeNotImplemented)
 		}
 		return s.firecracker, nil
 	}
@@ -1299,7 +1299,7 @@ type runtimeListings struct {
 // Docker-engine row, the only listing a pass can fail to read.
 func (l runtimeListings) forSandbox(sandbox *models.Sandbox) (listing map[string]*models.SandboxRuntimeState, inDocker bool) {
 	switch sandbox.Runtime {
-	case models.RuntimeFirecracker:
+	case models.RuntimeFirecracker, models.RuntimeFirecrackerNitro:
 		return l.firecracker, false
 	case models.RuntimeWasm:
 		return l.wasm, false
@@ -2044,7 +2044,7 @@ func capacityRequestFromSandbox(sandbox *models.Sandbox) capacity.Request {
 }
 
 func diskGBForCapacity(base int, runtimeName string, overlaySizeGB int) int {
-	if runtimeName == models.RuntimeFirecracker && overlaySizeGB > 0 {
+	if models.IsFirecracker(runtimeName) && overlaySizeGB > 0 {
 		return base + overlaySizeGB
 	}
 	return base
@@ -2512,7 +2512,7 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	//     rather than an operator misconfiguration — main.go must
 	//     always register the driver when the env var is set. The
 	//     distinct message lets the operator tell the two apart.
-	if chosenRuntime == models.RuntimeFirecracker {
+	if models.IsFirecracker(chosenRuntime) {
 		if !s.cfg.EnableFirecracker {
 			return nil, fmt.Errorf("runtime %q requires SB_ENABLE_FIRECRACKER=true on this host (see plans/snapshot-clone-fast-boot.md): %w",
 				chosenRuntime, models.ErrRuntimeNotImplemented)
@@ -4818,7 +4818,7 @@ func (s *Service) CreateSnapshotWithOwnership(ctx context.Context, sandboxID str
 // checkpoint is a file, not an image, so it has no tag to clean up.
 func snapshotCommitEngine(sandbox *models.Sandbox) (engine string, ok bool) {
 	switch sandbox.Runtime {
-	case models.RuntimeFirecracker:
+	case models.RuntimeFirecracker, models.RuntimeFirecrackerNitro:
 		return "", true
 	case models.RuntimeWasm, models.RuntimeIsolate:
 		return "", false
@@ -6610,7 +6610,7 @@ func (s *Service) Health(ctx context.Context) (models.HealthStatus, error) {
 		case interface{ RuntimeHealth(context.Context) string }:
 			firecrackerStatus = rt.RuntimeHealth(ctx)
 		case nil:
-			firecrackerStatus = fmt.Sprintf("runtime %q: driver not registered", models.RuntimeFirecracker)
+			firecrackerStatus = fmt.Sprintf("runtime %q: driver not registered", s.cfg.FirecrackerRuntime())
 		default:
 			if err := rt.Ping(ctx); err != nil {
 				firecrackerStatus = err.Error()
@@ -7505,7 +7505,7 @@ func (s *Service) Reconcile(ctx context.Context) error {
 		removeOrphans(s.containerd, models.RuntimeDocker, models.ContainerEngineContainerd, listings.containerd)
 	}
 	if s.firecracker != nil {
-		removeOrphans(s.firecracker, models.RuntimeFirecracker, "", listings.firecracker)
+		removeOrphans(s.firecracker, s.cfg.FirecrackerRuntime(), "", listings.firecracker)
 	}
 	if s.wasm != nil {
 		removeOrphans(s.wasm, models.RuntimeWasm, "", listings.wasm)

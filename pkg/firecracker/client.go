@@ -161,6 +161,14 @@ func (c *Client) PutVsock(ctx context.Context, v Vsock) error {
 	return c.do(ctx, http.MethodPut, "/vsock", v, nil)
 }
 
+// PutEnclave makes the VMM a Nitro Sandbox (Firecracker v1.18+). Pre-boot
+// only, before InstanceStart. A Nitro Sandbox has no snapshots, no paused
+// state, no CPU template and no dirty-page tracking: Firecracker refuses
+// them at InstanceStart.
+func (c *Client) PutEnclave(ctx context.Context, e Enclave) error {
+	return c.do(ctx, http.MethodPut, "/enclave", e, nil)
+}
+
 // PutLogger attaches a file-backed logger to the VMM. Optional but useful
 // for capturing Firecracker's own diagnostic output during early bring-up.
 func (c *Client) PutLogger(ctx context.Context, lg Logger) error {

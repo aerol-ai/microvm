@@ -220,10 +220,10 @@ func (s *Service) noteReconcileRuntimeUnknown(ctx context.Context, sandbox *mode
 }
 
 // reconcileRuntimeLabel names the runtime a sandbox runs on, for the metric
-// key and the log: one of five values, so the map stays small.
+// key and the log: one of six values, so the map stays small.
 func reconcileRuntimeLabel(sandbox *models.Sandbox) string {
 	switch sandbox.Runtime {
-	case models.RuntimeFirecracker, models.RuntimeWasm, models.RuntimeIsolate:
+	case models.RuntimeFirecracker, models.RuntimeFirecrackerNitro, models.RuntimeWasm, models.RuntimeIsolate:
 		return sandbox.Runtime
 	}
 	return models.SandboxEngine(sandbox)

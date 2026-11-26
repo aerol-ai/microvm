@@ -107,7 +107,7 @@ func (s *Service) applyCreatePolicy(req *models.CreateSandboxRequest, chosenRunt
 		memory = 0
 	}
 	disk := req.DiskGB
-	if chosenRuntime == models.RuntimeFirecracker && req.OverlaySizeGB > 0 {
+	if models.IsFirecracker(chosenRuntime) && req.OverlaySizeGB > 0 {
 		// The overlay is disk the VM gets on top of its root disk, the same
 		// sum capacity admission charges.
 		disk += req.OverlaySizeGB

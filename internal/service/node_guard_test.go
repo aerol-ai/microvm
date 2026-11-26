@@ -251,9 +251,17 @@ func TestNodeGuardInstallAndGate(t *testing.T) {
 	if err := gate(models.ContainerEngineDocker, models.RuntimeFirecracker); err != nil {
 		t.Fatalf("network rules off, outside enterprise mode: %v", err)
 	}
+	// A Nitro guest is on the Firecracker TAPs: its gate is Firecracker's
+	// guard, never the engine's (containerd's failed here).
+	if err := gate(models.ContainerEngineContainerd, models.RuntimeFirecrackerNitro); err != nil {
+		t.Fatalf("firecracker-nitro was gated on the engine's guard: %v", err)
+	}
 	svc.cfg.EnterpriseMode = true
 	if err := gate(models.ContainerEngineDocker, models.RuntimeFirecracker); !errors.Is(err, ErrNodeGuardNotReady) {
 		t.Fatalf("enterprise mode needs the guard: %v", err)
+	}
+	if err := gate(models.ContainerEngineContainerd, models.RuntimeFirecrackerNitro); !errors.Is(err, ErrNodeGuardNotReady) || !strings.Contains(err.Error(), "runtime firecracker:") {
+		t.Fatalf("firecracker-nitro must need Firecracker's guard: %v", err)
 	}
 	svc.cfg.EnterpriseMode = false
 

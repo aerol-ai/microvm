@@ -31,6 +31,10 @@ import (
 //     resident host, a workerd group host) run many sandboxes, so no group
 //     holds one sandbox alone, and freezing a shared one would stop the
 //     others.
+//   - a Firecracker VM on the Nitro backend: never. The Nitro System runs
+//     its vCPUs, not the Firecracker process, and a cgroup does not hold
+//     or limit them (Firecracker's Nitro Sandboxes guide), so freezing the
+//     group would not stop the guest.
 //
 // Before, a Firecracker VM's file entry named a group that did not exist
 // and WASM and isolate sandboxes were fenced in name only: each could run
@@ -53,7 +57,7 @@ func (s *Service) fenceRef(sb *models.Sandbox) string {
 // sandbox of runtime alone, on this node.
 func (s *Service) leaseFreezable(chosenRuntime string) bool {
 	switch chosenRuntime {
-	case models.RuntimeWasm, models.RuntimeIsolate:
+	case models.RuntimeWasm, models.RuntimeIsolate, models.RuntimeFirecrackerNitro:
 		return false
 	case models.RuntimeFirecracker:
 		return s.cfg.HostProcessCgroupParent == "" || s.cfg.HostProcessCgroupParent == s.cfg.ContainerdCgroupParent
@@ -408,8 +412,11 @@ func (s *Service) refuseUnfencedRecreate(failover *models.Failover, chosenRuntim
 		return nil
 	}
 	why := "its host process runs other sandboxes too"
-	if chosenRuntime == models.RuntimeFirecracker {
+	switch chosenRuntime {
+	case models.RuntimeFirecracker:
 		why = "its VMs' cgroup (SB_HOST_PROCESS_CGROUP_PARENT) is not under the sandboxes' cgroup parent"
+	case models.RuntimeFirecrackerNitro:
+		why = "a Nitro VM's CPUs are not in any cgroup of this node"
 	}
 	return fmt.Errorf("failover.policy=recreate is not available for runtime %q on this node: if the node lost touch with the cluster, its runtime supervisor could not stop such a sandbox alone (%s), so it could run on here after being recreated elsewhere; use failover.policy=none, or a container or Firecracker runtime", chosenRuntime, why)
 }

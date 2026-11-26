@@ -398,7 +398,7 @@ func TestRestartOnFailureRuntimes(t *testing.T) {
 	lc := models.Lifecycle{RestartOnFailure: true}
 	for runtime, ok := range map[string]bool{
 		models.RuntimeDocker: true, models.RuntimeGvisor: true, "": true,
-		models.RuntimeFirecracker: false, models.RuntimeWasm: false, models.RuntimeIsolate: false,
+		models.RuntimeFirecracker: false, models.RuntimeFirecrackerNitro: false, models.RuntimeWasm: false, models.RuntimeIsolate: false,
 	} {
 		err := validateLifecycleRuntime(lc, runtime)
 		if (err == nil) != ok {

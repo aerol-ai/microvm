@@ -12,6 +12,10 @@ finish() {
   python3 /opt/spb/kit/spb.py verdict 2>&1 | grep '^SPB ' | while IFS= read -r l; do echo "$l" >/dev/console; done
   mkdir -p /root/spb-out
   cp /root/spb-results.jsonl /root/spb-doc-*.b64 /root/meminfo-nopool.txt /var/log/spb.log /root/spb-out/ 2>/dev/null
+  # sandboxd's log and setup log, with the admin token masked.
+  for f in /var/log/sandboxd.log /root/spb-sandboxd-setup.log; do
+    [ -s "$f" ] && sed "s/$(cat /root/pat 2>/dev/null || echo NOPAT)/<pat>/g" "$f" | gzip -c >"/root/spb-out/$(basename "$f").gz"
+  done
   dmesg | tail -300 >/root/spb-out/dmesg-tail.txt
   tar -czf /root/spb-results.tgz -C /root spb-out
   if curl -fsS --retry 3 -X PUT -T /root/spb-results.tgz "$(cat /opt/spb/results-url)" -o /dev/null; then
@@ -59,6 +63,16 @@ for step in $(cat /opt/spb/steps); do
     step5) spb step5 ;;
     step6) spb step6 ;;
     parked) spb parked --samples 12 ;;
+    sandboxd)
+      # AerolVM's own sandboxd on the Nitro backend (plan §4.3).
+      if bash /opt/spb/kit/spb-sandboxd.sh /opt/spb/src /opt/spb/kit >/root/spb-sandboxd-setup.log 2>&1; then
+        say "sandboxd setup: $(tail -1 /root/spb-sandboxd-setup.log | cut -c1-300)"
+        spb sandboxd --samples 10
+      else
+        say "sandboxd setup FAILED; last lines:"
+        tail -15 /root/spb-sandboxd-setup.log | sed "s/$(cat /root/pat 2>/dev/null || echo NOPAT)/<pat>/g" | cut -c1-240 | sed 's/^/SPB   /' >/dev/console
+      fi
+      ;;
     probe-*) spb probe --what "${step#probe-}" ;;
     *) say "unknown step $step" ;;
   esac

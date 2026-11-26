@@ -7,18 +7,26 @@ import (
 
 // SB_FIRECRACKER_BACKEND and SB_FIRECRACKER_NITRO_MODE
 // (plans/security-gaps-m1-m4.md §4.3): unset is today's KVM node; a value
-// that is neither name stops the start; the Nitro backend is refused until
-// its driver lands, so no node offers a runtime it cannot run.
+// that is neither name stops the start; a Nitro node refuses the KVM-only
+// settings it would otherwise take and quietly ignore.
 func TestLoadFirecrackerBackend(t *testing.T) {
 	for _, tc := range []struct {
 		name, backend, mode   string
+		extra                 map[string]string
 		wantBackend, wantMode string
+		wantRuntime           string
 		wantErr               string
 	}{
-		{name: "unset is kvm, direct", wantBackend: "kvm", wantMode: "direct"},
-		{name: "kvm spelled out", backend: " KVM ", wantBackend: "kvm", wantMode: "direct"},
-		{name: "confidential on a kvm node is read and ignored", backend: "kvm", mode: "Confidential", wantBackend: "kvm", wantMode: "confidential"},
-		{name: "nitro is not in this build", backend: "nitro", wantErr: "not in this build yet"},
+		{name: "unset is kvm, direct", wantBackend: "kvm", wantMode: "direct", wantRuntime: "firecracker"},
+		{name: "kvm spelled out", backend: " KVM ", wantBackend: "kvm", wantMode: "direct", wantRuntime: "firecracker"},
+		{name: "confidential on a kvm node is read and ignored", backend: "kvm", mode: "Confidential", wantBackend: "kvm", wantMode: "confidential", wantRuntime: "firecracker"},
+		{name: "nitro", backend: "nitro", wantBackend: "nitro", wantMode: "direct", wantRuntime: "firecracker-nitro"},
+		{name: "nitro confidential", backend: "Nitro", mode: "confidential", wantBackend: "nitro", wantMode: "confidential", wantRuntime: "firecracker-nitro"},
+		{name: "kvm keeps nested virtualization and the warm pool", backend: "kvm",
+			extra:       map[string]string{"SB_FIRECRACKER_NESTED_VIRT": "true", "SB_FIRECRACKER_VMM_POOL_ENABLED": "true"},
+			wantBackend: "kvm", wantMode: "direct", wantRuntime: "firecracker"},
+		{name: "nitro refuses nested virtualization", backend: "nitro", extra: map[string]string{"SB_FIRECRACKER_NESTED_VIRT": "true"}, wantErr: "SB_FIRECRACKER_NESTED_VIRT"},
+		{name: "nitro refuses the snapshot warm pool", backend: "nitro", extra: map[string]string{"SB_FIRECRACKER_VMM_POOL_ENABLED": "true"}, wantErr: "SB_FIRECRACKER_VMM_POOL_ENABLED"},
 		{name: "an unknown backend", backend: "xen", wantErr: "SB_FIRECRACKER_BACKEND"},
 		{name: "an unknown mode", mode: "half", wantErr: "SB_FIRECRACKER_NITRO_MODE"},
 	} {
@@ -26,6 +34,9 @@ func TestLoadFirecrackerBackend(t *testing.T) {
 			t.Setenv("SB_PAT_TOKEN", "operator-pat")
 			t.Setenv("SB_FIRECRACKER_BACKEND", tc.backend)
 			t.Setenv("SB_FIRECRACKER_NITRO_MODE", tc.mode)
+			for k, v := range tc.extra {
+				t.Setenv(k, v)
+			}
 			cfg, err := Load()
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -38,6 +49,9 @@ func TestLoadFirecrackerBackend(t *testing.T) {
 			}
 			if cfg.FirecrackerBackend != tc.wantBackend || cfg.FirecrackerNitroMode != tc.wantMode {
 				t.Fatalf("backend %q mode %q, want %q %q", cfg.FirecrackerBackend, cfg.FirecrackerNitroMode, tc.wantBackend, tc.wantMode)
+			}
+			if got := cfg.FirecrackerRuntime(); got != tc.wantRuntime {
+				t.Fatalf("FirecrackerRuntime() = %q, want %q", got, tc.wantRuntime)
 			}
 		})
 	}

@@ -145,16 +145,14 @@ var runtimeTable = []RuntimeInfo{
 		Features:  RuntimeFeatures{Snapshots: true, Pause: true, Moves: MovesMemory, WarmPool: WarmPoolKindSnapshot},
 	},
 	{
-		// Firecracker through Nitro Enclaves' direct mode
-		// (plans/security-gaps-m1-m4.md §4.3). AWS gives a Nitro VM no
-		// memory snapshots, so no snapshots, no pause and no memory moves.
-		// Reserved until the Nitro driver lands; the features say what it
-		// will offer when it does, nothing more.
+		// Firecracker through Nitro Sandboxes (plans/security-gaps-m1-m4.md
+		// §4.3): the same driver on SB_FIRECRACKER_BACKEND=nitro nodes. AWS
+		// gives a Nitro VM no memory snapshots and no paused state, so no
+		// snapshots, no pause and no memory moves; no warm pool yet.
 		Name:      RuntimeFirecrackerNitro,
 		Isolation: IsolationHardwareVM,
 		Backend:   "nitro",
 		Features:  RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindNone},
-		Reserved:  true,
 	},
 	{
 		// A snapshot is a checkpoint file, not an image a create can start

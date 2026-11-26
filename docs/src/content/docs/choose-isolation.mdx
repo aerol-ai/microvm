@@ -376,7 +376,8 @@ The HTTP status code is the same as it was before the list was added. The list h
 ## Good to know
 
 - **A runtime is fixed for the life of a sandbox.** To change it, create a new sandbox.
-- **`kata` and `firecracker-nitro` are reserved names.** A create that asks for either fails with `runtime not yet implemented on this build`. `firecracker-nitro` will be Firecracker on ordinary EC2 machines through AWS Nitro, without snapshots or pause. Until then, `firecracker` is the VM runtime.
+- **`kata` is a reserved name.** A create that asks for it fails with `runtime not yet implemented on this build`.
+- **`firecracker-nitro` is Firecracker on ordinary EC2 machines,** through AWS Nitro instead of KVM. A server offers it only when its operator sets `SB_FIRECRACKER_BACKEND=nitro`, and then it does not offer `firecracker`. These sandboxes have no snapshots and no pause. Stop is not available on them yet.
 - **The API calls containers `docker`,** whether the server runs Docker or containerd underneath. See [Docker or containerd](/container-sandbox/#docker-or-containerd).
 
 ## For server operators
