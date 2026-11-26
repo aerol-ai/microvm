@@ -205,6 +205,7 @@ func (d *Driver) stopNitro(ctx context.Context, sandboxID string) error {
 		}
 	}
 	d.unregister(sandboxID)
+	d.budget.release(sandboxID) // its enclave ended with it
 	if err := d.writeStopDir(ctx, sandboxID, handle.RunDir(), func(string) (sandboxSnapshotManifest, []string, error) {
 		return sandboxSnapshotManifest{
 			Version:    1,
@@ -265,11 +266,19 @@ func (d *Driver) startNitro(ctx context.Context, sandboxID, toolboxToken string,
 	if slot == nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: tap slot missing; cannot start with the sandbox's address", sandboxID)
 	}
+	if err := d.budget.reserve(sandboxID, manifest.VcpuCount, manifest.MemSizeMib); err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			d.budget.release(sandboxID)
+		}
+	}()
 	handle, err := d.spawn(d.cfg, sandboxID)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: spawn handle: %w", sandboxID, err)
 	}
-	committed := false
 	defer func() {
 		if committed {
 			return

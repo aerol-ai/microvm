@@ -32,6 +32,12 @@ type wasmInstanceCounter interface {
 	ManagedCount() int
 }
 
+// nitroSlotPooler is the Firecracker driver's Nitro vCPU budget, reported
+// only on a Nitro node.
+type nitroSlotPooler interface {
+	NitroSlotPool() (capacity.SlotPool, bool)
+}
+
 // LocalSlotPools reports this node's bounded per-sandbox slot pools and how
 // many slots each has free. Service.Capacity and the cluster's own lease
 // overlay it on the capacity snapshot, which is how placement learns that a
@@ -48,6 +54,8 @@ type wasmInstanceCounter interface {
 //     costs no store read.
 //   - Firecracker TAP pool: unallocated /30 slots (warm VMMs hold theirs).
 //   - WASM instances, only when SB_WASM_MAX_INSTANCES caps them.
+//   - Nitro sandbox vCPUs (5 per host vCPU), on a Nitro node: the driver
+//     holds the count, so it costs no store read.
 //
 // Nothing is reported for isolate's egress slots, which are per tenant group
 // rather than per node; an isolate create refuses itself when its group's
@@ -105,6 +113,11 @@ func (s *Service) readSlotPools(ctx context.Context) ([]capacity.SlotPool, error
 				Total:    stats.Total,
 				Free:     stats.Free,
 			})
+		}
+	}
+	if np, ok := s.firecracker.(nitroSlotPooler); ok {
+		if pool, ok := np.NitroSlotPool(); ok {
+			pools = append(pools, pool)
 		}
 	}
 	if limit := s.cfg.WasmMaxInstances; limit > 0 && s.wasm != nil {

@@ -16,6 +16,9 @@ Checks, each recorded:
     and the boot ID is new (no memory is kept on Nitro);
   - what a Nitro sandbox cannot do answers 501 with the runtime's name
     (a snapshot); a create for "firecracker" is refused here;
+  - the Nitro budget: 1-vCPU sandboxes created until one is refused; the
+    refusal is AerolVM's capacity answer (503, naming the limit), not a
+    Firecracker failure, and every one that started is deleted;
   - nothing left: no Firecracker process and no sandbox TAP after the
     deletes.
 
@@ -168,6 +171,23 @@ def stop_start(sid, say):
     return r
 
 
+def fill_budget(say, most=40):
+    """Create 1-vCPU, 256 MiB sandboxes until one is refused."""
+    made, refusal = [], None
+    for _ in range(most):
+        st, js, _ = call("POST", "/v1/sandboxes", {"image": IMAGE, "runtime": NITRO, "memory_mb": 256, "cpu": 1})
+        if st < 300 and (js or {}).get("id"):
+            made.append(js["id"])
+            continue
+        refusal = "HTTP %s %s" % (st, json.dumps(js)[:300])
+        break
+    for sid in made:
+        call("DELETE", "/v1/sandboxes/" + sid)
+    ok = refusal is not None and refusal.startswith("HTTP 503") and "Nitro" in refusal and len(made) > 0
+    say("sandboxd budget: %d started before the refusal: %s" % (len(made), refusal))
+    return {"budget_started": len(made), "budget_refusal": refusal, "budget_ok": ok}
+
+
 def run(a, record, say):
     say("sandboxd: %d sandboxes of runtime %s through sandboxd's API" % (a.samples, NITRO))
     ok_runtimes = runtimes(record, say)
@@ -179,6 +199,7 @@ def run(a, record, say):
             create_ms.append(ms)
         if "create_error" in r:
             say("sandboxd sample %d failed: %s" % (i, r["create_error"][:600]))
+    budget = fill_budget(say) if getattr(a, "budget", True) else {}
     st, js, _ = call("POST", "/v1/sandboxes", {"image": IMAGE, "runtime": "firecracker"})
     kvm_refused = st >= 400 and "firecracker-nitro" in json.dumps(js)
     if st < 300 and (js or {}).get("id"):
@@ -200,6 +221,7 @@ def run(a, record, say):
         "snapshot_refused": first.get("snapshot_refused"), "snapshot_answer": first.get("snapshot_answer"),
         "leftovers": leftovers, "results": results,
     }
+    out.update(budget)
     record("sandboxd", out)
 
 
@@ -213,11 +235,14 @@ def verdict(r):
     left = r.get("leftovers") or {}
     ok = (r.get("samples", 0) > 0 and r.get("passed") == r.get("samples") and r.get("runtimes_ok")
           and r.get("kvm_create_refused") and r.get("boot_line_ok") and r.get("stop_start_ok") and r.get("snapshot_refused")
+          and r.get("budget_ok", True)
           and left.get("firecracker_processes") == 0 and left.get("sandbox_taps") == 0
           and p50 is not None and p50 < COLD_GO_MS)
     text = ("%s of %s sandboxes passed through sandboxd (create p50 %s ms, go under %g); runtimes %s; firecracker refused %s; "
-            "boot line %s; stop/start %s (stop %s ms, start %s ms); snapshot refused %s; left: %s processes, %s TAPs; guest %s, vmx lines %s"
+            "boot line %s; stop/start %s (stop %s ms, start %s ms); snapshot refused %s; budget %s (%s started, then %s); "
+            "left: %s processes, %s TAPs; guest %s, vmx lines %s"
             % (r.get("passed"), r.get("samples"), p50, COLD_GO_MS, r.get("runtimes_ok"), r.get("kvm_create_refused"),
                r.get("boot_line_ok"), r.get("stop_start_ok"), r.get("stop_ms"), r.get("start_ms"), r.get("snapshot_refused"),
+               r.get("budget_ok"), r.get("budget_started"), (r.get("budget_refusal") or "")[:120],
                left.get("firecracker_processes"), left.get("sandbox_taps"), r.get("guest_kernel"), r.get("guest_vmx_lines")))
     return bool(ok), text

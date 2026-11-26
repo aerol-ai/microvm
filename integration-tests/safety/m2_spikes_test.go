@@ -514,8 +514,14 @@ type nitroStandIn struct {
 	next     int
 	noEgress bool
 	loseEnv  bool
-	sb       map[string]*nitroGuest
+	// rawRefusal answers a create past the cap as Firecracker would without
+	// AerolVM's budget (a 400 from InstanceStart), not with a capacity 503.
+	rawRefusal bool
+	sb         map[string]*nitroGuest
 }
+
+// nitroStandInCap is how many sandboxes the stand-in runs at once.
+const nitroStandInCap = 6
 
 type nitroGuest struct {
 	env, file string
@@ -553,6 +559,14 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/sandboxes":
 		if body["runtime"] != "firecracker-nitro" {
 			reply(http.StatusNotImplemented, map[string]string{"error": fmt.Sprintf(`runtime %q is not offered here (offered: docker, firecracker-nitro)`, body["runtime"])})
+			return
+		}
+		if len(s.sb) >= nitroStandInCap {
+			if s.rawRefusal {
+				reply(http.StatusBadRequest, map[string]string{"error": "firecracker runtime: action InstanceStart: A Nitro Enclave does not have enough vCPUs"})
+				return
+			}
+			reply(http.StatusServiceUnavailable, map[string]string{"error": "Nitro vCPU budget: no free slot (host capacity exceeded)"})
 			return
 		}
 		s.next++
@@ -603,6 +617,7 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasSuffix(r.URL.Path, "/snapshot"):
 		refuse("take a snapshot")
 	case r.Method == http.MethodDelete:
+		delete(s.sb, parts[3])
 		w.WriteHeader(http.StatusNoContent)
 	default:
 		reply(http.StatusNotFound, map[string]string{"error": "stand-in: " + r.Method + " " + r.URL.Path})
@@ -617,16 +632,17 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func TestM2SPBSandboxdStepVerdict(t *testing.T) {
 	needTools(t, "python3")
 	for _, c := range []struct {
-		name              string
-		noEgress, loseEnv bool
-		want              string
+		name                          string
+		noEgress, loseEnv, rawRefusal bool
+		want                          string
 	}{
-		{"guests reach the internet and keep their env across a start", false, false, "VERDICT SP-B: go"},
-		{"guests cannot reach the internet", true, false, "VERDICT SP-B: NO GO"},
-		{"a start loses the env", false, true, "VERDICT SP-B: NO GO"},
+		{"guests reach the internet and keep their env across a start", false, false, false, "VERDICT SP-B: go"},
+		{"guests cannot reach the internet", true, false, false, "VERDICT SP-B: NO GO"},
+		{"a start loses the env", false, true, false, "VERDICT SP-B: NO GO"},
+		{"the budget is Firecracker's refusal, not AerolVM's", false, false, true, "VERDICT SP-B: NO GO"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			srv := httptest.NewServer(&nitroStandIn{noEgress: c.noEgress, loseEnv: c.loseEnv})
+			srv := httptest.NewServer(&nitroStandIn{noEgress: c.noEgress, loseEnv: c.loseEnv, rawRefusal: c.rawRefusal})
 			defer srv.Close()
 			dir := t.TempDir()
 			pat, results := filepath.Join(dir, "pat"), filepath.Join(dir, "results.jsonl")

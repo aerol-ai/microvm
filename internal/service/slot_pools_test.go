@@ -24,6 +24,16 @@ type countingWasmRuntime struct {
 
 func (r countingWasmRuntime) ManagedCount() int { return r.n }
 
+// nitroPoolRuntime is a Firecracker driver stand-in on a Nitro node: it
+// reports its vCPU budget.
+type nitroPoolRuntime struct {
+	noContainerRuntime
+	pool capacity.SlotPool
+	ok   bool
+}
+
+func (r nitroPoolRuntime) NitroSlotPool() (capacity.SlotPool, bool) { return r.pool, r.ok }
+
 func newSlotPoolService(t *testing.T, cfg config.Config) (*Service, *store.Store) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
@@ -47,6 +57,7 @@ func TestLocalSlotPoolsReportsEachPool(t *testing.T) {
 		name  string
 		cfg   config.Config
 		wasm  countingWasmRuntime
+		fc    *nitroPoolRuntime
 		seed  func(t *testing.T, st *store.Store)
 		want  []capacity.SlotPool
 		wantN int
@@ -104,6 +115,18 @@ func TestLocalSlotPoolsReportsEachPool(t *testing.T) {
 			want: []capacity.SlotPool{{Name: capacity.SlotPoolWasmInstances, Runtimes: []string{"wasm"}, Total: 3, Free: 0}},
 		},
 		{
+			// The driver holds the count (nitro_budget.go): no store read.
+			name: "a nitro node's vCPU budget",
+			cfg:  config.Config{EnableFirecracker: true, FirecrackerBackend: config.FirecrackerBackendNitro},
+			fc:   &nitroPoolRuntime{ok: true, pool: capacity.SlotPool{Name: capacity.SlotPoolNitroVcpus, Runtimes: []string{"firecracker-nitro"}, Total: 20, Free: 15}},
+			want: []capacity.SlotPool{{Name: capacity.SlotPoolNitroVcpus, Runtimes: []string{"firecracker-nitro"}, Total: 20, Free: 15}},
+		},
+		{
+			name: "a kvm firecracker driver reports no nitro budget",
+			cfg:  config.Config{EnableFirecracker: true},
+			fc:   &nitroPoolRuntime{},
+		},
+		{
 			name: "docker engine has no bounded pool",
 			cfg:  config.Config{ContainerEngine: models.ContainerEngineDocker},
 		},
@@ -122,6 +145,9 @@ func TestLocalSlotPoolsReportsEachPool(t *testing.T) {
 			svc, st := newSlotPoolService(t, tc.cfg)
 			if tc.cfg.EnableWasm {
 				svc.wasm = tc.wasm
+			}
+			if tc.fc != nil {
+				svc.firecracker = *tc.fc
 			}
 			if tc.seed != nil {
 				tc.seed(t, st)

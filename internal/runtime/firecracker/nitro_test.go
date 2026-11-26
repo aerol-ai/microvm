@@ -159,7 +159,7 @@ func TestNitroStartReportsARunningVM(t *testing.T) {
 	f := newDriverFixture(t)
 	f.driver.cfg.Backend = "nitro"
 	ctx := context.Background()
-	if _, err := f.driver.Create(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro}, "sb-run", "tok", nil); err != nil {
+	if _, err := f.driver.Create(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro, MemoryMB: 512}, "sb-run", "tok", nil); err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	state, err := f.driver.StartWithIdentity(ctx, "sb-run", "sb-run", "tok")
@@ -215,7 +215,7 @@ func TestCreate_NitroEnclaveRefusedUnwinds(t *testing.T) {
 	f.driver.cfg.Backend = "nitro"
 	f.client.enclaveErr = errors.New("400 Bad Request: unknown request")
 	_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{
-		Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro,
+		Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro, MemoryMB: 512,
 	}, "sb-noenclave", "tok", nil)
 	if err == nil || !strings.Contains(err.Error(), "PutEnclave (SB_FIRECRACKER_BACKEND=nitro") {
 		t.Fatalf("err = %v, want the PutEnclave failure", err)
@@ -355,7 +355,7 @@ func TestNitroStopRefusedWithoutAFlushOrAShape(t *testing.T) {
 			f := newDriverFixture(t)
 			f.driver.cfg.Backend = "nitro"
 			ctx := context.Background()
-			if _, err := f.driver.Create(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro}, "sb-busy", "tok", nil); err != nil {
+			if _, err := f.driver.Create(ctx, models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro, MemoryMB: 512}, "sb-busy", "tok", nil); err != nil {
 				t.Fatalf("Create: %v", err)
 			}
 			tc.setup(f)

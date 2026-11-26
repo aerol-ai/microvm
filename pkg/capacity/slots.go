@@ -63,6 +63,9 @@ const (
 	SlotPoolContainerNetns = "container_netns"
 	SlotPoolFirecrackerTap = "firecracker_tap"
 	SlotPoolWasmInstances  = "wasm_instances"
+	// SlotPoolNitroVcpus is a Nitro node's sandbox vCPU budget (5 per host
+	// vCPU): one slot per sandbox vCPU.
+	SlotPoolNitroVcpus = "nitro_vcpus"
 	// SlotPoolDockerBridge is the docker engine's sandbox network: every
 	// running runc or gVisor sandbox, and every parked warm container, is
 	// one veth on its bridge. The admitter counts it (SlotLimit).

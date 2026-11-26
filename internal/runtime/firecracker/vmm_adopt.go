@@ -100,6 +100,10 @@ type vmmRecord struct {
 	// which its stop snapshot saves. Empty in a record from a release before
 	// it: unknown.
 	NestedVirt firecracker.NestedVirt `json:"nested_virt,omitempty"`
+	// NitroVcpus and NitroMemMiB are a Nitro VM's share of the node's Nitro
+	// budget (nitro_budget.go), taken back on adoption. Zero on KVM.
+	NitroVcpus  int `json:"nitro_vcpus,omitempty"`
+	NitroMemMiB int `json:"nitro_mem_mib,omitempty"`
 }
 
 func (d *Driver) vmmRecordDir() string {
@@ -268,10 +272,12 @@ func (d *Driver) writeVMMRecord(sandboxID string, handle VMMHandle, guestCID uin
 	if err != nil {
 		return fmt.Errorf("read boot id: %w", err)
 	}
+	hold, _ := d.budget.holding(sandboxID)
 	return writeRecordFile(dir, vmmRecord{
 		SandboxID: sandboxID, PID: pid, StartTicks: ticks, BootID: boot,
 		APISocket: handle.APISocket(), RunDir: handle.RunDir(), VsockCID: guestCID,
 		OwnsRunDir: ownsRunDir, NestedVirt: nestedVirt,
+		NitroVcpus: hold.vcpus, NitroMemMiB: hold.memMiB,
 	})
 }
 
@@ -486,6 +492,7 @@ func (d *Driver) adoptVM(ctx context.Context, rec vmmRecord, keep VMMKeeper) boo
 		d.frozenAdopted[rec.SandboxID] = frozenAdoption{client: client, runDir: rec.RunDir, cid: rec.VsockCID}
 	}
 	d.mu.Unlock()
+	d.budget.adopt(rec.SandboxID, nitroHold{vcpus: rec.NitroVcpus, memMiB: rec.NitroMemMiB})
 	d.rssRegister(rec.SandboxID, rec.PID)
 	// A release before this one started every VM in the VMs' shared
 	// cgroup: a group of its own lets the ownership lease freeze it alone.

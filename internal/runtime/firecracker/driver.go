@@ -180,6 +180,9 @@ type Driver struct {
 	verifyMu          sync.Mutex
 	verifiedSnapshots map[snapshotVerifyKey]*snapshotVerifyEntry
 	verifiedTemplates map[string]snapshotVerifyKey
+
+	// budget is the Nitro backend's admission (nitro_budget.go); nil on KVM.
+	budget *nitroBudget
 }
 
 // TapPool is the interface Driver depends on for network allocation.
@@ -367,6 +370,9 @@ func New(cfg Config, logger *slog.Logger) *Driver {
 	}
 	d.snapshotVerifier = verifySnapshotChecksum
 	d.toolboxTCPProbe = d.probeToolboxTCP
+	if d.nitro() {
+		d.budget = newNitroBudget(runtime.NumCPU(), logger)
+	}
 	return d
 }
 
@@ -567,6 +573,20 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	if d.nitro() && req.TemplateID != "" {
 		return nil, errNitroUnsupported("start from a template snapshot")
 	}
+	if d.nitro() {
+		if err := checkNitroShape(req.MemoryMB); err != nil {
+			return nil, err
+		}
+		if err := d.budget.reserve(allocID, vcpuFromRequest(req.CPU), req.MemoryMB); err != nil {
+			return nil, err
+		}
+	}
+	nitroHeld := d.nitro()
+	defer func() {
+		if nitroHeld {
+			d.budget.release(allocID)
+		}
+	}()
 
 	// Phase 0 (plans/firecracker-create-latency.md): per-stage boot
 	// attribution. The recorder rides the request context (nil-safe
@@ -1038,6 +1058,7 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 	// `released = true`, so a panic between them still cleans up the
 	// half-built state (the deferred closures run on panic).
 	released = true
+	nitroHeld = false  // the VM's now; Stop and Destroy give it back
 	tapRemoved = false // sandbox-owned now; Destroy will remove
 	// A cold boot got this node's setting (configureVMM); a clone has the
 	// CPU its template was saved with.
@@ -1623,6 +1644,7 @@ func (d *Driver) Destroy(ctx context.Context, sandbox *models.Sandbox) error {
 	// Before Shutdown, so a slow Shutdown can't leave the sampler reading
 	// a dying pid for one extra tick.
 	handle, hasHandle := d.unregister(sandboxID)
+	defer d.budget.release(sandboxID)
 
 	var firstErr error
 	rememberErr := func(err error) {
