@@ -176,8 +176,10 @@ type VMMClient interface {
 	PutDrive(ctx context.Context, driveID string, drv firecracker.Drive) error
 	PutNetworkInterface(ctx context.Context, ifaceID string, iface firecracker.NetworkInterface) error
 	PutVsock(ctx context.Context, v firecracker.Vsock) error
-	// PutEnclave is the Nitro backend's seam (nitro.go).
+	// PutEnclave and GetMachineConfig are the Nitro backend's seams
+	// (nitro.go): the enclave before start, the VM's shape at Stop.
 	PutEnclave(ctx context.Context, e firecracker.Enclave) error
+	GetMachineConfig(ctx context.Context) (*firecracker.MachineConfig, error)
 	Action(ctx context.Context, a firecracker.Action) error
 	PatchVM(ctx context.Context, vm firecracker.VM) error
 	InstanceInfo(ctx context.Context) (*firecracker.InstanceInfo, error)

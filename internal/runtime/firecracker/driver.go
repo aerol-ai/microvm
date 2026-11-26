@@ -1562,6 +1562,23 @@ func (d *Driver) StartWithIdentity(ctx context.Context, containerRef, sandboxID,
 	return d.startFromSandboxSnapshot(ctx, sandboxID, toolboxToken)
 }
 
+// StartWithIdentityEnv implements runtime.EnvIdentityStarter, which the
+// service prefers. On KVM it is StartWithIdentity: the restored memory
+// holds the env, and loadEnv is never called. On Nitro the guest boots
+// afresh from its kept disk (startNitro), so its env is handed over again.
+func (d *Driver) StartWithIdentityEnv(ctx context.Context, containerRef, sandboxID, toolboxToken string, loadEnv sbruntime.AdoptEnvLoader) (*models.SandboxRuntimeState, error) {
+	if containerRef != sandboxID {
+		return nil, fmt.Errorf("firecracker runtime: start %q: runtime reference does not name sandbox %q", containerRef, sandboxID)
+	}
+	if !d.nitro() {
+		return d.startFromSandboxSnapshot(ctx, sandboxID, toolboxToken)
+	}
+	if state, err := d.startChecks(ctx, sandboxID); err != nil || state != nil {
+		return state, err
+	}
+	return d.startNitro(ctx, sandboxID, toolboxToken, loadEnv)
+}
+
 // Stop captures a full per-sandbox snapshot, persists the root/overlay disk
 // files that snapshot expects, then tears down the VMM and host TAP. The TAP
 // pool allocation is intentionally kept so Start can restore the same guest IP
@@ -1576,7 +1593,7 @@ func (d *Driver) Stop(ctx context.Context, sandboxID string) error {
 	}
 	defer release()
 	if d.nitro() {
-		return errNitroNotYet("stop")
+		return d.stopNitro(ctx, sandboxID)
 	}
 	return d.stopToSandboxSnapshot(ctx, sandboxID)
 }

@@ -525,8 +525,11 @@ func (s *Service) specFromSandbox(ctx context.Context, sb *models.Sandbox) (*mod
 	return spec, nil
 }
 
+// isStoppedFirecrackerSnapshotRow reports a stopped Firecracker sandbox,
+// on either backend: no VM runs, and what Start needs (a KVM memory
+// snapshot, or a Nitro VM's kept disk) is only on this node's disk.
 func isStoppedFirecrackerSnapshotRow(sb *models.Sandbox) bool {
-	return sb != nil && sb.Runtime == models.RuntimeFirecracker && sb.Status == models.SandboxStatusStopped
+	return sb != nil && models.IsFirecracker(sb.Runtime) && sb.Status == models.SandboxStatusStopped
 }
 
 func clusterPortsFromSandbox(sb *models.Sandbox) map[int]cluster.ExposedPortRoute {

@@ -101,6 +101,16 @@ func (c *Client) InstanceInfo(ctx context.Context) (*InstanceInfo, error) {
 	return &info, nil
 }
 
+// GetMachineConfig reads the VMM's CPU/memory shape back. A Nitro VM's
+// Stop saves it, so its Start can boot the same VM again from its disk.
+func (c *Client) GetMachineConfig(ctx context.Context) (*MachineConfig, error) {
+	var mc MachineConfig
+	if err := c.do(ctx, http.MethodGet, "/machine-config", nil, &mc); err != nil {
+		return nil, err
+	}
+	return &mc, nil
+}
+
 // PutMachineConfig sets the VMM-wide CPU/memory shape. Must precede
 // InstanceStart on a fresh VMM; ignored on a VMM that loads a snapshot
 // (the snapshot already encodes the shape).
