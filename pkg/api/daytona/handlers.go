@@ -624,6 +624,10 @@ func (h *handlers) getSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
 	sandbox, sandboxID, err := h.resolveSandbox(r.Context(), r.PathValue("idOrName"))
+	if errors.Is(err, store.ErrNotFound) {
+		h.destroyAbandonedSandbox(w, r)
+		return
+	}
 	if err != nil {
 		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
 		return
@@ -642,6 +646,34 @@ func (h *handlers) destroySandbox(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	snapshot.UpdatedAt = now
 	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, &snapshot, meta))
+}
+
+// destroyAbandonedSandbox is the DELETE of a sandbox with no row here. On a
+// server that is how a sandbox left on a node an operator deleted arrives
+// (the router sends its delete to a server, clusterDestroyForwardWrap): the
+// service deletes the placement and returns the sandbox as the cluster still
+// knows it, and the answer is the same Sandbox body as above, which the
+// Daytona SDKs parse. Any other sandbox with no row is not found, as before,
+// and so is another tenant's.
+func (h *handlers) destroyAbandonedSandbox(w http.ResponseWriter, r *http.Request) {
+	ref := strings.TrimSpace(r.PathValue("idOrName"))
+	sandbox, state, err := h.deps.Service.DestroyAbandonedSandbox(r.Context(), ref, true, models.FacadeDaytona)
+	if err != nil {
+		apihttp.WriteStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	if sandbox.ID != ref {
+		// Named by its name: the call's api record must carry the id.
+		auditlog.NoteSandbox(r.Context(), sandbox.ID)
+	}
+	meta, err := sandboxMetaFromState(state, sandbox)
+	if err != nil {
+		// The sandbox is deleted; a facade state that does not decode
+		// costs only its own fields in the answer.
+		meta = defaultSandboxMeta(sandbox)
+	}
+	sandbox.UpdatedAt = time.Now().UTC()
+	apihttp.WriteJSON(w, http.StatusOK, h.toSandboxResponse(r, sandbox, meta))
 }
 
 func (h *handlers) startSandbox(w http.ResponseWriter, r *http.Request) {

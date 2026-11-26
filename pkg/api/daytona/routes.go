@@ -83,7 +83,7 @@ func RegisterRoutes(mux apihttp.Mux, d Deps) {
 	// A get returns env only with include_env (audited), which needs
 	// sandbox.secrets.
 	mux.Handle("GET "+PathPrefix+"/sandbox/{idOrName}", d.RouteBy(apihttp.ReadOrSecretsTag, apihttp.ReadOrSecrets, h.clusterForwardWrap("idOrName", http.HandlerFunc(h.getSandbox))))
-	mux.Handle("DELETE "+PathPrefix+"/sandbox/{idOrName}", d.Route(permWrite, h.clusterForwardWrap("idOrName", http.HandlerFunc(h.destroySandbox))))
+	mux.Handle("DELETE "+PathPrefix+"/sandbox/{idOrName}", d.Route(permWrite, h.clusterDestroyForwardWrap(http.HandlerFunc(h.destroySandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandbox/{idOrName}/start", d.Route(permWrite, h.clusterForwardWrap("idOrName", http.HandlerFunc(h.startSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandbox/{idOrName}/stop", d.Route(permWrite, h.clusterForwardWrap("idOrName", http.HandlerFunc(h.stopSandbox))))
 	mux.Handle("POST "+PathPrefix+"/sandbox/{idOrName}/snapshot", d.Route(permWrite, h.clusterForwardWrap("idOrName", http.HandlerFunc(h.createSnapshot))))

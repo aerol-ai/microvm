@@ -475,6 +475,8 @@ func (h *handlers) shutdownDevbox(w http.ResponseWriter, r *http.Request, id str
 			writeJSON(w, http.StatusOK, view)
 			return
 		}
+		h.shutdownAbandonedDevbox(w, r, id)
+		return
 	}
 	if err != nil {
 		writeStoreAwareError(h.deps.Logger, w, err)
@@ -489,12 +491,40 @@ func (h *handlers) shutdownDevbox(w http.ResponseWriter, r *http.Request, id str
 		writeStoreAwareError(h.deps.Logger, w, err)
 		return
 	}
+	h.finishShutdown(w, r, id, sandbox.OwnerRef, view)
+}
+
+// shutdownAbandonedDevbox is the shutdown of a devbox with no row and no
+// tombstone here. On a server that is how a devbox left on a node an
+// operator deleted arrives (the router sends its shutdown to a server,
+// clusterShutdownForwardWrap): the service deletes the placement and
+// returns the devbox as the cluster still knows it, and the answer is the
+// same terminal view, recorded as this node's tombstone. Any other devbox
+// with no row is not found, as before, and so is another tenant's.
+func (h *handlers) shutdownAbandonedDevbox(w http.ResponseWriter, r *http.Request, id string) {
+	sandbox, state, err := h.deps.Service.DestroyAbandonedSandbox(r.Context(), id, false, models.FacadeRunloop)
+	if err != nil {
+		writeStoreAwareError(h.deps.Logger, w, err)
+		return
+	}
+	blob, err := decodeDevboxBlob(state)
+	if err != nil {
+		// The devbox is deleted; a facade state that does not decode costs
+		// only its name, blueprint and launch parameters in the answer.
+		blob = devboxBlob{}
+	}
+	h.finishShutdown(w, r, sandbox.ID, sandbox.OwnerRef, newDevboxView(sandbox, blob))
+}
+
+// finishShutdown answers a shutdown whose devbox is gone: its terminal view,
+// recorded as the tombstone a retry replays.
+func (h *handlers) finishShutdown(w http.ResponseWriter, r *http.Request, id, owner string, view devboxView) {
 	end := time.Now().UnixMilli()
 	view.Status = statusShutdown
 	view.EndTimeMs = &end
 	view.ShutdownReason = stringPtr("api_shutdown")
 	view.FailureReason = nil
-	if err := h.putShutdownTombstone(r.Context(), id, sandbox.OwnerRef, view); err != nil {
+	if err := h.putShutdownTombstone(r.Context(), id, owner, view); err != nil {
 		// The sandbox is already gone; a tombstone write failure only costs a
 		// retried shutdown its replay (it would 404 instead of 200). Log and
 		// still return the terminal view for this call.

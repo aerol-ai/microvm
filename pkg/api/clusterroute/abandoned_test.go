@@ -157,6 +157,68 @@ func TestWrapSandboxOnADeletedNode(t *testing.T) {
 	}
 }
 
+// byNameStub resolves one name to id, as the real lookups do for an orphan:
+// the id comes back with ErrOrphaned. Its placement answers only by id.
+type byNameStub struct {
+	*abandonedStub
+	id string
+}
+
+func (c *byNameStub) OwnerOfName(string, string) (string, cluster.OwnerInfo, error) {
+	return c.id, cluster.OwnerInfo{}, cluster.ErrOrphaned
+}
+
+func (c *byNameStub) PlacementOf(id string) (cluster.Placement, bool) {
+	if id != c.id {
+		return cluster.Placement{}, false
+	}
+	return c.abandonedStub.PlacementOf(id)
+}
+
+type byNameServerStub struct{ *byNameStub }
+
+func (c *byNameServerStub) DeleteAbandonedPlacement(context.Context, cluster.Placement) error {
+	return nil
+}
+
+// A DELETE by name (Daytona's idOrName) of a sandbox orphaned from a deleted
+// node. The name lookup answers the id with ErrOrphaned; the placement must
+// be read by that id, or the call answered 410 as if the node had only died.
+func TestWrapDeleteByNameOfAnOrphanOnADeletedNode(t *testing.T) {
+	const deleted = "worker-deleted"
+	for _, tc := range []struct {
+		name   string
+		server bool
+	}{{name: "at a gateway"}, {name: "at a server", server: true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := &abandonedStub{
+				stubCluster: &stubCluster{Noop: cluster.NewNoop("self", "", ""), ownerErr: cluster.ErrUnknownSandbox},
+				denied:      map[string]bool{deleted: true},
+				place: cluster.Placement{SandboxID: "sb-1", IncarnationID: "inc", OwnerState: cluster.PlacementOwnerStateOrphaned,
+					OrphanedOwnerNodeID: deleted},
+				placed: true,
+			}
+			named := &byNameStub{abandonedStub: base, id: "sb-1"}
+			var c cluster.Client = named
+			if tc.server {
+				c = &byNameServerStub{byNameStub: named}
+			}
+			lh, ran := local()
+			r := httptest.NewRequest(http.MethodDelete, "/x/web", nil)
+			r.SetPathValue("idOrName", "web")
+			r.Header.Set("Authorization", "Bearer tok")
+			rr := httptest.NewRecorder()
+			Wrap(svcWith(t, c), Options{PathKey: "idOrName", ResolveName: true, WriteError: writeErr, Destroy: true}, lh).ServeHTTP(rr, r)
+			if tc.server && !*ran {
+				t.Fatalf("a server answered %d %q; want its handler to delete the sandbox", rr.Code, rr.Body.String())
+			}
+			if !tc.server && base.toServer != 1 {
+				t.Fatalf("a gateway answered %d %q and sent it %d times; want it sent to a server once", rr.Code, rr.Body.String(), base.toServer)
+			}
+		})
+	}
+}
+
 // An owner-cache entry written before its node was deleted is never used:
 // the call takes the lookup path, which does not forward to a deleted node.
 func TestOwnerCacheSkipsADeletedNode(t *testing.T) {
