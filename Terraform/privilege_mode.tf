@@ -45,12 +45,13 @@ locals {
     : var.firecracker.mkfs_bin
   )
 
-  # The jailer's user. Unset is uid and gid 1000 in single, as before. In
-  # split the bootstrap writes no SB_JAILER_UID or SB_JAILER_GID, so the VMs
-  # run as a user of their own, sandboxd-jailer, which install.sh
-  # --with-firecracker makes. A value set in tfvars is kept.
-  firecracker_jailer_uid = var.firecracker.jailer_uid != null ? var.firecracker.jailer_uid : (local.split_mode ? null : 1000)
-  firecracker_jailer_gid = var.firecracker.jailer_gid != null ? var.firecracker.jailer_gid : (local.split_mode ? null : 1000)
+  # The jailer's user. Unset, the VMs run as a system user of their own,
+  # sandboxd-jailer: in split install.sh --with-firecracker makes it and
+  # writes its ids, and in single the bootstrap makes it and writes its ids
+  # (section 2d). A value set in tfvars is kept; sandboxd refuses one that
+  # is root, a login user or in an admin group.
+  firecracker_jailer_uid = var.firecracker.jailer_uid
+  firecracker_jailer_gid = var.firecracker.jailer_gid
 
   # The folders sandboxd's user owns in split: what `aerolvm-rootd
   # agent-folders` hands it at each start (internal/rootd

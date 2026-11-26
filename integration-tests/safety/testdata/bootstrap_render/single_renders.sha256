@@ -5,6 +5,11 @@
 # replaces every node of an existing cluster. TestBootstrapSingleRendersArePinned
 # reads this file; split renders are not in it. Change a line only on purpose,
 # from a render of main's template, never of the branch's.
+# On purpose: joiner_join_firecracker (single Firecracker, jailer ids unset)
+# changed when the bootstrap began to make the jailer's own system user
+# instead of writing uid 1000. joiner_join_firecracker_own_ids (ids set to
+# 1000) keeps the hash joiner_join_firecracker had at c9878073: a cluster
+# that sets jailer_uid and jailer_gid to 1000 keeps its nodes.
 03513f0e2a6f532785c087a0810135ed7f9bfb303969f5024c6e85fcb396a96e  joiner
 ca35dc6ad4bada348167fb3868a8e4b66f84bf2261114f2b44cecbb371551246  joiner_api_lb
 7190d8fa8b82d598de9ceb28afe61cc3e9efe44df20fb242f4dabe9b164c8296  joiner_api_lb_worker
@@ -18,7 +23,8 @@ ecc93de933ed76514335baeeeafd319aeb172e899d35f608182614544a4d3ddd  joiner_audit_s
 a783480d36f81bbec1aafd7baf26db84ab3b12b9dd1707c094c69d8fa5c72663  joiner_join_buildkit_rootless
 367cfc917e5a90291bfd92cb734683a39fc3ee99addffa5226ab5920847ef64e  joiner_join_download_mirror
 8739a2decc729057cb7cd5566bab038063c1f37a2f370ae21b1039b2eaaffa6b  joiner_join_everything_single
-7fa4894128d45d06762daf9a2b8f3e78e4a19f9abc4d90925c0761a1d7ce77c4  joiner_join_firecracker
+e58e8a8976a91ac72c4e61a9fbdb7de98bd08ac5cef8760d50fecfceed83acd2  joiner_join_firecracker
+7fa4894128d45d06762daf9a2b8f3e78e4a19f9abc4d90925c0761a1d7ce77c4  joiner_join_firecracker_own_ids
 fe11648ffbf1359261b8743118efa72e8bceee8b0deb8a4103179dba50127d01  joiner_join_worker
 4f89c95bacfaa495fff0fc77b2eba07de9f5c6ce4a4a1cdeb210710a084cf44a  joiner_kms
 39d5a7e06baf39d8f85f8f570a2cc795d482bdcb20cc29aff6f07be33b757f46  joiner_receiver

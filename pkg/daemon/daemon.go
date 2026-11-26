@@ -514,6 +514,10 @@ func Run(ctx context.Context, logger *slog.Logger, makeProvider ProviderFactory)
 	// fields, so any failure is operational (CIDR doesn't fit the pool,
 	// SQLite write failed) and worth crashing for rather than swallowing.
 	if cfg.EnableFirecracker {
+		// Before anything Firecracker starts: the user every VM runs as.
+		if err := checkFirecrackerJailerUser(cfg, helper != nil); err != nil {
+			return err
+		}
 		pool := tap.New(db)
 		if err := pool.Seed(context.Background(), tap.SeedConfig{
 			BaseCIDR: cfg.FirecrackerTapBaseCIDR,

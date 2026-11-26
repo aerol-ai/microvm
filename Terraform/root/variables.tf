@@ -489,10 +489,14 @@ variable "firecracker" {
     becomes /usr/local/lib/aerolvm-firecracker/vmlinux (a folder only root
     writes), the default mkfs_bin becomes /usr/sbin/mkfs.ext4 (/sbin is a
     link on Ubuntu, Debian and Amazon Linux 2023, and the root helper follows
-    no link in a folder), and when jailer_uid and jailer_gid are unset split runs
-    the VMs as a user of their own, sandboxd-jailer, which install.sh makes.
-    Unset in single is uid and gid 1000, as before. See Terraform/README.md,
-    "Privilege mode split".
+    no link in a folder). See Terraform/README.md, "Privilege mode split".
+
+    When jailer_uid and jailer_gid are unset, the VMs run as a system user of
+    their own, sandboxd-jailer, with no login shell: install.sh makes it in
+    split, the bootstrap makes it in single, and each writes its ids. A value
+    set here is written as it is; sandboxd refuses to start Firecracker when
+    it is root, sandboxd's own user, a user with a login shell, or in a
+    group that gives root rights (root, sudo, wheel, admin, docker, lxd).
   EOT
   type = object({
     binary_url                   = optional(string, "")

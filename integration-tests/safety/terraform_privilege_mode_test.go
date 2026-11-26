@@ -68,10 +68,13 @@ const (
 )
 
 var splitCases = map[string]splitCase{
-	// Single is untouched: whatever it ran before, it runs.
+	// Single is untouched, but for the jailer's user: with no ids set the
+	// bootstrap makes sandboxd-jailer, so none is passed (it was 1000).
 	"single_every_runtime": {mode: "single", firecracker: true, isolate: true, wasm: true,
 		fc:         map[string]string{"use_jailer": "false", "jailer_chroot_base": `"/data/jailer"`},
-		wantKernel: singleKernel, wantJailer: "1000", wantMkfs: singleMkfs},
+		wantKernel: singleKernel, wantJailer: "null", wantMkfs: singleMkfs},
+	"single_own_jailer_ids": {mode: "single", firecracker: true,
+		fc: map[string]string{"jailer_uid": "2000", "jailer_gid": "2000"}, wantJailer: "2000"},
 	"single_docker_old_join": {mode: "single", docker: true, oldJoin: true, noNetnsPool: true},
 
 	// Split runs every runtime with the defaults and the shipped cluster.yml.
@@ -471,8 +474,8 @@ func terraformRun(t *testing.T, dir string, args ...string) string {
 // A split node with each runtime gets the install.sh flags that set it up,
 // and the root helper restarts after the bootstrap's settings are written,
 // since it reads cluster.env too. Single renders as before: Terraform
-// installs Firecracker itself, the jailer runs as uid 1000, and only
-// sandboxd restarts.
+// installs Firecracker itself and only sandboxd restarts. The jailer's user
+// is TestBootstrapSingleJailerUser's.
 func TestBootstrapSplitRunsEveryRuntime(t *testing.T) {
 	const (
 		split       = "INSTALL_ARGS+=(--with-containerd-engine --privilege-mode split)"
@@ -543,8 +546,48 @@ func TestBootstrapSplitRunsEveryRuntime(t *testing.T) {
 	if out := rendered["joiner_privilege_split_oldpath"]; !strings.Contains(out, oneRestart) || strings.Contains(out, "aerolvm-rootd") {
 		t.Error("the old join path restarts the root helper; split runs on the one-line join path only")
 	}
-	if out := rendered["joiner_join_firecracker"]; !strings.Contains(out, "SB_JAILER_UID=1000\nSB_JAILER_GID=1000\n") {
-		t.Error("single Firecracker no longer runs the jailer as uid 1000")
+}
+
+// Single Firecracker with no jailer ids set makes the sandboxd-jailer system
+// user, as install.sh --with-firecracker does, and writes its ids to
+// cluster.env after the settings that name the jailer; it never writes uid
+// 1000, a cloud image's login user. Ids set in tfvars are written as they
+// are, and no user is made. Split leaves both to install.sh.
+func TestBootstrapSingleJailerUser(t *testing.T) {
+	const (
+		useradd = "useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-jailer"
+		ids     = `printf 'SB_JAILER_UID=%s\nSB_JAILER_GID=%s\n' "$JAILER_UID" "$JAILER_GID" >> /tmp/aerolvm-ops.env`
+		readUID = `JAILER_UID="$(id -u sandboxd-jailer)"`
+		opsEnv  = "sudo tee -a /etc/sandboxd/cluster.env < /tmp/aerolvm-ops.env"
+		fcEnv   = "SB_FIRECRACKER_USE_JAILER=true"
+	)
+	rendered := renderBootstrapOutputs(t, bootstrapTemplatePath(t), "joiner_join_firecracker",
+		"joiner_join_firecracker_own_ids", "joiner_join_privilege_split_firecracker", "joiner_join")
+
+	out := rendered["joiner_join_firecracker"]
+	for _, w := range []string{useradd, readUID, ids} {
+		if !strings.Contains(out, w) {
+			t.Errorf("single Firecracker with no jailer ids: missing %q", w)
+		}
+	}
+	if strings.Contains(out, "SB_JAILER_UID=1000") || strings.Contains(out, "SB_JAILER_GID=1000") {
+		t.Error("single Firecracker still writes uid 1000 for the jailer")
+	}
+	order := []string{useradd, fcEnv, readUID, ids, opsEnv}
+	for i := 1; i < len(order); i++ {
+		if a, b := strings.Index(out, order[i-1]), strings.Index(out, order[i]); a < 0 || b < 0 || a > b {
+			t.Errorf("want %q before %q (at %d and %d)", order[i-1], order[i], a, b)
+		}
+	}
+
+	own := rendered["joiner_join_firecracker_own_ids"]
+	if !strings.Contains(own, "SB_JAILER_UID=1000\nSB_JAILER_GID=1000\n") {
+		t.Error("jailer ids set in tfvars are not written")
+	}
+	for name, o := range map[string]string{"own ids": own, "split": rendered["joiner_join_privilege_split_firecracker"], "no Firecracker": rendered["joiner_join"]} {
+		if strings.Contains(o, useradd) || strings.Contains(o, readUID) {
+			t.Errorf("%s: the bootstrap makes or reads the sandboxd-jailer user", name)
+		}
 	}
 }
 

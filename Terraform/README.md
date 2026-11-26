@@ -348,8 +348,9 @@ warm pool (`containerd.pool.enabled`). What changes for them:
   Amazon Linux 2023, and the helper follows no link in a folder (a
   program's own name may be a link, as `mkfs.ext4` is to `mke2fs`). If
   `firecracker.jailer_uid` and `jailer_gid` are unset, the bootstrap writes no
-  jailer ids, so the VMs run as `sandboxd-jailer`. In single they stay uid
-  and gid 1000, as before.
+  jailer ids, so the VMs run as `sandboxd-jailer`. In single the bootstrap
+  makes the `sandboxd-jailer` user itself and writes its ids (it used to
+  write uid and gid 1000; see "Firecracker's jailer user" below).
 - **The helper restarts with sandboxd** at the end of the bootstrap. It reads
   `cluster.env` too, and the WASM, Firecracker and volume settings are added
   there after it first starts.
@@ -484,6 +485,41 @@ Notes:
 - `with_firecracker` is validated at plan time and may only be set on worker-capable nodes (`worker`, `server,worker`, `worker,ingress`, or `mixed`).
 - The host default runtime stays Docker; Firecracker is selected per sandbox via `runtime: "firecracker"` or template-backed create calls.
 - The bootstrap writes the runtime env only on nodes with `with_firecracker = true`, so server-only and ingress-only nodes keep the old Docker-only shape.
+
+### Firecracker's jailer user
+
+The jailer runs every microVM on a node as one user. With
+`firecracker.jailer_uid` and `jailer_gid` unset, that is `sandboxd-jailer`: a
+system user with no login shell and a group of its own. The bootstrap makes
+it on each Firecracker node and writes its ids to `/etc/sandboxd/cluster.env`
+(`install.sh` does this in split).
+
+When you upgrade this module, a single-mode Firecracker node's start script
+changes, so the next `terraform apply` replaces that node (nodes use
+`user_data_replace_on_change`). The new node comes up with `sandboxd-jailer`.
+To keep your nodes instead, first set `jailer_uid = 1000` and
+`jailer_gid = 1000` in `firecracker` in `terraform.tfvars`: the start script
+then stays byte for byte the same, and you fix each node as below.
+
+Nodes made before this change have `SB_JAILER_UID=1000` and
+`SB_JAILER_GID=1000` in `cluster.env`. On Ubuntu and Amazon Linux images uid
+1000 is the login user (`ubuntu`, `ec2-user`), with a login shell and sudo.
+From this release sandboxd will not start Firecracker as such a user. It
+stops at start and names the setting. To fix a node, run Ansible's
+`configure-ops.yml` (it makes `sandboxd-jailer` and writes its ids), or on the
+node:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-jailer
+sudo sed -i "s/^SB_JAILER_UID=.*/SB_JAILER_UID=$(id -u sandboxd-jailer)/; s/^SB_JAILER_GID=.*/SB_JAILER_GID=$(id -g sandboxd-jailer)/" /etc/sandboxd/cluster.env
+sudo systemctl restart sandboxd
+```
+
+Do this before you upgrade the node, or right after. Running microVMs keep
+running while sandboxd is stopped, and sandboxd takes them back when it starts.
+A node whose uid 1000 is no user, or a user with no login shell and in no
+group that gives root rights (`root`, `sudo`, `wheel`, `admin`, `docker`,
+`lxd`), keeps starting as before.
 
 The S3 bucket is private, SSE-encrypted, and `force_destroy = true` by
 default so `terraform destroy` doesn't fail on leftover objects. Flip

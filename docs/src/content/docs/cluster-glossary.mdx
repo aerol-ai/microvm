@@ -175,6 +175,7 @@ Firecracker runs each sandbox in a **microVM**: a small, fast virtual machine. T
 | `SB_JAILER_BINARY` | Where the `jailer` program is. The jailer locks each microVM in, for extra safety. | `/usr/local/bin/jailer` |
 | `SB_FIRECRACKER_KERNEL` | Where the Linux kernel file (`vmlinux`) for microVMs is. Firecracker cannot start without it. | `/var/lib/sandboxd/firecracker/vmlinux` |
 | `SB_FIRECRACKER_USE_JAILER` | `true` runs each microVM inside the jailer. | `true` |
+| `SB_JAILER_UID`, `SB_JAILER_GID` | The user and group the jailer runs every microVM as. Use a system user of its own: Terraform, Ansible and `install.sh --with-firecracker` make `sandboxd-jailer` and write its ids. sandboxd will not start Firecracker if this user is root, sandboxd's own user, has a login shell, or is in a group that gives root rights (`root`, `sudo`, `wheel`, `admin`, `docker`, `lxd`). The error says how to fix it. | `1000` (set by the installers) |
 | `SB_FIRECRACKER_RUN_DIR` | Where Firecracker keeps each microVM's socket files and state. | `/run/sandboxd/firecracker` |
 | `SB_FIRECRACKER_TEMPLATES_DIR` | Where Firecracker keeps templates on disk. | `/var/lib/sandboxd/firecracker/templates` |
 | `SB_FIRECRACKER_TAP_BASE_CIDR` | The IP address range for the virtual network cards that link microVMs to the machine. | `172.16.0.0/20` |

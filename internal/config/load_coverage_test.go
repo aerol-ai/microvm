@@ -408,6 +408,23 @@ func TestLoad_ValidationErrors(t *testing.T) {
 			},
 			want: "SB_JAILER_UID/SB_JAILER_GID must be >= 0",
 		},
+		{
+			name: "firecracker under the jailer refuses root's uid",
+			env: map[string]string{
+				"SB_ENABLE_FIRECRACKER": "true",
+				"SB_JAILER_UID":         "0",
+			},
+			want: "SB_JAILER_UID/SB_JAILER_GID must not be 0, root (got 0/1000)",
+		},
+		{
+			name: "firecracker under the jailer refuses root's group",
+			env: map[string]string{
+				"SB_ENABLE_FIRECRACKER": "true",
+				"SB_JAILER_UID":         "996",
+				"SB_JAILER_GID":         "0",
+			},
+			want: "SB_JAILER_UID/SB_JAILER_GID must not be 0, root (got 996/0)",
+		},
 	}
 
 	for _, tc := range cases {
@@ -670,6 +687,29 @@ func TestLoad_ComprehensiveEnabledConfig(t *testing.T) {
 	}
 	if len(cfg.ImageGCWhitelist) != 2 || len(cfg.HostSupportedRuntimes) != 2 {
 		t.Fatalf("unexpected list parsing: whitelist=%v runtimes=%v", cfg.ImageGCWhitelist, cfg.HostSupportedRuntimes)
+	}
+}
+
+// The jailer's ids keep their 1000/1000 default, so an upgrade never moves a
+// node's VMs to another user by itself (the start check refuses a login
+// user there). Without the jailer no privilege is dropped and 0 is allowed.
+func TestLoad_JailerIDs(t *testing.T) {
+	t.Setenv("SB_PAT_TOKEN", "operator-pat")
+	t.Setenv("SB_ENABLE_FIRECRACKER", "true")
+	cfg, err := Load()
+	if err != nil || !cfg.UseJailer || cfg.JailerUID != 1000 || cfg.JailerGID != 1000 {
+		t.Fatalf("default: jailer %v %d:%d, err = %v; want the jailer as 1000:1000", cfg.UseJailer, cfg.JailerUID, cfg.JailerGID, err)
+	}
+	t.Setenv("SB_JAILER_UID", "996")
+	t.Setenv("SB_JAILER_GID", "996")
+	if cfg, err = Load(); err != nil || cfg.JailerUID != 996 || cfg.JailerGID != 996 {
+		t.Fatalf("set: jailer %d:%d, err = %v", cfg.JailerUID, cfg.JailerGID, err)
+	}
+	t.Setenv("SB_FIRECRACKER_USE_JAILER", "false")
+	t.Setenv("SB_JAILER_UID", "0")
+	t.Setenv("SB_JAILER_GID", "0")
+	if _, err = Load(); err != nil {
+		t.Fatalf("no jailer, ids 0: %v", err)
 	}
 }
 

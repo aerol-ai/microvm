@@ -860,6 +860,16 @@ fi
 
 apt-get install -y skopeo umoci e2fsprogs iproute2
 
+%{ if !(one_line_join && containerd_cfg.privilege_mode == "split") && firecracker_jailer_uid == null && firecracker_jailer_gid == null ~}
+# The jailer runs every VM as one user: a system user of its own, with no
+# login shell and no other group, as install.sh --with-firecracker makes it
+# (in split install.sh makes it). Its ids go in cluster.env below. sandboxd
+# refuses to start Firecracker as a login user or an admin group's member.
+if ! getent passwd sandboxd-jailer >/dev/null 2>&1; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin --user-group sandboxd-jailer
+fi
+
+%{ endif ~}
 %{ if one_line_join && containerd_cfg.privilege_mode == "split" ~}
 # Privilege mode split: the run and templates folders are sandboxd's, inside
 # folders its user owns, and sandboxd makes them itself when it first needs
@@ -1055,6 +1065,12 @@ SB_FIRECRACKER_VMM_POOL_REFILL_INTERVAL=${firecracker_vmm_pool_refill_interval}
 SB_FIRECRACKER_RSS_SAMPLER_INTERVAL=${firecracker_rss_sampler_interval}
 SB_FIRECRACKER_RSS_WATERMARK_RATIO=${firecracker_rss_watermark_ratio}
 EOF
+%{ if !(one_line_join && containerd_cfg.privilege_mode == "split") && firecracker_jailer_uid == null && firecracker_jailer_gid == null ~}
+# The jailer's user made in section 2d, by its ids on this node.
+JAILER_UID="$(id -u sandboxd-jailer)"
+JAILER_GID="$(id -g sandboxd-jailer)"
+printf 'SB_JAILER_UID=%s\nSB_JAILER_GID=%s\n' "$JAILER_UID" "$JAILER_GID" >> /tmp/aerolvm-ops.env
+%{ endif ~}
 %{ endif ~}
 
 %{ if aocr_enabled ~}
