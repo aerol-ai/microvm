@@ -1199,11 +1199,15 @@ type Config struct {
 	// /srv/jailer matches the jailer docs. SB_JAILER_CHROOT_BASE.
 	JailerChrootBase string
 	// JailerUID / JailerGID are the UID/GID the firecracker process drops
-	// to inside the jail. The pair must exist on the host before the
-	// daemon starts (jailer setresuid()s into them; a nonexistent UID is
-	// accepted on Linux but is a security smell — assume the operator has
-	// created a `firecracker` system user). Defaults 1000/1000 are
-	// nominal; production setups override.
+	// to inside the jail: every VM on the node runs as them. They should
+	// be a system user of its own, which install.sh --with-firecracker, the
+	// Terraform bootstrap and Ansible's configure-ops.yml make
+	// (sandboxd-jailer) and write here. Under the jailer, root (0) is
+	// refused here, and at start sandboxd refuses a user with a login
+	// shell, in an admin group, or sandboxd's own
+	// (firecracker.CheckJailerUser). The 1000/1000 default is kept so an
+	// upgrade never moves a node's VMs to another uid by itself; a node
+	// where uid 1000 is a login user is refused with how to fix it.
 	// SB_JAILER_UID / SB_JAILER_GID.
 	JailerUID int
 	JailerGID int
@@ -3252,6 +3256,12 @@ func load(keyTool bool) (Config, error) {
 			}
 			if cfg.JailerUID < 0 || cfg.JailerGID < 0 {
 				return Config{}, fmt.Errorf("SB_JAILER_UID/SB_JAILER_GID must be >= 0 (got %d/%d)", cfg.JailerUID, cfg.JailerGID)
+			}
+			// 0 is root: the jailer would drop no privilege, and every VM
+			// would run as root.
+			if cfg.JailerUID == 0 || cfg.JailerGID == 0 {
+				return Config{}, fmt.Errorf("SB_JAILER_UID/SB_JAILER_GID must not be 0, root (got %d/%d): every VM runs as this user; "+
+					"use a system user of its own, such as the sandboxd-jailer user install.sh --with-firecracker makes", cfg.JailerUID, cfg.JailerGID)
 			}
 		}
 		if cfg.FirecrackerTapBaseCIDR == "" {
