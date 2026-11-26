@@ -221,7 +221,8 @@ func main() {
 		}
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{}))
+	// Never blocks on a stuck console (logsink.go).
+	logger := newAgentLogger(os.Stdout)
 
 	// The init of a snapshot export helper VM, not a sandbox's agent
 	// (export_helper.go).
