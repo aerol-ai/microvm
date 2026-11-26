@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -368,9 +369,25 @@ func TestVsockHandshake_ErrorPaths(t *testing.T) {
 		t.Fatalf("write error: got %v", err)
 	}
 
-	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{readErr: io.EOF}}}
-	if err := d.vsockHandshake(context.Background(), "/tmp/vsock.sock", 3); err == nil || !strings.Contains(err.Error(), "vsock read") {
-		t.Fatalf("read error: got %v", err)
+	// A torn connection (the guest accepted, then closed) is dialed again;
+	// one that stays torn until the deadline reports the last tear.
+	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{readErr: io.EOF}, {reply: []byte(`{"ok":true}` + "\n")}}}
+	if err := d.vsockHandshake(context.Background(), "/tmp/vsock.sock", 3); err != nil {
+		t.Fatalf("torn then answered: got %v", err)
+	}
+	torn := make([]*errVsockConn, 200)
+	for i := range torn {
+		torn[i] = &errVsockConn{readErr: io.EOF}
+	}
+	d.vsockDial = &stubVsockDialer{conns: torn}
+	tornCtx, tornCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer tornCancel()
+	if err := d.vsockHandshake(tornCtx, "/tmp/vsock.sock", 3); err == nil || !strings.Contains(err.Error(), "vsock read: EOF") {
+		t.Fatalf("always torn: got %v", err)
+	}
+	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{readErr: syscall.ECONNRESET}, {writeErr: syscall.EPIPE}, {reply: []byte(`{"ok":true}` + "\n")}}}
+	if err := d.vsockHandshake(context.Background(), "/tmp/vsock.sock", 3); err != nil {
+		t.Fatalf("reset, broken pipe, then answered: got %v", err)
 	}
 
 	d.vsockDial = &stubVsockDialer{conns: []*errVsockConn{{reply: []byte("not-json\n")}}}
