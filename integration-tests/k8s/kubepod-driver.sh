@@ -21,6 +21,9 @@
 #              init container copies toolboxd with --install-to.
 # The test then creates a sandbox, reads toolboxd's /health from the worker
 # pod, checks a second create is a duplicate, stops, starts and destroys it.
+# TestKindDriverWatch does it again with the driver's pod watch running
+# (M4 PR 2): the waits use the watch, and each start, stop and pod deleted
+# behind the worker's back comes as an event with the kubelet's time.
 # First, a privileged pod is refused in the sandbox namespace, so the Pod
 # Security labels are known to be enforced.
 #

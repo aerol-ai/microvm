@@ -177,3 +177,129 @@ func TestKindDriver(t *testing.T) {
 		return nil
 	})
 }
+
+// TestKindDriverWatch is TestKindDriver's lifecycle with the watch running
+// (M4 PR 2): the Role's watch right, a real watch stream, and the start and
+// exit events a real kubelet's status gives.
+func TestKindDriverWatch(t *testing.T) {
+	if os.Getenv("AEROL_KUBEPOD_KIND") != "1" {
+		t.Skip("runs inside a kind pod; see integration-tests/k8s/kubepod-driver.sh")
+	}
+	client, err := InClusterClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ns := os.Getenv("AEROL_KUBEPOD_NAMESPACE")
+	d, err := New(Config{
+		Namespace:      ns,
+		WorkerID:       os.Getenv("AEROL_KUBEPOD_WORKER") + "-watch",
+		RuntimeClasses: map[string]string{models.RuntimeDocker: os.Getenv("AEROL_KUBEPOD_CLASS")},
+		ToolboxImage:   os.Getenv("AEROL_KUBEPOD_TOOLBOX_IMAGE"),
+		ToolboxPath:    os.Getenv("AEROL_KUBEPOD_TOOLBOX_PATH"),
+		SpecDir:        t.TempDir(),
+		StartTimeout:   2 * time.Minute,
+		StopTimeout:    time.Minute,
+		StopGrace:      2 * time.Second,
+	}, client, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		d.RunWatch(ctx)
+	}()
+	defer func() {
+		cancel()
+		<-watchDone
+	}()
+	events := make(chan dockerpkg.DockerEvent, 64)
+	go func() { _ = d.StreamEvents(ctx, events) }()
+
+	step := func(name string, fn func() error) {
+		t.Helper()
+		start := time.Now()
+		if err := fn(); err != nil {
+			t.Fatalf("FAIL %s: %v", name, err)
+		}
+		t.Logf("PASS %s (%s)", name, time.Since(start).Round(time.Millisecond))
+	}
+	expect := func(id, action string) error {
+		deadline := time.After(time.Minute)
+		for {
+			select {
+			case ev := <-events:
+				if ev.SandboxID == id && ev.Action == action {
+					if ev.Time.IsZero() {
+						return fmt.Errorf("%s event with no time", action)
+					}
+					return nil
+				}
+			case <-deadline:
+				return fmt.Errorf("no %s event for %s", action, id)
+			}
+		}
+	}
+
+	step("watch: the view goes live (list, then watch with the Role's watch right)", func() error {
+		for i := 0; i < 300; i++ {
+			if _, live := d.cache.changes(); live {
+				return nil
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		return errors.New("never live")
+	})
+
+	raw := make([]byte, 8)
+	_, _ = rand.Read(raw)
+	id := "sb-" + hex.EncodeToString(raw)
+	req := models.CreateSandboxRequest{Image: os.Getenv("AEROL_KUBEPOD_IMAGE"), CPU: 0.25, MemoryMB: 128}
+	t.Cleanup(func() { _ = d.Destroy(context.Background(), &models.Sandbox{ID: id}) })
+
+	step("create waits on the watch and a start event comes", func() error {
+		st, err := d.Create(ctx, req, id, "tok", nil)
+		if err != nil {
+			return err
+		}
+		if st.ContainerIP == "" {
+			return fmt.Errorf("state %+v", st)
+		}
+		return expect(id, "start")
+	})
+	step("stop waits on the watch and a die event comes", func() error {
+		if err := d.Stop(ctx, id); err != nil {
+			return err
+		}
+		return expect(id, "die")
+	})
+	step("start again gives a new start event", func() error {
+		if _, err := d.Start(ctx, id); err != nil {
+			return err
+		}
+		return expect(id, "start")
+	})
+	step("a pod deleted behind the worker's back is a die, and the sandbox is stopped, not gone", func() error {
+		p, err := client.GetPod(ctx, ns, id)
+		if err != nil {
+			return err
+		}
+		if err := client.DeletePod(ctx, ns, id, p.Metadata.UID, time.Second); err != nil {
+			return err
+		}
+		if err := expect(id, "die"); err != nil {
+			return err
+		}
+		if err := d.waitGone(ctx, id, p.Metadata.UID, time.Minute); err != nil {
+			return err
+		}
+		got, err := d.Inspect(ctx, id)
+		if err != nil || got.Status != models.SandboxStatusStopped {
+			return fmt.Errorf("inspect %+v, %v", got, err)
+		}
+		return nil
+	})
+	step("destroy", func() error { return d.Destroy(ctx, &models.Sandbox{ID: id}) })
+}

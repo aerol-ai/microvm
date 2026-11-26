@@ -15,9 +15,11 @@ import (
 )
 
 // fakeAPI is an in-memory kube-apiserver for pods: create, get, delete
-// (with grace and a UID precondition) and list (label selector, paging).
-// A "kubelet" hook moves pods along: kubelet runs on every read of a pod
-// and may change its status, as the real kubelet does between reads.
+// (with grace and a UID precondition), list (label selector, paging) and
+// watch (from a resource version, with bookmarks, and 410 for a version
+// older than the last compaction). A "kubelet" hook moves pods along: on
+// every read of a pod, as the real kubelet does between reads, and, with
+// runKubelet, on a timer, for clients that only watch.
 type fakeAPI struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -26,10 +28,23 @@ type fakeAPI struct {
 	pods    map[string]*Pod // "namespace/name"
 	nextUID int
 	rv      int
-	// kubelet, when set, runs on each GET of a pod (under mu).
+	// events is every change, in resource-version order, for watches.
+	events    []fakeEvent
+	notify    chan struct{} // closed and replaced on each new event
+	compacted int           // a watch from a version below this gets 410
+	cut       chan struct{} // closed to end every open watch
+	watches   int           // watches opened
+	failWatch int           // answer every watch with this status until cleared
+	// hangWatch: a watch gets no answer at all (no status, no headers)
+	// until cut or the client gives up. endWatch: a watch is answered 200
+	// and ended at once, empty.
+	hangWatch, endWatch bool
+	// kubelet, when set, runs on each GET of a pod (under mu), and on each
+	// tick of runKubelet.
 	kubelet func(p *Pod)
-	// goneAfter is how many reads a deleted pod stays for, terminating;
-	// 0 removes it at once. -1 keeps it forever (a node nobody can reach).
+	// goneAfter is how many reads (or kubelet ticks) a deleted pod stays
+	// for, terminating; 0 removes it at once. -1 keeps it forever (a node
+	// nobody can reach).
 	goneAfter int
 	reads     map[string]int
 	// fail answers a call with this status when its "METHOD path" starts
@@ -45,6 +60,12 @@ type fakeAPI struct {
 	deletes []deleteCall
 }
 
+type fakeEvent struct {
+	rv  int
+	typ string
+	pod Pod
+}
+
 type deleteCall struct {
 	name  string
 	grace int64
@@ -52,9 +73,13 @@ type deleteCall struct {
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
-	f := &fakeAPI{t: t, pods: map[string]*Pod{}, reads: map[string]int{}, fail: map[string]int{}}
+	f := &fakeAPI{
+		t: t, pods: map[string]*Pod{}, reads: map[string]int{}, fail: map[string]int{},
+		notify: make(chan struct{}), cut: make(chan struct{}),
+	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
+	t.Cleanup(f.cutWatches) // a watch handler must end before Close waits on it
 	return f
 }
 
@@ -77,6 +102,103 @@ func runningKubelet(p *Pod) {
 	}
 }
 
+// runKubelet runs the kubelet hook and the deletion countdown on a timer,
+// for clients that watch instead of reading.
+func (f *fakeAPI) runKubelet(every time.Duration) {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	f.t.Cleanup(func() { close(stop); <-done })
+	go func() {
+		defer close(done)
+		tick := time.NewTicker(every)
+		defer tick.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+			}
+			f.mu.Lock()
+			for key, p := range f.pods {
+				f.advanceLocked(key, p)
+			}
+			f.mu.Unlock()
+		}
+	}()
+}
+
+// advanceLocked moves one pod along, as a read or a kubelet tick does:
+// a deleted pod counts down to its removal; a live one gets the kubelet's
+// changes. Either change is an event.
+func (f *fakeAPI) advanceLocked(key string, p *Pod) (removed bool) {
+	if p.Metadata.DeletionTimestamp != nil {
+		if f.goneAfter < 0 {
+			return false
+		}
+		f.reads[key]++
+		if f.reads[key] > f.goneAfter {
+			delete(f.pods, key)
+			delete(f.reads, key)
+			f.recordLocked("DELETED", p)
+			return true
+		}
+		return false
+	}
+	if f.kubelet != nil {
+		before, _ := json.Marshal(p.Status)
+		f.kubelet(p)
+		if after, _ := json.Marshal(p.Status); string(after) != string(before) {
+			f.recordLocked("MODIFIED", p)
+		}
+	}
+	return false
+}
+
+// recordLocked gives p a new resource version and logs the change for
+// watches. The log keeps a copy: tests change pods in place.
+func (f *fakeAPI) recordLocked(typ string, p *Pod) {
+	f.rv++
+	p.Metadata.ResourceVersion = strconv.Itoa(f.rv)
+	var cp Pod
+	raw, _ := json.Marshal(p)
+	_ = json.Unmarshal(raw, &cp)
+	f.events = append(f.events, fakeEvent{rv: f.rv, typ: typ, pod: cp})
+	close(f.notify)
+	f.notify = make(chan struct{})
+}
+
+// bookmark sends every watch the current version, with no change.
+func (f *fakeAPI) bookmark() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rv++
+	f.events = append(f.events, fakeEvent{rv: f.rv, typ: "BOOKMARK", pod: Pod{Metadata: ObjectMeta{ResourceVersion: strconv.Itoa(f.rv)}}})
+	close(f.notify)
+	f.notify = make(chan struct{})
+}
+
+// compact forgets the history before now: a watch from an older version
+// gets 410 Gone and must list again.
+func (f *fakeAPI) compact() {
+	f.mu.Lock()
+	f.compacted = f.rv
+	f.mu.Unlock()
+}
+
+// cutWatches ends every open watch, as a dropped connection would.
+func (f *fakeAPI) cutWatches() {
+	f.mu.Lock()
+	close(f.cut)
+	f.cut = make(chan struct{})
+	f.mu.Unlock()
+}
+
+func (f *fakeAPI) watchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.watches
+}
+
 func (f *fakeAPI) status(w http.ResponseWriter, code int, reason, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -93,19 +215,47 @@ func (f *fakeAPI) put(p *Pod) {
 }
 
 func (f *fakeAPI) putLocked(p *Pod) {
-	f.rv++
-	p.Metadata.ResourceVersion = strconv.Itoa(f.rv)
 	if p.Metadata.UID == "" {
 		f.nextUID++
 		p.Metadata.UID = "uid-" + strconv.Itoa(f.nextUID)
 	}
-	f.pods[p.Metadata.Namespace+"/"+p.Metadata.Name] = p
+	key := p.Metadata.Namespace + "/" + p.Metadata.Name
+	typ := "ADDED"
+	if old := f.pods[key]; old != nil && old.Metadata.UID == p.Metadata.UID {
+		typ = "MODIFIED"
+	} else if old != nil {
+		f.recordLocked("DELETED", old)
+	}
+	f.pods[key] = p
+	f.recordLocked(typ, p)
 }
 
 func (f *fakeAPI) get(ns, name string) *Pod {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.pods[ns+"/"+name]
+}
+
+// change edits a stored pod and records it, as the kubelet would.
+func (f *fakeAPI) change(ns, name string, edit func(p *Pod)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.pods[ns+"/"+name]
+	edit(p)
+	f.recordLocked("MODIFIED", p)
+}
+
+// forceRemove removes a pod at once with no end seen, as a force delete
+// or a lost node does.
+func (f *fakeAPI) forceRemove(ns, name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := ns + "/" + name
+	p := f.pods[key]
+	now := time.Date(2026, 11, 26, 11, 0, 0, 0, time.UTC)
+	p.Metadata.DeletionTimestamp = &now
+	delete(f.pods, key)
+	f.recordLocked("DELETED", p)
 }
 
 func (f *fakeAPI) setPhase(ns, name, phase string) {
@@ -116,6 +266,7 @@ func (f *fakeAPI) setPhase(ns, name, phase string) {
 		p.Status = &PodStatus{}
 	}
 	p.Status.Phase = phase
+	f.recordLocked("MODIFIED", p)
 }
 
 // Setters and getters take the lock the handler reads under, so a test
@@ -136,6 +287,24 @@ func (f *fakeAPI) setGoneAfter(n int) {
 func (f *fakeAPI) setToken(tok string) {
 	f.mu.Lock()
 	f.token = tok
+	f.mu.Unlock()
+}
+
+func (f *fakeAPI) setHangWatch(on bool) {
+	f.mu.Lock()
+	f.hangWatch = on
+	f.mu.Unlock()
+}
+
+func (f *fakeAPI) setEndWatch(on bool) {
+	f.mu.Lock()
+	f.endWatch = on
+	f.mu.Unlock()
+}
+
+func (f *fakeAPI) setFailWatch(code int) {
+	f.mu.Lock()
+	f.failWatch = code
 	f.mu.Unlock()
 }
 
@@ -172,6 +341,9 @@ func (f *fakeAPI) count(prefix string) int {
 
 func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	call := r.Method + " " + r.URL.Path
+	if r.URL.Query().Get("watch") == "1" {
+		call = "WATCH " + r.URL.Path
+	}
 	f.mu.Lock()
 	f.calls = append(f.calls, call)
 	for k, code := range f.fail {
@@ -204,6 +376,8 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case len(parts) == 2 && r.Method == http.MethodPost:
 		f.create(w, r, ns)
+	case len(parts) == 2 && r.Method == http.MethodGet && r.URL.Query().Get("watch") == "1":
+		f.watch(w, r, ns)
 	case len(parts) == 2 && r.Method == http.MethodGet:
 		f.list(w, r, ns)
 	case len(parts) == 3 && r.Method == http.MethodGet:
@@ -258,16 +432,8 @@ func (f *fakeAPI) read(w http.ResponseWriter, ns, name string) {
 	f.mu.Lock()
 	key := ns + "/" + name
 	p := f.pods[key]
-	if p != nil && p.Metadata.DeletionTimestamp != nil && f.goneAfter >= 0 {
-		f.reads[key]++
-		if f.reads[key] > f.goneAfter {
-			delete(f.pods, key)
-			delete(f.reads, key)
-			p = nil
-		}
-	}
-	if p != nil && f.kubelet != nil && p.Metadata.DeletionTimestamp == nil {
-		f.kubelet(p)
+	if p != nil && f.advanceLocked(key, p) {
+		p = nil
 	}
 	var raw []byte
 	if p != nil {
@@ -314,9 +480,11 @@ func (f *fakeAPI) remove(w http.ResponseWriter, r *http.Request, ns, name string
 		return
 	case f.goneAfter == 0:
 		delete(f.pods, key)
+		f.recordLocked("DELETED", p)
 	default:
 		now := time.Now().UTC()
 		p.Metadata.DeletionTimestamp = &now
+		f.recordLocked("MODIFIED", p)
 	}
 	f.mu.Unlock()
 	_ = json.NewEncoder(w).Encode(map[string]any{"kind": "Status", "status": "Success"})
@@ -353,10 +521,12 @@ func (f *fakeAPI) list(w http.ResponseWriter, r *http.Request, ns string) {
 	}
 	out := struct {
 		Metadata struct {
-			Continue string `json:"continue,omitempty"`
+			Continue        string `json:"continue,omitempty"`
+			ResourceVersion string `json:"resourceVersion"`
 		} `json:"metadata"`
 		Items []Pod `json:"items"`
 	}{Items: []Pod{}}
+	out.Metadata.ResourceVersion = strconv.Itoa(f.rv)
 	for _, key := range names[min(offset, len(names)):end] {
 		out.Items = append(out.Items, *f.pods[key])
 	}
@@ -365,4 +535,75 @@ func (f *fakeAPI) list(w http.ResponseWriter, r *http.Request, ns string) {
 	}
 	f.mu.Unlock()
 	_ = json.NewEncoder(w).Encode(&out)
+}
+
+func (f *fakeAPI) watch(w http.ResponseWriter, r *http.Request, ns string) {
+	q := r.URL.Query()
+	from, _ := strconv.Atoi(q.Get("resourceVersion"))
+	selector := q.Get("labelSelector")
+	f.mu.Lock()
+	f.watches++
+	if code := f.failWatch; code != 0 {
+		f.mu.Unlock()
+		f.status(w, code, http.StatusText(code), "injected")
+		return
+	}
+	expired := from < f.compacted
+	cut := f.cut
+	hang, end := f.hangWatch, f.endWatch
+	f.mu.Unlock()
+	if hang {
+		select {
+		case <-cut:
+		case <-r.Context().Done():
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if end {
+		return
+	}
+	enc := json.NewEncoder(w)
+	flush := func() {
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+	}
+	if expired {
+		_ = enc.Encode(map[string]any{"type": "ERROR", "object": map[string]any{
+			"kind": "Status", "status": "Failure", "code": 410, "reason": "Expired", "message": "too old resource version",
+		}})
+		flush()
+		return
+	}
+	cursor := from
+	for {
+		f.mu.Lock()
+		var batch []fakeEvent
+		for _, e := range f.events {
+			if e.rv <= cursor {
+				continue
+			}
+			cursor = e.rv
+			if e.typ == "BOOKMARK" || (e.pod.Metadata.Namespace == ns && matchesSelector(e.pod.Metadata.Labels, selector)) {
+				batch = append(batch, e)
+			}
+		}
+		notify := f.notify
+		f.mu.Unlock()
+		for _, e := range batch {
+			if err := enc.Encode(map[string]any{"type": e.typ, "object": e.pod}); err != nil {
+				return
+			}
+		}
+		flush()
+		select {
+		case <-notify:
+		case <-cut:
+			return
+		case <-r.Context().Done():
+			return
+		}
+	}
 }

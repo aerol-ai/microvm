@@ -33,7 +33,9 @@ func podOf(worker, id string) *Pod {
 		Name: podName(id), Namespace: testNS,
 		Labels:      map[string]string{LabelComponent: componentSandbox, LabelWorker: worker},
 		Annotations: map[string]string{AnnotationSandboxID: id},
-	}, Status: &PodStatus{Phase: PhaseRunning, PodIP: "10.244.9.9"}}
+	}, Status: &PodStatus{Phase: PhaseRunning, PodIP: "10.244.9.9", ContainerStatuses: []ContainerStatus{{
+		Name: sandboxContainer, State: ContainerState{Running: &StateRunning{}},
+	}}}}
 }
 
 func withPhase(p *Pod, phase string) *Pod {
