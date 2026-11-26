@@ -104,6 +104,8 @@ type Driver struct {
 	// watch's own retries. Tests shrink them.
 	pollMin, pollMax   time.Duration
 	retryMin, retryMax time.Duration
+	// shortWatch is the shortWatch constant; tests shrink it.
+	shortWatch time.Duration
 }
 
 var _ sbruntime.Runtime = (*Driver)(nil)
@@ -186,15 +188,16 @@ func New(cfg Config, client *Client, logger *slog.Logger) (*Driver, error) {
 		return nil, err
 	}
 	return &Driver{
-		cfg:      cfg,
-		client:   client,
-		specs:    specs,
-		logger:   logger,
-		cache:    newPodCache(),
-		pollMin:  100 * time.Millisecond,
-		pollMax:  time.Second,
-		retryMin: watchRetryMin,
-		retryMax: watchRetryMax,
+		cfg:        cfg,
+		client:     client,
+		specs:      specs,
+		logger:     logger,
+		cache:      newPodCache(),
+		pollMin:    100 * time.Millisecond,
+		pollMax:    time.Second,
+		retryMin:   watchRetryMin,
+		retryMax:   watchRetryMax,
+		shortWatch: shortWatch,
 	}, nil
 }
 

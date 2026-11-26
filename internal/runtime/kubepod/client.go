@@ -38,7 +38,7 @@ func NewClient(host string, token func() (string, error), hc *http.Client) *Clie
 	if hc == nil {
 		hc = &http.Client{}
 	}
-	watch := &http.Client{Transport: hc.Transport}
+	watch := &http.Client{Transport: watchTransport(hc.Transport, watchHeaderTimeout)}
 	if hc.Timeout == 0 {
 		hc.Timeout = callTimeout
 	}
@@ -47,6 +47,36 @@ func NewClient(host string, token func() (string, error), hc *http.Client) *Clie
 
 // callTimeout bounds one call other than a watch.
 const callTimeout = 30 * time.Second
+
+// A watch has no overall timeout (it streams for minutes), but opening one
+// must not hang: these bound the connect, the TLS handshake and the wait
+// for the server's answer. Until it answers, the view stays not live and
+// reads go to the API server (RunWatch).
+const (
+	watchConnectTimeout = 10 * time.Second
+	watchHeaderTimeout  = 30 * time.Second
+)
+
+// watchTransport is rt with those bounds; nil is Go's default transport.
+// A transport that is not an *http.Transport is used as it is.
+func watchTransport(rt http.RoundTripper, headerTimeout time.Duration) http.RoundTripper {
+	if rt == nil {
+		rt = http.DefaultTransport
+	}
+	t, ok := rt.(*http.Transport)
+	if !ok {
+		return rt
+	}
+	t = t.Clone()
+	t.ResponseHeaderTimeout = headerTimeout
+	if t.TLSHandshakeTimeout == 0 {
+		t.TLSHandshakeTimeout = watchConnectTimeout
+	}
+	if t.DialContext == nil {
+		t.DialContext = (&net.Dialer{Timeout: watchConnectTimeout, KeepAlive: 30 * time.Second}).DialContext
+	}
+	return t
+}
 
 // maxResponseBytes bounds a reply the client reads. A page of the largest
 // list it asks for (listPageSize pods of a few KB each) fits well inside.
@@ -217,11 +247,13 @@ type WatchEvent struct {
 const watchSeconds = 300
 
 // WatchPods watches the pods in namespace that match selector, from
-// resourceVersion, and calls fn for each event in order. It returns nil
-// when the server ends the watch, the error fn returns, or the stream's
-// error. An expired version is an *APIError with Code 410 (isGone): the
-// caller must list again.
-func (c *Client) WatchPods(ctx context.Context, namespace, selector, resourceVersion string, fn func(WatchEvent) error) error {
+// resourceVersion, and calls fn for each event in order. opened, when set,
+// is called once the server has answered the watch (status 2xx), before
+// any event: only from then on is the stream current. It returns nil when
+// the server ends the watch, the error fn returns, or the stream's error.
+// An expired version is an *APIError with Code 410 (isGone): the caller
+// must list again.
+func (c *Client) WatchPods(ctx context.Context, namespace, selector, resourceVersion string, opened func(), fn func(WatchEvent) error) error {
 	q := url.Values{}
 	q.Set("watch", "1")
 	q.Set("allowWatchBookmarks", "true")
@@ -244,6 +276,9 @@ func (c *Client) WatchPods(ctx context.Context, namespace, selector, resourceVer
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		return apiErrorOf(http.MethodGet, path, resp)
+	}
+	if opened != nil {
+		opened()
 	}
 	dec := json.NewDecoder(resp.Body)
 	for {
