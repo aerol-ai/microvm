@@ -7,7 +7,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"github.com/aerol-ai/microvm/pkg/models"
 )
 
 // specStore keeps each sandbox's pod as the worker made it, one JSON file
@@ -94,13 +97,15 @@ func (s *specStore) remove(name string) error {
 	return nil
 }
 
-// list returns every kept pod.
-func (s *specStore) list() ([]*Pod, error) {
+// list returns every kept pod, and the names of the files that could not
+// be read. One damaged file must not hide every other sandbox: the caller
+// lists the rest, and a sandbox whose file is damaged answers Inspect with
+// an error (unknown), never "gone", so reconcile keeps its row.
+func (s *specStore) list() (pods []*Pod, bad []string, err error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
-		return nil, fmt.Errorf("kubepod: spec folder: %w", err)
+		return nil, nil, fmt.Errorf("kubepod: spec folder: %w", err)
 	}
-	var out []*Pod
 	for _, e := range entries {
 		name, ok := strings.CutSuffix(e.Name(), specSuffix)
 		if !ok || e.IsDir() || strings.HasPrefix(e.Name(), ".") {
@@ -108,9 +113,66 @@ func (s *specStore) list() ([]*Pod, error) {
 		}
 		p, err := s.get(name)
 		if err != nil {
-			return nil, err
+			bad = append(bad, name)
+			continue
 		}
-		out = append(out, p)
+		pods = append(pods, p)
 	}
-	return out, nil
+	return pods, bad, nil
+}
+
+// sandboxRequestOf reads back, from a pod renderPod made, the sandbox's own
+// create inputs: its ID and runtime (annotations), and its image, command,
+// size and no-root rule (the sandbox container). Anything it cannot read
+// exactly as renderPod writes it is an error, never a guess.
+func sandboxRequestOf(p *Pod) (models.CreateSandboxRequest, string, error) {
+	var req models.CreateSandboxRequest
+	id := p.Metadata.Annotations[AnnotationSandboxID]
+	req.Runtime = p.Metadata.Annotations[AnnotationRuntime]
+	if id == "" || req.Runtime == "" {
+		return req, "", errors.New("it has no sandbox ID or runtime annotation")
+	}
+	var c *Container
+	for i := range p.Spec.Containers {
+		if p.Spec.Containers[i].Name == sandboxContainer {
+			c = &p.Spec.Containers[i]
+		}
+	}
+	if c == nil || c.Resources == nil {
+		return req, "", errors.New("it has no sandbox container with resources")
+	}
+	req.Image = c.Image
+	req.ContainerCommand = c.Args
+	limits := c.Resources.Limits
+	milli, err := quantityInt(limits["cpu"], "m")
+	if err != nil {
+		return req, "", fmt.Errorf("cpu: %w", err)
+	}
+	req.CPU = float64(milli) / 1000
+	if req.MemoryMB, err = quantityInt(limits["memory"], "Mi"); err != nil {
+		return req, "", fmt.Errorf("memory: %w", err)
+	}
+	if disk, ok := limits["ephemeral-storage"]; ok {
+		if req.DiskGB, err = quantityInt(disk, "Gi"); err != nil {
+			return req, "", fmt.Errorf("ephemeral-storage: %w", err)
+		}
+	}
+	if sc := c.SecurityContext; sc != nil && sc.RunAsNonRoot != nil {
+		req.RequireNonRootUser = *sc.RunAsNonRoot
+	}
+	return req, id, nil
+}
+
+// quantityInt reads a positive whole quantity with exactly unit, the way
+// renderPod writes it ("1500m", "512Mi", "4Gi").
+func quantityInt(q, unit string) (int, error) {
+	num, ok := strings.CutSuffix(q, unit)
+	if !ok {
+		return 0, fmt.Errorf("%q is not in %s", q, unit)
+	}
+	n, err := strconv.Atoi(num)
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("%q is not a positive whole number of %s", q, unit)
+	}
+	return n, nil
 }

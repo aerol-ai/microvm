@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aerol-ai/microvm/internal/rootpolicy"
 	"github.com/aerol-ai/microvm/pkg/models"
 )
 
@@ -190,8 +191,25 @@ func TestRenderPodShape(t *testing.T) {
 		t.Errorf("sandbox mounts = %+v: want the toolbox volume read-only", c.VolumeMounts)
 	}
 	sc := c.SecurityContext
-	if *sc.Privileged || *sc.AllowPrivilegeEscalation || !reflect.DeepEqual(sc.Capabilities.Drop, []string{"NET_RAW"}) || sc.Capabilities.Add != nil {
+	if *sc.Privileged || *sc.AllowPrivilegeEscalation || !reflect.DeepEqual(sc.Capabilities.Drop, []string{"ALL"}) || sc.RunAsNonRoot != nil {
 		t.Errorf("sandbox security = %+v", sc)
+	}
+	// An allow-list: the default install's sandbox set, every entry of
+	// which Pod Security "baseline" allows a pod to add.
+	baselineAllowed := map[string]bool{
+		"AUDIT_WRITE": true, "CHOWN": true, "DAC_OVERRIDE": true, "FOWNER": true, "FSETID": true, "KILL": true, "MKNOD": true,
+		"NET_BIND_SERVICE": true, "SETFCAP": true, "SETGID": true, "SETPCAP": true, "SETUID": true, "SYS_CHROOT": true,
+	}
+	if len(sc.Capabilities.Add) != len(rootpolicy.SandboxCapabilities()) {
+		t.Errorf("added %v, want the sandbox set %v", sc.Capabilities.Add, rootpolicy.SandboxCapabilities())
+	}
+	for _, capName := range sc.Capabilities.Add {
+		if !baselineAllowed[capName] {
+			t.Errorf("adds %s, which Pod Security baseline refuses", capName)
+		}
+		if capName == "NET_RAW" {
+			t.Error("adds NET_RAW")
+		}
 	}
 
 	raw, _ := json.Marshal(p)

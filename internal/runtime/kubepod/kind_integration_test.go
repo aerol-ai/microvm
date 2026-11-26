@@ -176,6 +176,21 @@ func TestKindDriver(t *testing.T) {
 		}
 		return nil
 	})
+
+	step("the no-root rule: the kubelet refuses an image that runs as root, and nothing is left", func() error {
+		_, _ = rand.Read(raw)
+		rootID := "sb-" + hex.EncodeToString(raw)
+		_, err := d.Create(ctx, models.CreateSandboxRequest{Image: env("AEROL_KUBEPOD_IMAGE"), CPU: 0.25, MemoryMB: 128, RequireNonRootUser: true}, rootID, token, nil)
+		if err == nil || !strings.Contains(err.Error(), "CreateContainerConfigError") {
+			_ = d.Destroy(ctx, &models.Sandbox{ID: rootID})
+			return fmt.Errorf("create of a root image with the no-root rule = %v, want CreateContainerConfigError", err)
+		}
+		got, err := d.Inspect(ctx, rootID)
+		if !sbruntime.InstanceGone(got, err) {
+			return fmt.Errorf("inspect after the refused create %+v, %v", got, err)
+		}
+		return nil
+	})
 }
 
 // TestKindDriverWatch is TestKindDriver's lifecycle with the watch running

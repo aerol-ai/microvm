@@ -44,9 +44,13 @@ func TestSpecStore(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(s.dir, "dir.json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	all, err := s.list()
-	if err != nil || len(all) != 2 {
-		t.Fatalf("list = %d, %v; want 2", len(all), err)
+	// A damaged spec is named, and does not hide the others.
+	if err := os.WriteFile(filepath.Join(s.dir, "sb-bad.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	all, bad, err := s.list()
+	if err != nil || len(all) != 2 || len(bad) != 1 || bad[0] != "sb-bad" {
+		t.Fatalf("list = %d, bad %v, %v; want 2 and sb-bad", len(all), bad, err)
 	}
 	if err := s.remove("sb-1"); err != nil {
 		t.Fatal(err)
@@ -80,7 +84,7 @@ func TestSpecStoreErrors(t *testing.T) {
 		t.Error("put over a folder: want an error")
 	}
 	gone := &specStore{dir: filepath.Join(dir, "missing")}
-	if _, err := gone.list(); err == nil {
+	if _, _, err := gone.list(); err == nil {
 		t.Error("list of a missing folder: want an error")
 	}
 	if err := gone.put(&Pod{Metadata: ObjectMeta{Name: "x"}}); err == nil {
