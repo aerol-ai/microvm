@@ -199,7 +199,11 @@ func (h *handlers) route(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, http.StatusNotFound, "eviction notices are not supported")
 	default:
 		r.SetPathValue("id", segs[0])
-		h.clusterForwardWrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wrap := h.clusterForwardWrap
+		if isShutdown(r, segs[1:]) {
+			wrap = h.clusterShutdownForwardWrap
+		}
+		wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			h.routeDevbox(w, r, segs[0], segs[1:])
 		})).ServeHTTP(w, r)
 	}

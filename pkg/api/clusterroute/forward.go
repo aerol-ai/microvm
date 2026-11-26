@@ -182,7 +182,11 @@ func Wrap(svc *service.Service, opts Options, local http.Handler) http.Handler {
 			byName = true
 			var resolved string
 			resolved, owner, err = c.OwnerOfName(service.OwnerRefForCreate(r.Context()), id)
-			if err == nil && strings.TrimSpace(resolved) != "" {
+			// The id comes back with an orphan's ErrOrphaned too, and the
+			// delete of one left on a deleted node needs it: the placement
+			// is read by id (destroyAbandoned). Every other error answers
+			// below without looking at the id.
+			if strings.TrimSpace(resolved) != "" {
 				localID = resolved
 			}
 		}
