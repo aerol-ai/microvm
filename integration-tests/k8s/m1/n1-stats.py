@@ -101,7 +101,15 @@ def main():
                 print(f"{phase:<6} {side:<6} n={len(w):<4} worker create ms p50 {pct(w, 50):8.2f} p90 {pct(w, 90):8.2f} p99 {pct(w, 99):8.2f}"
                       f" | client ms p50 {pct(c, 50):7.0f} p99 {pct(c, 99):7.0f}")
         # A burst runs one side, then the other: not paired, no verdict.
-        if len(pairs) < 2 or phase == "burst":
+        if phase == "burst":
+            continue
+        # A phase that ran but left fewer than 2 usable pairs (for example a
+        # pool that missed on every warm round) has no result. That is a
+        # failure, never a silent pass: say why and fail the run.
+        if len(pairs) < 2:
+            why = f"; {misses} pool-miss rounds left out" if warm else ""
+            print(f"{phase:<6} NO DATA: {len(pairs)} usable pair(s), need 2{why}")
+            verdicts[phase] = ("NO DATA", "NO DATA")
             continue
         diffs = [p[0][0] - p[1][0] for p in pairs]
         med = statistics.median(diffs)

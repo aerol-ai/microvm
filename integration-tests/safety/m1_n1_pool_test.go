@@ -180,6 +180,45 @@ func TestM1N1StatsDropsPoolMisses(t *testing.T) {
 	}
 }
 
+// A warm phase whose pool missed on every round (or all but one) on one
+// side has no usable pairs. It must fail the run and say why; it used to
+// print no warm line at all and exit 0, so N1 passed with no warm result.
+func TestM1N1StatsFailsWhenAPhaseHasNoUsablePairs(t *testing.T) {
+	needTools(t, "python3")
+	var cold strings.Builder
+	for i := 1; i <= 30; i++ {
+		fmt.Fprintf(&cold, "N1 cold %d split client_ms=200 create_ms=140.0 code=201 id=sb-c%d pool=none\n", i, i)
+		fmt.Fprintf(&cold, "N1 cold %d single client_ms=200 create_ms=139.5 code=201 id=sb-d%d pool=none\n", i, i)
+	}
+	warm := func(hits int) string {
+		var b strings.Builder
+		for i := 1; i <= 240; i++ {
+			pool := "miss"
+			if i <= hits {
+				pool = "hit"
+			}
+			fmt.Fprintf(&b, "N1 warm %d split client_ms=30 create_ms=18.0 code=201 id=sb-w%d pool=%s\n", i, i, pool)
+			fmt.Fprintf(&b, "N1 warm %d single client_ms=30 create_ms=17.5 code=201 id=sb-x%d pool=hit\n", i, i)
+		}
+		return b.String()
+	}
+	for _, hits := range []int{0, 1} {
+		f := filepath.Join(t.TempDir(), "bench.log")
+		if err := os.WriteFile(f, []byte(cold.String()+warm(hits)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, err := exec.Command("python3", "-I", k8sFile(t, "m1/n1-stats.py"), f).CombinedOutput()
+		ee, ok := err.(*exec.ExitError)
+		if !ok || ee.ExitCode() != 1 {
+			t.Fatalf("%d warm hit(s): want exit 1, got %v\n%s", hits, err, out)
+		}
+		want := fmt.Sprintf("warm   NO DATA: %d usable pair(s), need 2; %d pool-miss rounds left out", hits, 240-hits)
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("%d warm hit(s): want %q in:\n%s", hits, want, out)
+		}
+	}
+}
+
 // The running cost check projects only the steps a run does: m1d-3 ran
 // N1 alone, and every other step's minutes would have counted against its
 // limit.

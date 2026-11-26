@@ -428,7 +428,7 @@ image_user() {
 spec_user() {
   [[ "$dry" == 1 ]] && { echo '{"uid":0,"gid":0}'; return 0; }
   [[ -n "$2" ]] || return 0
-  kubectl --kubeconfig "$sd/kubeconfig" -n "$workers" exec "$1" -c runtime -- sh -c \
+  bounded 60 kubectl --kubeconfig "$sd/kubeconfig" -n "$workers" exec "$1" -c runtime -- sh -c \
     "c=\$(ctr -n aerolvm c ls -q | grep -F '$2' | head -1); [ -n \"\$c\" ] && ctr -n aerolvm c info \"\$c\"" 2>/dev/null |
     jq -c '.Spec.process.user' 2>/dev/null || true
 }
@@ -462,7 +462,7 @@ YAML
   k -n m1-bench wait --for=condition=Ready pod/m1-bench --timeout=5m >/dev/null
 }
 
-bench_done() { kubectl --kubeconfig "$sd/kubeconfig" -n m1-bench exec m1-bench -- grep -q "^N1 done $1" "/tmp/n1-$1.log" 2>/dev/null; }
+bench_done() { bounded 60 kubectl --kubeconfig "$sd/kubeconfig" -n m1-bench exec m1-bench -- grep -q "^N1 done $1" "/tmp/n1-$1.log" 2>/dev/null; }
 # pool_state <pod>: "<pinned> <learned>", the worker's running park-* tasks
 # (its warm slots, and any claimed one still alive, which keeps its park-
 # id): pinned are gVisor alpine, the image values.yaml pins; learned are
@@ -472,7 +472,7 @@ bench_done() { kubectl --kubeconfig "$sd/kubeconfig" -n m1-bench exec m1-bench -
 # recreate), each refilling beside the creates N1 timed. Only reads.
 pool_state() {
   [[ "$dry" == 1 ]] && { echo "0 0"; return 0; }
-  kubectl --kubeconfig "$sd/kubeconfig" -n "$workers" exec "$1" -c runtime -- \
+  bounded 60 kubectl --kubeconfig "$sd/kubeconfig" -n "$workers" exec "$1" -c runtime -- \
     sh -c 'ctr -n aerolvm t ls 2>/dev/null; echo ---; ctr -n aerolvm c ls 2>/dev/null' 2>/dev/null |
     awk -v img="$ALPINE" '
       $0 == "---" { c = 1; next }
