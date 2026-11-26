@@ -1,10 +1,11 @@
 exit 0
 --- stdout
-NAME          ISOLATION           BACKEND   AVAILABLE   SNAPSHOTS   PAUSE   MOVES    WARM POOL   CONFIDENTIAL   CHECKPOINT MEMORY   NODES
-docker        container           -         yes         yes         no      none     parked      no             -                   3
-gvisor        user-space-kernel   -         no          no          no      memory   parked      no             -                   0
-kata          hardware-vm         -         no          no          no      none     none        no             -                   0
-firecracker   hardware-vm         kvm       yes         yes         yes     memory   snapshot    no             -                   1
-wasm          wasm                -         yes         no          no      memory   parked      no             1024Mi              2
-isolate       v8-isolate          -         no          no          no      none     parked      no             -                   0
+NAME                ISOLATION           BACKEND   AVAILABLE   SNAPSHOTS   PAUSE   MOVES    WARM POOL   CONFIDENTIAL   CHECKPOINT MEMORY   NODES
+docker              container           -         yes         yes         no      none     parked      no             -                   3
+gvisor              user-space-kernel   -         no          no          no      memory   parked      no             -                   0
+kata                hardware-vm         -         no          no          no      none     none        no             -                   0
+firecracker         hardware-vm         kvm       yes         yes         yes     memory   snapshot    no             -                   1
+firecracker-nitro   hardware-vm         nitro     no          no          no      none     none        no             -                   0
+wasm                wasm                -         yes         no          no      memory   parked      no             1024Mi              2
+isolate             v8-isolate          -         no          no          no      none     parked      no             -                   0
 --- stderr

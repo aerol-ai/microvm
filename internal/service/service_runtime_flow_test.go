@@ -751,6 +751,7 @@ func TestCreateSandboxValidationAndRollbackPaths(t *testing.T) {
 		}{
 			{name: "missing image", req: models.CreateSandboxRequest{}, want: "image is required"},
 			{name: "runtime not implemented", req: models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeKata}, want: models.ErrRuntimeNotImplemented.Error()},
+			{name: "nitro reserved until its driver lands", req: models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro}, want: models.ErrRuntimeNotImplemented.Error()},
 			{name: "too many mounts", req: models.CreateSandboxRequest{Image: "alpine:3.20", Mounts: make([]models.MountSpec, models.MaxMountsPerSandbox+1)}, want: "too many mounts"},
 			{name: "invalid lifecycle", req: models.CreateSandboxRequest{Image: "alpine:3.20", Lifecycle: &models.Lifecycle{StopIfIdleFor: -time.Second}}, want: "invalid lifecycle"},
 			{name: "invalid gpu", req: models.CreateSandboxRequest{Image: "alpine:3.20", GPUs: &models.GPURequest{Vendor: "bogus"}}, want: "invalid gpu request"},

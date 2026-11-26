@@ -118,6 +118,7 @@ func TestRuntimeTableValues(t *testing.T) {
 		{RuntimeGvisor, IsolationUserSpaceKernel, "", RuntimeFeatures{Moves: MovesMemory, WarmPool: WarmPoolKindParked}, nil, false},
 		{RuntimeKata, IsolationHardwareVM, "", RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindNone}, nil, true},
 		{RuntimeFirecracker, IsolationHardwareVM, "kvm", RuntimeFeatures{Snapshots: true, Pause: true, Moves: MovesMemory, WarmPool: WarmPoolKindSnapshot}, nil, false},
+		{RuntimeFirecrackerNitro, IsolationHardwareVM, "nitro", RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindNone}, nil, true},
 		{RuntimeWasm, IsolationWasm, "", RuntimeFeatures{Moves: MovesMemory, WarmPool: WarmPoolKindParked}, &RuntimeLimits{MaxCheckpointMemoryMB: 1024}, false},
 		{RuntimeIsolate, IsolationV8Isolate, "", RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindParked}, nil, false},
 	} {
@@ -175,11 +176,12 @@ func TestRuntimeTableReturnsCopies(t *testing.T) {
 
 func TestListRuntimes(t *testing.T) {
 	offers := map[string]int{
-		RuntimeDocker:      3,
-		RuntimeFirecracker: 1,
-		RuntimeKata:        2,  // listed in SB_HOST_RUNTIMES, but reserved
-		RuntimeWasm:        -1, // never trusted below zero
-		"runc":             4,  // free text no create accepts
+		RuntimeDocker:           3,
+		RuntimeFirecracker:      1,
+		RuntimeKata:             2,  // listed in SB_HOST_RUNTIMES, but reserved
+		RuntimeFirecrackerNitro: 1,  // reserved until its driver lands
+		RuntimeWasm:             -1, // never trusted below zero
+		"runc":                  4,  // free text no create accepts
 	}
 	for _, tc := range []struct {
 		name      string
@@ -191,7 +193,7 @@ func TestListRuntimes(t *testing.T) {
 		{name: "tenant", offers: offers, available: map[string]bool{RuntimeDocker: true, RuntimeFirecracker: true}},
 		{name: "fleet admin", offers: offers, withNodes: true,
 			available: map[string]bool{RuntimeDocker: true, RuntimeFirecracker: true},
-			nodes:     map[string]int{RuntimeDocker: 3, RuntimeGvisor: 0, RuntimeKata: 0, RuntimeFirecracker: 1, RuntimeWasm: 0, RuntimeIsolate: 0}},
+			nodes:     map[string]int{RuntimeDocker: 3, RuntimeGvisor: 0, RuntimeKata: 0, RuntimeFirecracker: 1, RuntimeFirecrackerNitro: 0, RuntimeWasm: 0, RuntimeIsolate: 0}},
 		{name: "nothing offered", offers: nil, available: map[string]bool{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -267,6 +269,7 @@ func TestRuntimeBackendAndWarmStartKind(t *testing.T) {
 		warm, cold string
 	}{
 		{RuntimeFirecracker, "kvm", WarmPoolKindSnapshot, WarmPoolKindNone},
+		{RuntimeFirecrackerNitro, "nitro", WarmPoolKindParked, WarmPoolKindNone},
 		{RuntimeDocker, "", WarmPoolKindParked, WarmPoolKindNone},
 		{RuntimeWasm, "", WarmPoolKindParked, WarmPoolKindNone},
 		{RuntimeKata, "", WarmPoolKindParked, WarmPoolKindNone},

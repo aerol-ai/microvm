@@ -1338,6 +1338,19 @@ type Config struct {
 	// x86_64 only (arm64 guests get no EL2 from Firecracker).
 	// SB_FIRECRACKER_NESTED_VIRT.
 	FirecrackerNestedVirt bool
+	// FirecrackerBackend is what this node runs Firecracker VMs on: "kvm"
+	// (the default; /dev/kvm on metal or with nested virtualization) or
+	// "nitro" (Nitro Enclaves' direct mode on ordinary EC2 machines,
+	// plans/security-gaps-m1-m4.md §4.3). Per node: a machine cannot have
+	// both. A KVM node keeps today's whole fast path. A Nitro node will
+	// offer the firecracker-nitro runtime instead of firecracker; until its
+	// driver lands, Load refuses "nitro". SB_FIRECRACKER_BACKEND.
+	FirecrackerBackend string
+	// FirecrackerNitroMode is how a Nitro node runs its VMs: "direct" (the
+	// default; the host can still read the VM's memory) or "confidential"
+	// (it cannot; the road to M3). Checked on every node so a typo fails at
+	// start; only a Nitro node reads it. SB_FIRECRACKER_NITRO_MODE.
+	FirecrackerNitroMode string
 	// FirecrackerOverlayMkfs makes the host run `mkfs.ext4 -F` on each
 	// per-sandbox overlay.ext4 right after the sparse allocation and
 	// before PutDrive/PatchDrive. Default false — the guest is normally
@@ -2974,6 +2987,8 @@ func load(keyTool bool) (Config, error) {
 
 		FirecrackerOverlayEnabled:            getEnvBool("SB_FIRECRACKER_OVERLAY_ENABLED", true),
 		FirecrackerNestedVirt:                getEnvBool("SB_FIRECRACKER_NESTED_VIRT", false),
+		FirecrackerBackend:                   strings.ToLower(strings.TrimSpace(getEnv("SB_FIRECRACKER_BACKEND", FirecrackerBackendKVM))),
+		FirecrackerNitroMode:                 strings.ToLower(strings.TrimSpace(getEnv("SB_FIRECRACKER_NITRO_MODE", FirecrackerNitroModeDirect))),
 		FirecrackerOverlayMkfs:               getEnvBool("SB_FIRECRACKER_OVERLAY_MKFS", false),
 		FirecrackerSnapshotPostResumeTimeout: getEnvDuration("SB_FIRECRACKER_SNAPSHOT_POST_RESUME_TIMEOUT", 2*time.Second),
 
@@ -3058,6 +3073,9 @@ func load(keyTool bool) (Config, error) {
 	}
 	if cfg.FirecrackerSnapshotVerifyMode != "once" && cfg.FirecrackerSnapshotVerifyMode != "always" {
 		return Config{}, errors.New("SB_FIRECRACKER_SNAPSHOT_VERIFY_MODE must be either once or always")
+	}
+	if err := validateFirecrackerBackend(cfg.FirecrackerBackend, cfg.FirecrackerNitroMode); err != nil {
+		return Config{}, err
 	}
 	if cfg.AutoImportEnabled {
 		if cfg.AutoImportHooksBaseURL == "" {
@@ -3156,7 +3174,7 @@ func load(keyTool bool) (Config, error) {
 		return Config{}, fmt.Errorf("invalid SB_CONTAINER_RUNTIME=%q (allowed: %s, %s, %s, %s)",
 			cfg.Runtime, models.RuntimeDocker, models.RuntimeGvisor, models.RuntimeKata, models.RuntimeFirecracker)
 	}
-	if cfg.Runtime == models.RuntimeFirecracker {
+	if cfg.Runtime == models.RuntimeFirecracker || cfg.Runtime == models.RuntimeFirecrackerNitro {
 		return Config{}, fmt.Errorf("SB_CONTAINER_RUNTIME=%q is not allowed as the host default; keep the default at %q and select Firecracker per-sandbox via the API once SB_ENABLE_FIRECRACKER=true",
 			cfg.Runtime, models.RuntimeDocker)
 	}
