@@ -181,6 +181,9 @@ func TestInstallPrivilegeModeSplit(t *testing.T) {
 		"Description=AerolVM daemon (privilege mode split)",
 		"After=aerolvm-rootd.service containerd.service caddy.service network-online.target",
 		"Requires=aerolvm-rootd.service",
+		// Not while a switch back to single is unfinished
+		// (TestInstallRootUnitWaitsForTheSwitchBack in integration-tests/safety).
+		"ConditionPathExists=!" + r.path("sandboxd") + "/privilege-mode-switch-back",
 		"User=sandboxd",
 		"Group=sandboxd",
 		"SupplementaryGroups=aerolvm aerolvm-wasm",
