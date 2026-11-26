@@ -19,8 +19,10 @@ Two tests per phase, and a phase passes only when both do:
     UNCLEAR        otherwise: run more rounds
 The paired median alone graded run m1d-2's warm phase LIKELY MEETS (+0.80
 ms) while its p50 gap was +1.30 ms, over the +1 ms budget.
-Warm rounds where either side took over 100 ms are counted as pool misses
-and left out (reported), so a miss never reads as split's cost.
+Warm rounds where either side missed the pool are left out (reported), so
+a miss never reads as split's cost. A miss is what the worker's
+Server-Timing says (pool=miss on the N1 line); a log without that field
+(older than m1d-3) falls back to "either side took over 100 ms".
 """
 import argparse
 import random
@@ -28,7 +30,7 @@ import re
 import statistics
 import sys
 
-LINE = re.compile(r"^N1 (\S+) (\S+) (split|single) client_ms=(-?\d+) create_ms=(-?[\d.]+) code=(\d+) id=(\S+)")
+LINE = re.compile(r"^N1 (\S+) (\S+) (split|single) client_ms=(-?\d+) create_ms=(-?[\d.]+) code=(\d+) id=(\S+)(?: pool=(\S+))?")
 
 
 def pct(xs, p):
@@ -68,11 +70,11 @@ def main():
             m = LINE.match(ln.strip())
             if not m:
                 continue
-            phase, rnd, mode, cms, wms, code, _ = m.groups()
+            phase, rnd, mode, cms, wms, code, _, pool = m.groups()
             if code not in ("200", "201") or float(wms) < 0:
                 bad += 1
                 continue
-            rows.setdefault(phase, {}).setdefault(rnd, {})[mode] = (float(wms), int(cms))
+            rows.setdefault(phase, {}).setdefault(rnd, {})[mode] = (float(wms), int(cms), pool)
     if not rows:
         print("n1-stats: no N1 lines")
         return 2
@@ -84,7 +86,10 @@ def main():
         pairs = [(r["split"], r["single"]) for k, r in rows[phase].items() if "split" in r and "single" in r and k != "prime"]
         misses = 0
         if warm:
-            kept = [p for p in pairs if p[0][0] <= 100 and p[1][0] <= 100]
+            if any(p[0][2] in ("hit", "miss") or p[1][2] in ("hit", "miss") for p in pairs):
+                kept = [p for p in pairs if p[0][2] == "hit" and p[1][2] == "hit"]
+            else:
+                kept = [p for p in pairs if p[0][0] <= 100 and p[1][0] <= 100]
             misses = len(pairs) - len(kept)
             pairs = kept
         p50 = {}

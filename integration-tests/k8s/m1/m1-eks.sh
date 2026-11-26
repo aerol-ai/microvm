@@ -463,6 +463,38 @@ YAML
 }
 
 bench_done() { kubectl --kubeconfig "$sd/kubeconfig" -n m1-bench exec m1-bench -- grep -q "^N1 done $1" "/tmp/n1-$1.log" 2>/dev/null; }
+# pool_state <pod>: "<pinned> <learned>", the worker's running park-* tasks
+# (its warm slots, and any claimed one still alive, which keeps its park-
+# id): pinned are gVisor alpine, the image values.yaml pins; learned are
+# any other image or runtime. A pool learns every image a create misses
+# for (dockerpool NoteMiss): in m1d-3 the split worker held 6 learned
+# busybox slots and the single worker 6 more alpine ones (the runc seed's
+# recreate), each refilling beside the creates N1 timed. Only reads.
+pool_state() {
+  [[ "$dry" == 1 ]] && { echo "0 0"; return 0; }
+  kubectl --kubeconfig "$sd/kubeconfig" -n "$workers" exec "$1" -c runtime -- \
+    sh -c 'ctr -n aerolvm t ls 2>/dev/null; echo ---; ctr -n aerolvm c ls 2>/dev/null' 2>/dev/null |
+    awk -v img="$ALPINE" '
+      $0 == "---" { c = 1; next }
+      !c && $1 ~ /^park-/ && $3 == "RUNNING" { up[$1] = 1; next }
+      c && ($1 in up) { if ($2 == img && $3 ~ /runsc/) p++; else l++ }
+      END { print p + 0, l + 0 }'
+}
+# pools_ready <pod>...: each holds M1_N1_POOL_DEPTH (values.yaml's depth)
+# pinned slots and no learned ones, so no refill runs beside a timed create.
+pools_ready() {
+  local p s
+  for p in "$@"; do
+    s="$(pool_state "$p")"
+    [[ "${s%% *}" -ge "${M1_N1_POOL_DEPTH:-10}" && "${s##* }" == 0 ]] || return 1
+  done
+}
+# pool_note <label> <split pod> <single pod>: both pools' state, to pool.txt.
+pool_note() {
+  local a b
+  a="$(pool_state "$2")"; b="$(pool_state "$3")"
+  echo "$1: split pinned ${a%% *} learned ${a##* }; single pinned ${b%% *} learned ${b##* }" >> "$sd/evidence/n1/pool.txt"
+}
 step_n1() {
   gate
   local out="$sd/evidence/n1" open=() p
@@ -479,11 +511,22 @@ step_n1() {
   local ph name
   for ph in "cold ${M1_N1_COLD:-40}" "warm ${M1_N1_WARM:-120}" "burst ${M1_N1_BURST:-20}"; do
     name="${ph%% *}"
+    # Cold and warm start with steady pools: full of the pinned image and
+    # nothing learned, so neither side refills beside a timed create (a
+    # learned image drains in values.yaml's idle TTL; cold creates never
+    # teach one, n1-bench.sh). The wait and the state are evidence.
+    if [[ "$name" == cold || "$name" == warm ]]; then
+      local tw; tw=$(now)
+      wait_until "${M1_N1_POOL_WAIT:-300}" "both pools full and nothing learned" pools_ready "${open[0]}" "${open[1]}" ||
+        say "n1: the pools were not steady before $name (pool.txt)"
+      pool_note "before $name, waited $(( $(now) - tw ))s" "${open[0]}" "${open[1]}"
+    fi
     # In the pod, in the background, into a file: a phase runs minutes, and
     # one long exec over this machine's link can drop.
     # shellcheck disable=SC2086
     k -n m1-bench exec m1-bench -- env SPLIT_NODE="${open[0]}" SINGLE_NODE="${open[1]}" sh -c "nohup bash /bench/n1-bench.sh $ph > /tmp/n1-$name.log 2>&1 &"
-    wait_until 1200 "N1 $name finished" bench_done "$name" || say "n1: phase $name did not finish in 20 min"
+    wait_until "${M1_N1_PHASE_WAIT:-1200}" "N1 $name finished" bench_done "$name" || say "n1: phase $name did not finish in time"
+    pool_note "after $name" "${open[0]}" "${open[1]}"
     [[ "$dry" == 1 ]] || kubectl --kubeconfig "$sd/kubeconfig" -n m1-bench exec m1-bench -- cat "/tmp/n1-$name.log" >> "$out/bench.log" 2>&1 || true
   done
   for p in $(worker_pods); do [[ " ${open[*]} " == *" $p "* ]] || api_uncordon "$p"; done
@@ -841,7 +884,7 @@ cost_check() {
   local out rc=0
   out="$(python3 -I "$HERE/cost.py" --running --limit "${M1_COST_LIMIT:-6.15}" --vm-hours "${M1_VM_HOURS:-1.5}" \
     --cell-start "$(cat "$sd/cost-start" 2>/dev/null || echo 0)" --cell-end "$(cat "$sd/cost-end" 2>/dev/null || echo 0)" \
-    --done "$(paste -sd, "$sd/done-steps")" \
+    --done "$(paste -sd, "$sd/done-steps")" --plan "$(IFS=,; echo "${steps[*]}")" \
     --vm-start "$(cat "$vm_sd/started-at" 2>/dev/null || echo 0)" --vm-end "$(cat "$vm_sd/ended-at" 2>/dev/null || echo 0)" \
     --vm-hourly "$(cat "$vm_sd/hourly" 2>/dev/null || echo 0)")" || rc=$?
   say "after $1: $out"
