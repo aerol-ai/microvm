@@ -376,11 +376,11 @@ func TestInstallSwitchBackMovesBuildkitAfterSandboxdStops(t *testing.T) {
 }
 
 // TestInstallSwitchBackRemovesTheOldKernelWithTheMarkerThere: single's
-// old guest kernel (in the data folder sandboxd's user controlled in split)
-// is removed by leave_split_mode before it removes the switch-back marker.
-// A run cut off anywhere before the marker goes finishes the switch next
-// time (and copies the new kernel in); one cut off after it finds no old
-// kernel to keep. Other runs leave the kernel alone.
+// old guest kernel and its build config (in the data folder sandboxd's
+// user controlled in split) are removed by leave_split_mode before it
+// removes the switch-back marker. A run cut off anywhere before the marker
+// goes finishes the switch next time (and copies the new pair in); one cut
+// off after it finds no old kernel to keep. Other runs leave both alone.
 func TestInstallSwitchBackRemovesTheOldKernelWithTheMarkerThere(t *testing.T) {
 	for _, tc := range []struct {
 		name, env, mode string
@@ -395,18 +395,21 @@ func TestInstallSwitchBackRemovesTheOldKernelWithTheMarkerThere(t *testing.T) {
 			kernel := filepath.Join(h.dir, "varlib-firecracker", "vmlinux")
 			mustMkdir(t, filepath.Dir(kernel))
 			mustWrite(t, kernel, "kernel left from single\n")
+			mustWrite(t, kernel+".config", "CONFIG_VMGENID=y\n")
 			calls, _, _ := h.run(tc.mode, writeEnvMarks+"setup_privilege_mode\nwrite_environment\nleave_split_mode\n")
 			_, err := os.Stat(kernel)
+			_, cerr := os.Stat(kernel + ".config")
 			if !tc.removed {
-				if err != nil {
-					t.Fatalf("a %s run removed the kernel", tc.name)
+				if err != nil || cerr != nil {
+					t.Fatalf("a %s run removed the kernel (%v) or its config (%v)", tc.name, err, cerr)
 				}
 				return
 			}
-			if err == nil {
-				t.Fatal("the switch back kept single's old guest kernel")
+			if err == nil || cerr == nil {
+				t.Fatalf("the switch back kept single's old guest kernel (%v) or its config (%v)", err, cerr)
 			}
-			checkCalls(t, calls, []string{"rm -f " + kernel + " marker=yes", "rm -f " + h.marker + " marker=yes"}, nil)
+			checkCalls(t, calls, []string{"rm -f " + kernel + " marker=yes", "rm -f " + kernel + ".config marker=yes",
+				"rm -f " + h.marker + " marker=yes"}, nil)
 			if h.markerThere() {
 				t.Fatal("the marker is still there after the switch")
 			}
@@ -499,4 +502,89 @@ func TestInstallSwitchBackStopsAtAKernelThatIsNotAFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInstallSwitchBackStopsAtAKernelConfigThatIsNotAFile: the guest
+// kernel's build config sits next to it, in the same folder sandboxd's user
+// controlled in split. A folder there would fool the copy that follows the
+// cleanup: install puts the new config inside it and reports success, and
+// sandboxd's VMGENID check and the next run then find no config. So the
+// switch back stops there too, before it removes anything (the kernel
+// stays), names the path and what to do, does not go into the folder, and
+// keeps the marker; the run after the operator removes the folder finishes
+// the switch. A link there is removed and never followed.
+func TestInstallSwitchBackStopsAtAKernelConfigThatIsNotAFile(t *testing.T) {
+	const splitEnv = "SB_PRIVILEGE_MODE=split\n"
+	const switchBack = writeEnvMarks + "setup_privilege_mode\nwrite_environment\n"
+	// The cleanup runs in a subshell with errexit on, as in the installer;
+	// the test's shell goes on to print how it ended.
+	const stoppable = switchBack + "set +e\n(set -e; leave_split_mode)\necho \"leave_split_mode exit=$?\"\n"
+
+	newHost := func(t *testing.T) (h *switchBackHost, kernel, config string) {
+		h = newSwitchBackHost(t, splitEnv)
+		kernel = filepath.Join(h.dir, "varlib-firecracker", "vmlinux")
+		mustMkdir(t, filepath.Dir(kernel))
+		mustWrite(t, kernel, "kernel left from single\n")
+		return h, kernel, kernel + ".config"
+	}
+
+	t.Run("a folder: the run stops before anything goes, then finishes once it is gone", func(t *testing.T) {
+		h, kernel, config := newHost(t)
+		mustMkdir(t, config)
+		inside := filepath.Join(config, "inside")
+		mustWrite(t, inside, "made by sandboxd's user\n")
+
+		calls, stdout, stderr := h.run("single", stoppable)
+		if !strings.Contains(stdout, "leave_split_mode exit=1") {
+			t.Fatalf("the switch back did not stop at the folder:\nstdout: %s\nstderr: %s", stdout, stderr)
+		}
+		for _, want := range []string{config + " should be the build config file of Firecracker's guest kernel",
+			"sudo rm -r " + config + ")", "install.sh --privilege-mode single again"} {
+			if !strings.Contains(stderr, want) {
+				t.Errorf("the message does not say %q:\n%s", want, stderr)
+			}
+		}
+		// "rm -f <kernel>" also covers "rm -f <kernel>.config".
+		checkCalls(t, calls, []string{"systemctl disable --now aerolvm-rootd.service"}, []string{"rm -f " + kernel, "rm -f " + h.marker})
+		if got, err := os.ReadFile(inside); err != nil || string(got) != "made by sandboxd's user\n" {
+			t.Fatalf("the folder's file changed: %q, %v", got, err)
+		}
+		if _, err := os.Stat(kernel); err != nil {
+			t.Fatalf("the stopped run removed the kernel: %v", err)
+		}
+		if !h.markerThere() {
+			t.Fatal("the marker went with the switch unfinished")
+		}
+
+		// The operator removes the folder; the next run finishes.
+		if err := os.RemoveAll(config); err != nil {
+			t.Fatal(err)
+		}
+		calls, _, _ = h.run("single", switchBack+"leave_split_mode\n")
+		checkCalls(t, calls, []string{"rm -f " + kernel + " marker=yes", "rm -f " + config + " marker=yes", "rm -f " + h.marker + " marker=yes"}, nil)
+		if h.markerThere() {
+			t.Fatal("the marker is still there after the switch finished")
+		}
+	})
+
+	t.Run("a link to a folder: removed, not followed", func(t *testing.T) {
+		h, kernel, config := newHost(t)
+		target := filepath.Join(h.dir, "elsewhere")
+		mustMkdir(t, target)
+		mustWrite(t, filepath.Join(target, "keep"), "keep\n")
+		if err := os.Symlink(target, config); err != nil {
+			t.Fatal(err)
+		}
+		calls, _, _ := h.run("single", switchBack+"leave_split_mode\n")
+		checkCalls(t, calls, []string{"rm -f " + kernel + " marker=yes", "rm -f " + config + " marker=yes", "rm -f " + h.marker + " marker=yes"}, nil)
+		if _, err := os.Lstat(config); err == nil {
+			t.Fatal("the link is still there")
+		}
+		if got, err := os.ReadFile(filepath.Join(target, "keep")); err != nil || string(got) != "keep\n" {
+			t.Fatalf("what the link pointed at changed: %q, %v", got, err)
+		}
+		if h.markerThere() {
+			t.Fatal("the marker is still there after the switch")
+		}
+	})
 }
