@@ -250,18 +250,24 @@ func (d *Driver) WarmSpawn(ctx context.Context, req WarmSpawnRequest) (WarmHandl
 	// The snapshot's root drive names rootfs.ext4 (chroot-relative under
 	// the jailer), and LoadSnapshot opens it, so it is staged here, the
 	// way Create stages it for the cold load (Step 3, then
-	// configureVMMForLoad): linked or copied from the template, then given
-	// to the jailer's uid. A template built with an overlay drive has a
-	// read-only root drive, which PATCH /drives cannot change, so a link
-	// to the template's inode is never written through this VM; the guest
-	// writes to the overlay. The pool-hit path reuses this file: it is the
-	// rootfs the paused VM was loaded against.
+	// configureVMMForLoad): linked or copied from the template, then kept
+	// root's with the jailer's group and mode 0640 (chrootSharedFile). A
+	// link shares the template's own file with every other VM of the
+	// template, so it is never given to the jailer's user, not even while
+	// the slot waits in the pool. Firecracker only reads it: every
+	// template the pool warms was snapshotted with an overlay drive, so
+	// its root drive is read-only, which PATCH /drives cannot change; the
+	// guest writes to the overlay. A snapshot with a read-write root drive
+	// (from before the overlay) cannot open it and fails the spawn; the
+	// warm lister skips those templates until the service saves them
+	// again. The pool-hit path reuses this file as it is: it is the rootfs
+	// the paused VM was loaded against.
 	if d.split == nil {
 		rootfsPath := filepath.Join(handle.RunDir(), rootfsFileName)
 		if err := linkOrCopyRootfs(req.RootfsPath, rootfsPath); err != nil {
 			return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
 		}
-		if _, err := d.chrootFilePath(handle.RunDir(), rootfsPath, rootfsFileName); err != nil {
+		if _, err := d.chrootSharedFile(handle.RunDir(), rootfsPath, rootfsFileName); err != nil {
 			return nil, fmt.Errorf("firecracker warm-spawn: stage template rootfs: %w", err)
 		}
 	}
