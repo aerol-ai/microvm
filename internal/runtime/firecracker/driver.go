@@ -974,6 +974,9 @@ func (d *Driver) Create(ctx context.Context, req models.CreateSandboxRequest, sa
 		}
 	} else {
 		if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
+			if full := d.nitroOutOfResources(allocID, err); full != nil {
+				return nil, full
+			}
 			return nil, fmt.Errorf("firecracker runtime: action InstanceStart: %w", err)
 		}
 		// Split mode: the helper gives the vsock socket, bound at the

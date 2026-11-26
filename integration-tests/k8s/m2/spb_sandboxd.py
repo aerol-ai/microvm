@@ -171,8 +171,35 @@ def stop_start(sid, say):
     return r
 
 
-def fill_budget(say, most=40):
-    """Create 1-vCPU, 256 MiB sandboxes until one is refused."""
+NITRO_SYSFS = os.environ.get("SPB_NITRO_SYSFS", "/sys/class/misc/nitro_enclaves")
+
+
+def nitro_counters(root=NITRO_SYSFS):
+    """Every small readable file under the Nitro driver's sysfs folder (two
+    levels): its pools and slots, for the record."""
+    out = {}
+    for base, dirs, files in os.walk(root):
+        if base[len(root):].count(os.sep) > 1:
+            dirs[:] = []
+            continue
+        for name in files:
+            path = os.path.join(base, name)
+            try:
+                with open(path) as f:
+                    v = f.read(200).strip()
+            except OSError:
+                continue
+            if v and "\n" not in v:
+                out[os.path.relpath(path, root)] = v
+    return out
+
+
+def fill_budget(say, most=40, settle=30, retry_after=30):
+    """Create 1-vCPU, 256 MiB sandboxes until one is refused, after the
+    earlier deletes have had settle seconds to give memory back; then, the
+    refusal noted, wait retry_after seconds and try once more."""
+    time.sleep(settle)
+    before = nitro_counters()
     made, refusal = [], None
     for _ in range(most):
         st, js, _ = call("POST", "/v1/sandboxes", {"image": IMAGE, "runtime": NITRO, "memory_mb": 256, "cpu": 1})
@@ -181,11 +208,22 @@ def fill_budget(say, most=40):
             continue
         refusal = "HTTP %s %s" % (st, json.dumps(js)[:300])
         break
+    at_refusal = nitro_counters()
+    started = len(made)
+    retry = None
+    if refusal is not None:
+        time.sleep(retry_after)
+        st, js, _ = call("POST", "/v1/sandboxes", {"image": IMAGE, "runtime": NITRO, "memory_mb": 256, "cpu": 1})
+        retry = "HTTP %s" % st
+        if st < 300 and (js or {}).get("id"):
+            made.append(js["id"])
     for sid in made:
         call("DELETE", "/v1/sandboxes/" + sid)
-    ok = refusal is not None and refusal.startswith("HTTP 503") and "Nitro" in refusal and len(made) > 0
-    say("sandboxd budget: %d started before the refusal: %s" % (len(made), refusal))
-    return {"budget_started": len(made), "budget_refusal": refusal, "budget_ok": ok}
+    ok = refusal is not None and refusal.startswith("HTTP 503") and "Nitro" in refusal and started > 0
+    say("sandboxd budget: %d started before the refusal: %s; retry after %ds: %s" % (started, refusal, retry_after, retry))
+    say("sandboxd budget: nitro counters before %s; at the refusal %s" % (json.dumps(before), json.dumps(at_refusal)))
+    return {"budget_started": started, "budget_refusal": refusal, "budget_ok": ok, "budget_retry": retry,
+            "nitro_before": before, "nitro_at_refusal": at_refusal}
 
 
 def run(a, record, say):
@@ -199,7 +237,7 @@ def run(a, record, say):
             create_ms.append(ms)
         if "create_error" in r:
             say("sandboxd sample %d failed: %s" % (i, r["create_error"][:600]))
-    budget = fill_budget(say) if getattr(a, "budget", True) else {}
+    budget = fill_budget(say, settle=float(os.environ.get("SPB_SETTLE", "30")), retry_after=float(os.environ.get("SPB_RETRY_AFTER", "30")))
     st, js, _ = call("POST", "/v1/sandboxes", {"image": IMAGE, "runtime": "firecracker"})
     kvm_refused = st >= 400 and "firecracker-nitro" in json.dumps(js)
     if st < 300 and (js or {}).get("id"):

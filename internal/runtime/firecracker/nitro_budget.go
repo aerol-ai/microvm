@@ -173,6 +173,27 @@ func (b *nitroBudget) holding(id string) (nitroHold, bool) {
 	return h, ok
 }
 
+// nitroHostPool names a refusal by the Nitro System itself.
+const nitroHostPool = "Nitro resources"
+
+// nitroOutOfResources turns the Nitro System refusing a VM at InstanceStart
+// for want of resources into a capacity refusal (503, retried elsewhere),
+// or returns nil for any other error. The budget cannot see every limit:
+// in the live run m2-nitro-adm-1126 the 5th VM after ten deleted ones was
+// refused with ENOSPC ("Failed to create enclave VM: No space left") while
+// the budget had room, most likely because a deleted VM's memory returns
+// to the pool some time after it ends. Firecracker's words go to the log;
+// the caller gets the limit's name, as for the budget's own refusals.
+func (d *Driver) nitroOutOfResources(sandboxID string, err error) error {
+	if !d.nitro() || err == nil || !strings.Contains(err.Error(), "No space left") {
+		return nil
+	}
+	if d.logger != nil {
+		d.logger.Info("firecracker nitro: the Nitro System refused the VM for want of resources", "sandbox_id", sandboxID, "error", err)
+	}
+	return capacity.NewSlotPoolExhausted(nitroHostPool)
+}
+
 // slotPool is the vCPU budget as a slot pool for placement: one slot per
 // sandbox vCPU, so a node with none left gets no Nitro creates. A node
 // with one left may still refuse a two-vCPU create; the cluster then tries

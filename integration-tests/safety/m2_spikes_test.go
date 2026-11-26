@@ -653,7 +653,8 @@ func TestM2SPBSandboxdStepVerdict(t *testing.T) {
 			// Not -I: spb.py imports spb_sandboxd from its own folder, as
 			// it does on the node (spb-run.sh).
 			run := exec.Command("python3", spb, "sandboxd", "--samples", "3", "--results", results)
-			run.Env = append(os.Environ(), "SPB_API="+srv.URL, "SPB_PAT_FILE="+pat)
+			run.Env = append(os.Environ(), "SPB_API="+srv.URL, "SPB_PAT_FILE="+pat,
+				"SPB_SETTLE=0", "SPB_RETRY_AFTER=0", "SPB_NITRO_SYSFS="+filepath.Join(dir, "no-nitro"))
 			run.Dir = filepath.Dir(spb)
 			if out, err := run.CombinedOutput(); err != nil {
 				t.Fatalf("spb.py sandboxd: %v\n%s", err, out)

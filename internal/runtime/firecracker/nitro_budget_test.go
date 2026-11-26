@@ -267,3 +267,42 @@ func TestNitroSlotPool(t *testing.T) {
 		t.Fatalf("pool = %+v, %v", pool, ok)
 	}
 }
+
+// The Nitro System can refuse a VM for want of resources the budget cannot
+// see (live run m2-nitro-adm-1126: the 5th VM after ten deleted ones). The
+// refusal reaches the caller as a capacity refusal naming no internals,
+// on a create and on a start; the same error on KVM, or any other start
+// error, is left as it is.
+func TestNitroOutOfResourcesIsACapacityRefusal(t *testing.T) {
+	// Firecracker's words from that run.
+	enospc := errors.New(`firecracker: PUT /actions -> 400: {"fault_message":"Start microvm error: Enclave builder error: Enclave VM error: Failed to create enclave VM: No space left on device (os error 28)"}`)
+	t.Run("create", func(t *testing.T) {
+		f := nitroFixture(t, 8)
+		f.client.actionErr = enospc
+		_, err := f.driver.Create(context.Background(), models.CreateSandboxRequest{Image: "alpine:3.20", Runtime: models.RuntimeFirecrackerNitro, MemoryMB: 256}, "sb-full", "tok", nil)
+		refusedBy(t, err, nitroHostPool)
+		if strings.Contains(err.Error(), "Enclave") || strings.Contains(err.Error(), "fault_message") {
+			t.Fatalf("the refusal carries Firecracker's internals: %v", err)
+		}
+		if _, ok := f.driver.budget.holding("sb-full"); ok {
+			t.Fatal("the refused create kept its share")
+		}
+	})
+	t.Run("start", func(t *testing.T) {
+		f := nitroFixture(t, 8)
+		nitroStopped(t, f, "sb-s")
+		f.client.actionErr = enospc
+		_, err := f.driver.StartWithIdentityEnv(context.Background(), "sb-s", "sb-s", "tok", func(context.Context) (map[string]string, error) { return nil, nil })
+		refusedBy(t, err, nitroHostPool)
+	})
+	t.Run("kvm and other errors are left alone", func(t *testing.T) {
+		kvm := newDriverFixture(t)
+		if kvm.driver.nitroOutOfResources("sb", enospc) != nil {
+			t.Fatal("a KVM node turned an error into a Nitro refusal")
+		}
+		f := nitroFixture(t, 8)
+		if f.driver.nitroOutOfResources("sb", errors.New("400: bad kernel")) != nil || f.driver.nitroOutOfResources("sb", nil) != nil {
+			t.Fatal("a non-resource error became a capacity refusal")
+		}
+	})
+}

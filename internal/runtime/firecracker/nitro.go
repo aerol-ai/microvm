@@ -327,6 +327,9 @@ func (d *Driver) startNitro(ctx context.Context, sandboxID, toolboxToken string,
 		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
 	}
 	if err := client.Action(ctx, firecracker.Action{ActionType: firecracker.ActionInstanceStart}); err != nil {
+		if full := d.nitroOutOfResources(sandboxID, err); full != nil {
+			return nil, full
+		}
 		return nil, fmt.Errorf("firecracker runtime: start %s: action InstanceStart: %w", sandboxID, err)
 	}
 	if err := shareSockets(ctx, handle); err != nil {
