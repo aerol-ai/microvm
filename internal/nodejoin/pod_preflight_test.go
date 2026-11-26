@@ -58,7 +58,11 @@ func TestPodPreflight(t *testing.T) {
 			if tc.m.release != "" {
 				write(p.OSRelease, tc.m.release)
 			}
-			r := PodPreflight(p, tc.kvm)
+			backend := ""
+			if tc.kvm {
+				backend = PodFirecrackerKVM
+			}
+			r := PodPreflight(p, backend)
 			var failed []string
 			for _, c := range r.Checks {
 				if c.Status == StatusFail {
@@ -99,5 +103,85 @@ func TestPodPreflight(t *testing.T) {
 func TestDefaultPathsKVMSysfs(t *testing.T) {
 	if p := DefaultPaths(); p.KVMSysfs != "/sys/class/misc/kvm" || p.KVMDevice != "/dev/kvm" {
 		t.Fatalf("kvm paths = %q, %q", p.KVMSysfs, p.KVMDevice)
+	}
+}
+
+// A Nitro pool's preflight (plans/security-gaps-m1-m4.md §4.3): the Nitro
+// Enclaves device with PCIe slots, a reserved memory pool, and an Amazon
+// Linux 2023 kernel with the Nitro Sandboxes driver. No kvm check: a Nitro
+// machine has no /dev/kvm.
+func TestPodPreflightNitro(t *testing.T) {
+	type machine struct {
+		device      bool
+		slots, pool string // "" = no file
+		release     string
+	}
+	good := machine{device: true, slots: "20\n", pool: "6442450944\n", release: "6.18.62-127.179.amzn2023.x86_64\n"}
+	cases := []struct {
+		name     string
+		m        machine
+		wantFail []string
+	}{
+		{"SP-B's machine", good, nil},
+		{"the oldest kernel with the driver", machine{device: true, slots: "4", pool: "1073741824", release: "6.18.51-120.162.amzn2023.x86_64"}, nil},
+		{"no Nitro device (launched without enclaves)", machine{release: good.release}, []string{"nitro enclaves", "nitro memory pool"}},
+		{"no PCIe slots (an older driver)", machine{device: true, slots: "0", pool: good.pool, release: good.release}, []string{"nitro enclaves"}},
+		{"no memory pool (no kernel argument)", machine{device: true, slots: good.slots, pool: "0", release: good.release}, []string{"nitro memory pool"}},
+		{"a kernel before the driver", machine{device: true, slots: good.slots, pool: good.pool, release: "6.18.51-120.161.amzn2023.x86_64"}, []string{"nitro kernel"}},
+		{"a 6.1 Amazon Linux kernel", machine{device: true, slots: good.slots, pool: good.pool, release: "6.1.158-180.294.amzn2023.x86_64"}, []string{"nitro kernel"}},
+		{"mainline 6.19 (no patches)", machine{device: true, slots: good.slots, pool: good.pool, release: "6.19.3"}, []string{"nitro kernel"}},
+		{"a newer major", machine{device: true, slots: good.slots, pool: good.pool, release: "7.0.1-1.1.amzn2023.aarch64"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := Paths{CgroupRoot: dir, OSRelease: filepath.Join(dir, "osrelease"), BridgeNF: filepath.Join(dir, "bridge-nf"),
+				KVMSysfs: filepath.Join(dir, "kvm"), NitroSysfs: filepath.Join(dir, "nitro_enclaves")}
+			write := func(path, body string) {
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write(filepath.Join(dir, "cgroup.controllers"), "cpu memory\n")
+			write(p.BridgeNF, "1\n")
+			write(p.OSRelease, tc.m.release)
+			if tc.m.device {
+				if err := os.MkdirAll(p.NitroSysfs, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if tc.m.slots != "" {
+					write(filepath.Join(p.NitroSysfs, "pcie_slots_total"), tc.m.slots)
+				}
+				if tc.m.pool != "" {
+					write(filepath.Join(p.NitroSysfs, "mem_pool", "total"), tc.m.pool)
+				}
+			}
+			r := PodPreflight(p, PodFirecrackerNitro)
+			var failed []string
+			for _, c := range r.Checks {
+				if c.Name == "kvm" {
+					t.Fatal("a Nitro pool ran the kvm check")
+				}
+				if c.Status == StatusFail {
+					failed = append(failed, c.Name)
+					if c.Detail == "" || c.Fix == "" {
+						t.Fatalf("%s failed with no detail or fix: %+v", c.Name, c)
+					}
+				}
+			}
+			if strings.Join(failed, ",") != strings.Join(tc.wantFail, ",") {
+				t.Fatalf("failed = %v, want %v\n%+v", failed, tc.wantFail, r.Checks)
+			}
+		})
+	}
+}
+
+// The pod preflight reads the Nitro driver from the machine's sysfs.
+func TestDefaultPathsNitroSysfs(t *testing.T) {
+	if p := DefaultPaths(); p.NitroSysfs != "/sys/class/misc/nitro_enclaves" {
+		t.Fatalf("NitroSysfs = %q", p.NitroSysfs)
 	}
 }

@@ -123,15 +123,17 @@ answer.
 
 const preflightUsage = `usage: sandboxd preflight [--join <url> --token <id.secret>] [--ca-cert-hash sha256:<hex>]
                           [--role server|worker|ingress] [--node-id <id>] [-o text|json]
-       sandboxd preflight --pod [--kvm] [-o text|json]
+       sandboxd preflight --pod [--kvm | --nitro] [-o text|json]
 
 Checks this machine, and with --join the network to the cluster, before init
 or join changes anything; prints a fix for each failure. With --join the
 join server dials this machine back on the ports its role needs.
 
 --pod checks the machine a Kubernetes worker pod landed on (its preflight
-init container): cgroup v2, the kernel version and br_netfilter, and with
---kvm /dev/kvm. Its last line names every failure, for the operator.
+init container): cgroup v2, the kernel version and br_netfilter; with
+--kvm /dev/kvm; with --nitro the Nitro Enclaves device, its memory pool and
+a kernel with the Nitro Sandboxes driver. Its last line names every
+failure, for the operator.
 Exit status: 0 when nothing failed, 1 when a check failed, 2 for a usage error.
 `
 
@@ -196,7 +198,7 @@ type nodeFlags struct {
 	ttl                               string
 	reusable, json                    bool
 	filesOnly                         bool
-	pod, kvm                          bool
+	pod, kvm, nitro                   bool
 	byCert                            bool
 	externalCA                        bool
 	fromOperator, operatorCA          string
@@ -233,6 +235,7 @@ func parseNodeArgs(cmd string, args []string) (*nodeFlags, []string, error) {
 		fs.StringVar(&f.output, "output", "text", "")
 		fs.BoolVar(&f.pod, "pod", false, "")
 		fs.BoolVar(&f.kvm, "kvm", false, "")
+		fs.BoolVar(&f.nitro, "nitro", false, "")
 	case adoptSubcommand:
 		fs.StringVar(&f.caKey, "ca-key", "", "")
 	case resetSubcommand:
@@ -389,8 +392,12 @@ func runPreflight(ctx context.Context, f *nodeFlags, host nodejoin.Host, paths n
 		fmt.Fprintf(stderr, "sandboxd preflight: --join and --token go together\n%s", usage)
 		return 2
 	}
-	if f.kvm && !f.pod {
-		fmt.Fprintf(stderr, "sandboxd preflight: --kvm goes with --pod\n%s", usage)
+	if (f.kvm || f.nitro) && !f.pod {
+		fmt.Fprintf(stderr, "sandboxd preflight: --kvm and --nitro go with --pod\n%s", usage)
+		return 2
+	}
+	if f.kvm && f.nitro {
+		fmt.Fprintf(stderr, "sandboxd preflight: a pool runs Firecracker on KVM or on Nitro, not both: --kvm or --nitro\n%s", usage)
 		return 2
 	}
 	if f.pod {
@@ -398,7 +405,14 @@ func runPreflight(ctx context.Context, f *nodeFlags, host nodejoin.Host, paths n
 			fmt.Fprintf(stderr, "sandboxd preflight: --pod checks this machine only; leave out --join\n%s", usage)
 			return 2
 		}
-		report := nodejoin.PodPreflight(paths, f.kvm)
+		backend := ""
+		switch {
+		case f.kvm:
+			backend = nodejoin.PodFirecrackerKVM
+		case f.nitro:
+			backend = nodejoin.PodFirecrackerNitro
+		}
+		report := nodejoin.PodPreflight(paths, backend)
 		if f.output == "json" {
 			report.PrintJSON(stdout)
 		} else {

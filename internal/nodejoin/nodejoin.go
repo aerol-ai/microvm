@@ -51,6 +51,9 @@ type Paths struct {
 	// but sees the machine's sysfs read-only, where the device shows as
 	// soon as the kvm module made it.
 	KVMSysfs string
+	// NitroSysfs is the Nitro Enclaves driver's folder in sysfs (the pod
+	// preflight of a Nitro pool): the device, its PCIe slots, its pool.
+	NitroSysfs string
 	// OSRelease is the kernel's release string (the pod preflight).
 	OSRelease string
 	// BridgeNF is br_netfilter's sysctl: present only with the module
@@ -73,6 +76,7 @@ func DefaultPaths() Paths {
 		CgroupRoot:   "/sys/fs/cgroup",
 		KVMDevice:    "/dev/kvm",
 		KVMSysfs:     "/sys/class/misc/kvm",
+		NitroSysfs:   "/sys/class/misc/nitro_enclaves",
 		OSRelease:    "/proc/sys/kernel/osrelease",
 		BridgeNF:     "/proc/sys/net/bridge/bridge-nf-call-iptables",
 	}

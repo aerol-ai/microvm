@@ -47,6 +47,7 @@ func TestKubernetesImagePins(t *testing.T) {
 	for _, c := range []struct{ name, hash string }{
 		{"CONTAINERD", "SHA256"}, {"RUNC", "SHA256"}, {"CNI_PLUGINS", "SHA256"}, {"GVISOR", "SHA512"}, {"WORKERD", "SHA256"},
 		{"FIRECRACKER", "SHA256"}, {"FIRECRACKER_KERNEL", "SHA256"}, {"MOUNTPOINT_S3", "SHA256"},
+		{"FIRECRACKER_NITRO", "SHA256"},
 	} {
 		version := pins[c.name+"_VERSION"] + pins[c.name+"_RELEASE"]
 		if version == "" {
@@ -62,6 +63,16 @@ func TestKubernetesImagePins(t *testing.T) {
 				t.Errorf("%s = %q, want a %s hash", key, pins[key], strings.ToLower(c.hash))
 			}
 		}
+	}
+	// The Nitro guest kernel is amd64 only (versions.env says why), with
+	// its build config, from a named CI build.
+	for _, key := range []string{"FIRECRACKER_NITRO_KERNEL_SHA256_AMD64", "FIRECRACKER_NITRO_KERNEL_CONFIG_SHA256_AMD64"} {
+		if !sha256Hex.MatchString(pins[key]) {
+			t.Errorf("%s = %q, want a sha256 hash", key, pins[key])
+		}
+	}
+	if pins["FIRECRACKER_NITRO_KERNEL_CI_PREFIX"] == "" || pins["FIRECRACKER_NITRO_KERNEL_VERSION"] == "" {
+		t.Error("the Nitro guest kernel names no CI build or version")
 	}
 	argRE := regexp.MustCompile(`(?m)^ARG ([A-Z0-9_]+)`)
 	fromRE := regexp.MustCompile(`(?m)^FROM (\S+)`)

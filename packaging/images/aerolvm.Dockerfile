@@ -39,6 +39,13 @@ ARG FIRECRACKER_KERNEL_SHA256_AMD64
 ARG FIRECRACKER_KERNEL_SHA256_ARM64
 ARG FIRECRACKER_KERNEL_CONFIG_SHA256_AMD64
 ARG FIRECRACKER_KERNEL_CONFIG_SHA256_ARM64
+ARG FIRECRACKER_NITRO_VERSION
+ARG FIRECRACKER_NITRO_SHA256_AMD64
+ARG FIRECRACKER_NITRO_SHA256_ARM64
+ARG FIRECRACKER_NITRO_KERNEL_CI_PREFIX
+ARG FIRECRACKER_NITRO_KERNEL_VERSION
+ARG FIRECRACKER_NITRO_KERNEL_SHA256_AMD64
+ARG FIRECRACKER_NITRO_KERNEL_CONFIG_SHA256_AMD64
 ARG GVISOR_RELEASE
 ARG GVISOR_SHA512_AMD64
 ARG GVISOR_SHA512_ARM64
@@ -86,6 +93,20 @@ RUN set -eu; \
     kernel="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/${FIRECRACKER_KERNEL_CI_VERSION}/${arch}/vmlinux-${FIRECRACKER_KERNEL_VERSION}"; \
     get /out/fc/vmlinux "$kernel" "$k"; \
     get /out/fc/vmlinux.config "$kernel.config" "$kc"
+# The Nitro backend's set, in a folder of its own (versions.env says why).
+# amd64 only: there is no aarch64 EFI guest kernel to pin yet, and a Nitro
+# pool on arm64 then fails its health check on the missing kernel.
+RUN set -eu; \
+    mkdir -p /out/fc-nitro; \
+    [ "$TARGETARCH" = amd64 ] || exit 0; \
+    get() { curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 -o "$1" "$2"; echo "$3  $1" | sha256sum -c --quiet -; }; \
+    get fcn.tgz "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_NITRO_VERSION}/firecracker-${FIRECRACKER_NITRO_VERSION}-x86_64.tgz" "$FIRECRACKER_NITRO_SHA256_AMD64"; \
+    tar -xzf fcn.tgz; \
+    install -m 0755 "release-${FIRECRACKER_NITRO_VERSION}-x86_64/firecracker-${FIRECRACKER_NITRO_VERSION}-x86_64" /out/fc-nitro/firecracker; \
+    install -m 0755 "release-${FIRECRACKER_NITRO_VERSION}-x86_64/jailer-${FIRECRACKER_NITRO_VERSION}-x86_64" /out/fc-nitro/jailer; \
+    ci="https://s3.amazonaws.com/spec.ccfc.min/${FIRECRACKER_NITRO_KERNEL_CI_PREFIX}/x86_64"; \
+    get /out/fc-nitro/bzImage "$ci/bzImage-${FIRECRACKER_NITRO_KERNEL_VERSION}" "$FIRECRACKER_NITRO_KERNEL_SHA256_AMD64"; \
+    get /out/fc-nitro/bzImage.config "$ci/vmlinux-${FIRECRACKER_NITRO_KERNEL_VERSION}.config" "$FIRECRACKER_NITRO_KERNEL_CONFIG_SHA256_AMD64"
 # runsc, the runtime image's release: sandboxd saves a gVisor sandbox with
 # `runsc checkpoint` when a decommission moves it (C21), as the shim has no
 # checkpoint of its own.
@@ -151,6 +172,9 @@ COPY --from=fetch /out/fc/firecracker /out/fc/jailer /out/runsc /usr/local/bin/
 # Not under /var/lib/sandboxd, the worker pod's state volume, which would
 # hide it: the chart points SB_FIRECRACKER_KERNEL here.
 COPY --from=fetch /out/fc/vmlinux /out/fc/vmlinux.config /opt/aerolvm/firecracker/
+# The Nitro backend's Firecracker, jailer and guest kernel; the chart points
+# a nitro pool here (empty on arm64).
+COPY --from=fetch /out/fc-nitro/ /opt/aerolvm/firecracker-nitro/
 COPY ${TARGETARCH}/sandboxd ${TARGETARCH}/toolboxd /usr/local/bin/
 # The root helper and, for a signed release, aerolvm-rootd.manifest and
 # aerolvm-rootd.sig (scripts/build-images.sh puts them in rootd/).

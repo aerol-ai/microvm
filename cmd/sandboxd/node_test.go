@@ -90,7 +90,9 @@ func TestNodeCommandsUsage(t *testing.T) {
 		{"preflight", []string{"-o", "yaml"}, "-o must be text or json"},
 		{"preflight", []string{"--join", "https://x"}, "--join and --token go together"},
 		{"preflight", []string{"--role", "boss"}, "--role must be server, worker or ingress"},
-		{"preflight", []string{"--kvm"}, "--kvm goes with --pod"},
+		{"preflight", []string{"--kvm"}, "--kvm and --nitro go with --pod"},
+		{"preflight", []string{"--nitro"}, "--kvm and --nitro go with --pod"},
+		{"preflight", []string{"--pod", "--kvm", "--nitro"}, "not both: --kvm or --nitro"},
 		{"preflight", []string{"--pod", "--join", "https://x", "--token", "t"}, "leave out --join"},
 		{"reset", nil, "run it again with --yes"},
 		{"join-command", []string{"extra"}, "unexpected argument"},
@@ -137,6 +139,9 @@ func TestNodeCommandsRun(t *testing.T) {
 	}
 	if code, out, _ = runNode("preflight", "--pod", "--kvm", "-o", "json"); code != 1 || !strings.Contains(out, `"ok": false`) {
 		t.Fatalf("preflight --pod --kvm with no /dev/kvm = %d\n%s", code, out)
+	}
+	if code, out, _ = runNode("preflight", "--pod", "--nitro"); code != 1 || !strings.Contains(out, "nitro enclaves: ") {
+		t.Fatalf("preflight --pod --nitro with no Nitro device = %d\n%s", code, out)
 	}
 	// A join server that isn't there fails the check: exit 1.
 	tok, _ := cluster.GenerateJoinToken()

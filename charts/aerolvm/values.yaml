@@ -249,9 +249,21 @@ worker:
   # kernel. Like WASM, VMs are processes sandboxd starts: the pod shares one
   # process namespace so they outlive an agent restart. jailerUID is the
   # user each VM runs as (any unused number; nothing logs in as it).
+  # backend: kvm (the default: /dev/kvm, as above) or nitro: Firecracker
+  # through AWS Nitro Sandboxes on ordinary EC2 machines, no metal and no
+  # nested virtualization (plans/security-gaps-m1-m4.md §4.3). A nitro pool
+  # offers the runtime firecracker-nitro instead of firecracker: no
+  # snapshots, no pause, no memory moves; a stop keeps the files and a
+  # start boots again. Its machines need Nitro Enclaves on, the Amazon
+  # Linux 2023 kernel-6.18 image and a memory pool for the VMs
+  # (nitro_enclaves.mempool on the kernel line); the preflight checks all
+  # three. amd64 only for now. nitroMode: direct (the host can read a VM's
+  # memory) or confidential (it cannot).
   firecracker:
     enabled: false
     jailerUID: 990
+    backend: kvm
+    nitroMode: direct
   # External storage in a create's mounts (S3, NFS, SSHFS, rclone; docs page
   # "External storage"). sandboxd runs each mount's helper (mount-s3,
   # rclone, sshfs) in the runtime container's group, below a mounts folder

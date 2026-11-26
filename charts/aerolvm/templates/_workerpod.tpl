@@ -30,6 +30,15 @@ and no shared process namespace. */}}
 {{- if $split }}{{ $externalStorage = false }}{{ end }}
 {{- $wasm := $root.Values.worker.wasm.enabled }}
 {{- $isolate := $root.Values.worker.isolate.enabled }}
+{{- $fcBackend := toString ($root.Values.worker.firecracker.backend | default "kvm") }}
+{{- if not (has $fcBackend (list "kvm" "nitro")) }}
+{{- fail (printf "worker.firecracker.backend is kvm or nitro, got %q" $fcBackend) }}
+{{- end }}
+{{- $nitroMode := toString ($root.Values.worker.firecracker.nitroMode | default "direct") }}
+{{- if not (has $nitroMode (list "direct" "confidential")) }}
+{{- fail (printf "worker.firecracker.nitroMode is direct or confidential, got %q" $nitroMode) }}
+{{- end }}
+{{- $nitro := and $root.Values.worker.firecracker.enabled (eq $fcBackend "nitro") }}
 {{- /* The V8 jail's chroots. In split the root helper links, mounts and
 removes in them, so they sit outside every folder the agent writes (the
 helper refuses a base inside one): /srv/isolate-jail, the base sandboxd
@@ -105,7 +114,7 @@ initContainers:
   - name: preflight
     image: {{ include "aerolvm.image" (dict "root" $root "name" "aerolvm") }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
-    command: ["sandboxd", "preflight", "--pod"{{ if $root.Values.worker.firecracker.enabled }}, "--kvm"{{ end }}]
+    command: ["sandboxd", "preflight", "--pod"{{ if $root.Values.worker.firecracker.enabled }}, {{ ternary "--nitro" "--kvm" $nitro | quote }}{{ end }}]
     terminationMessagePolicy: FallbackToLogsOnError
     securityContext:
       runAsUser: 65532
@@ -587,7 +596,7 @@ containers:
       {{- $runtimes := list "docker" "gvisor" }}
       {{- if $root.Values.worker.wasm.enabled }}{{ $runtimes = append $runtimes "wasm" }}{{ end }}
       {{- if $root.Values.worker.isolate.enabled }}{{ $runtimes = append $runtimes "isolate" }}{{ end }}
-      {{- if $root.Values.worker.firecracker.enabled }}{{ $runtimes = append $runtimes "firecracker" }}{{ end }}
+      {{- if $root.Values.worker.firecracker.enabled }}{{ $runtimes = append $runtimes (ternary "firecracker-nitro" "firecracker" $nitro) }}{{ end }}
       - { name: SB_HOST_RUNTIMES, value: {{ join "," $runtimes | quote }} }
       {{- if $wasm }}
       # WASM workers start under the runtime container's sandboxes group
@@ -618,7 +627,17 @@ containers:
       # the run dir sit on the pod's volumes, so a VM the next agent takes
       # over keeps its files. Each VM runs as jailerUID.
       - { name: SB_ENABLE_FIRECRACKER, value: "true" }
+      {{- if $nitro }}
+      # The Nitro backend's own Firecracker (v1.18), jailer and EFI guest
+      # kernel, which the image keeps apart from the KVM ones.
+      - { name: SB_FIRECRACKER_BACKEND, value: nitro }
+      - { name: SB_FIRECRACKER_NITRO_MODE, value: {{ $nitroMode | quote }} }
+      - { name: SB_FIRECRACKER_BINARY, value: /opt/aerolvm/firecracker-nitro/firecracker }
+      - { name: SB_JAILER_BINARY, value: /opt/aerolvm/firecracker-nitro/jailer }
+      - { name: SB_FIRECRACKER_KERNEL, value: /opt/aerolvm/firecracker-nitro/bzImage }
+      {{- else }}
       - { name: SB_FIRECRACKER_KERNEL, value: /opt/aerolvm/firecracker/vmlinux }
+      {{- end }}
       - { name: SB_JAILER_CHROOT_BASE, value: /var/lib/sandboxd/jailer }
       - { name: SB_JAILER_UID, value: {{ $root.Values.worker.firecracker.jailerUID | quote }} }
       - { name: SB_JAILER_GID, value: {{ $root.Values.worker.firecracker.jailerUID | quote }} }

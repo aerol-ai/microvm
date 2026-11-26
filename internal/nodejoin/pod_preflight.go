@@ -22,15 +22,112 @@ import (
 // Bottlerocket ship 6.1, Azure Linux 6.6, Ubuntu 22.04 5.15.
 var MinKernel = [2]int{5, 10}
 
-// PodPreflight runs the worker pod's checks. kvm adds the kvm check, for a
-// Firecracker pool.
-func PodPreflight(p Paths, kvm bool) Report {
+// Firecracker backends a worker pool's preflight checks for.
+const (
+	PodFirecrackerKVM   = "kvm"
+	PodFirecrackerNitro = "nitro"
+)
+
+// PodPreflight runs the worker pod's checks. firecracker is the pool's
+// Firecracker backend: "kvm" adds the kvm check, "nitro" the Nitro
+// Enclaves checks, "" neither.
+func PodPreflight(p Paths, firecracker string) Report {
 	var r Report
 	r.add(checkCgroupRequired(p), checkKernel(p), checkBridgeNF(p))
-	if kvm {
+	switch firecracker {
+	case PodFirecrackerKVM:
 		r.add(checkKVMSysfs(p))
+	case PodFirecrackerNitro:
+		r.add(checkNitroDevice(p), checkNitroPool(p), checkNitroKernel(p))
 	}
 	return r
+}
+
+// MinNitroKernel is the oldest parent kernel with the Nitro Sandboxes driver
+// patches: Amazon Linux 2023's 6.18.51-120.162 (Firecracker's Nitro
+// Sandboxes guide). Mainline Linux does not have them.
+var MinNitroKernel = [5]int{6, 18, 51, 120, 162}
+
+// checkNitroDevice fails on a machine launched without Nitro Enclaves, or
+// whose driver reports no PCIe slots for sandboxes. Read from sysfs, as the
+// kvm check is: the preflight container is not privileged.
+func checkNitroDevice(p Paths) Check {
+	c := Check{Name: "nitro enclaves", Status: StatusOK}
+	if _, err := os.Stat(p.NitroSysfs); err != nil {
+		c.Status, c.Detail = StatusFail, "this machine has no Nitro Enclaves device ("+p.NitroSysfs+" is missing), and this worker pool runs Firecracker on Nitro"
+		c.Fix = "launch the node with Nitro Enclaves on (EC2 EnclaveOptions; on EKS, the Nitro node pool's launch template), or set worker.firecracker.backend: kvm"
+		return c
+	}
+	slots := readSysfsInt(filepath.Join(p.NitroSysfs, "pcie_slots_total"))
+	if slots < 1 {
+		c.Status, c.Detail = StatusFail, "the Nitro Enclaves driver reports no PCIe slots for sandboxes (an older driver)"
+		c.Fix = "use the Amazon Linux 2023 kernel 6.18.51-120.162 or later"
+		return c
+	}
+	c.Detail = fmt.Sprintf("Nitro Enclaves device present, %d PCIe slots", slots)
+	return c
+}
+
+// checkNitroPool fails when no memory is set aside for Nitro VMs: every
+// Nitro sandbox's memory comes from that pool.
+func checkNitroPool(p Paths) Check {
+	c := Check{Name: "nitro memory pool", Status: StatusOK}
+	total := readSysfsInt(filepath.Join(p.NitroSysfs, "mem_pool", "total"))
+	if total < 1 {
+		c.Status, c.Detail = StatusFail, "no memory is reserved for Nitro VMs"
+		c.Fix = "add nitro_enclaves.mempool=<size> (for example 6G@0) to the node's kernel command line and reboot it (the Nitro node pool's user data does this)"
+		return c
+	}
+	c.Detail = fmt.Sprintf("%d MiB reserved for Nitro VMs", total>>20)
+	return c
+}
+
+// checkNitroKernel fails on a kernel without the Nitro Sandboxes patches.
+func checkNitroKernel(p Paths) Check {
+	c := Check{Name: "nitro kernel", Status: StatusOK}
+	raw, err := os.ReadFile(p.OSRelease)
+	release := strings.TrimSpace(string(raw))
+	want := fmt.Sprintf("%d.%d.%d-%d.%d", MinNitroKernel[0], MinNitroKernel[1], MinNitroKernel[2], MinNitroKernel[3], MinNitroKernel[4])
+	if err != nil || !strings.Contains(release, ".amzn2023.") || !nitroKernelAtLeast(release, MinNitroKernel) {
+		c.Status, c.Detail = StatusFail, fmt.Sprintf("kernel %q does not have the Nitro Sandboxes driver (Amazon Linux 2023 %s or later has it)", release, want)
+		c.Fix = "use the Amazon Linux 2023 kernel-6.18 node image, " + want + " or later"
+		return c
+	}
+	c.Detail = "kernel " + release
+	return c
+}
+
+// nitroKernelAtLeast compares "6.18.62-127.179.amzn2023.x86_64" with min,
+// number by number.
+func nitroKernelAtLeast(release string, min [5]int) bool {
+	head, _, _ := strings.Cut(release, ".amzn2023")
+	fields := strings.FieldsFunc(head, func(r rune) bool { return r == '.' || r == '-' })
+	if len(fields) != 5 {
+		return false
+	}
+	for i, f := range fields {
+		n, err := strconv.Atoi(f)
+		if err != nil {
+			return false
+		}
+		if n != min[i] {
+			return n > min[i]
+		}
+	}
+	return true
+}
+
+// readSysfsInt reads one non-negative number, or 0.
+func readSysfsInt(path string) int {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return int(n)
 }
 
 // checkKVMSysfs fails on a machine without the kvm device. The preflight
