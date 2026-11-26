@@ -73,6 +73,7 @@ def main():
     ap.add_argument("--cell-start", type=float, default=0, help="epoch the cluster's up began (0: not up)")
     ap.add_argument("--cell-end", type=float, default=0, help="epoch the cluster was down (0: still up)")
     ap.add_argument("--done", default="", help="part A steps finished, comma-separated")
+    ap.add_argument("--plan", default="", help="part A steps this run does, comma-separated (empty: every step)")
     ap.add_argument("--vm-start", type=float, default=0)
     ap.add_argument("--vm-end", type=float, default=0)
     ap.add_argument("--limit", type=float, default=6.15)
@@ -162,7 +163,11 @@ def running(a):
     done = {x for x in a.done.split(",") if x}
     a_h = ((a.cell_end or now) - a.cell_start) / 3600 if a.cell_start else 0.0
     a_spent = CELL_H * a_h
-    left_min = sum(m for s, m, _ in STEPS if s not in done) if not a.cell_end else 0
+    # Only the steps this run does: a run of a few steps (m1d-3 ran N1
+    # alone) would otherwise carry every other step's minutes and could
+    # pass the limit on time it never spends.
+    plan = {x for x in a.plan.split(",") if x}
+    left_min = sum(m for s, m, _ in STEPS if s not in done and (not plan or s in plan)) if not a.cell_end else 0
     a_proj = a_spent + CELL_H * left_min / 60 + (ALLOWANCE_A if a.cell_start else 0)
     b_rate = a.vm_hourly or B_H
     b_h = ((a.vm_end or now) - a.vm_start) / 3600 if a.vm_start else 0.0

@@ -63,6 +63,27 @@ The budget (plan §3.7) is on the p50: +3 ms cold, +1 ms warm.
   has since merged (#1437); a new run will show how much of the gap it
   closes.
 
+N1 in m1d-3 (2026-11-26, N1 alone, on a commit with #1437):
+
+- Warm: 150 of 150 rounds came from the pool on both sides. Split p50
+  15.2 ms, single 18.4 ms. The p50 gap is -3.2 ms and the paired median
+  difference -3.15 ms (95% range -3.60 to -2.80): inside the budget.
+- Cold: split p50 164.3 ms, single 139.0 ms. The p50 gap is +25.3 ms,
+  **over** the +3 ms budget; the paired median difference is +19.05 ms
+  (95% range -9.60 to +37.75). The gap is in `toolbox_wait`, the time
+  from the task's start until toolboxd in the sandbox reports ready.
+- This run found that N1 measured the warm pool's learning too. A pool
+  learns every image a create misses for and keeps warm slots for it. The
+  first cold busybox create taught both pools busybox, so one side's
+  "cold" creates came from the pool, and learned slots were refilled
+  beside the timed creates. N1 now keeps cold creates off the pool (they
+  never teach it), drops learned images within a minute (values.yaml),
+  waits for steady pools before cold and warm (`.state/<name>/evidence/n1/pool.txt`),
+  and reads each create's pool hit or miss from the worker's own
+  Server-Timing. The cold result above came from a run with some learned
+  slots still refilling; a run with this kit will tell how much of the
+  cold gap that was.
+
 Part B, first run (m1d-1-vm), budget +1 ms: the paired median differences
 are WASM warm +0.05 ms, WASM busy mix +0.15 ms and V8 warm -0.10 ms, and
 the p50 gaps +0.15, -0.50 and -0.10 ms. All three meet it.
@@ -150,7 +171,21 @@ cat ../.state/m1d-3-vm/vm-verdict.txt    # Part B
 ```
 
 Each step can also run alone, for example `./m1-eks.sh m1d-3 s2 f8`. The
-order and what each step does are at the top of `m1-eks.sh`.
+order and what each step does are at the top of `m1-eks.sh`. The cost check
+counts only the steps on the command line. A run of named steps tears down
+on a stop only with `M1_TEARDOWN_ON_EXIT=1`. N1 alone, as m1d-3 ran it:
+
+```bash
+M1_VM_HOURS=0 M1_TTL_HOURS=3 M1_COST_LIMIT=3.50 M1_TEARDOWN_ON_EXIT=1 \
+  M1_N1_COLD=80 M1_N1_WARM=150 M1_N1_PHASE_WAIT=2700 HELM=<helm 3.8+> \
+  ./m1-eks.sh m1d-4 up setup build install kernel switch1 n1 down
+```
+
+N1's settings: `M1_N1_COLD` (cold pairs, 40), `M1_N1_WARM` (warm rounds
+where both sides come from the pool, 120; at most twice that many rounds),
+`M1_N1_BURST` (20), `M1_N1_POOL_DEPTH` (values.yaml's depth, 10),
+`M1_N1_POOL_WAIT` (seconds to wait for steady pools, 300) and
+`M1_N1_PHASE_WAIT` (seconds a phase may take, 1200).
 
 ## How to stop it and tear it down
 
@@ -186,6 +221,17 @@ an older commit still meets them.
   #1436). After the workaround above, the operator could remove the node
   while the sandbox was still being deleted, and later deletes of it
   failed. It went away with the cluster.
+
+One more the third run met, not fixed yet:
+
+- **A worker can wait for a machine forever at install.** The operator
+  puts two of the three workers in the first zone of `cluster.zones` (the
+  order Terraform gives). EKS may start two worker machines in the other
+  zone. Then the third worker pod stays Pending and `install` times out.
+  m1d-3 got past it by hand: `helm upgrade --reuse-values --set
+  'cluster.zones={<the zone with two worker machines>,<the other>}'`, then
+  deleting the Pending worker's AerolNode; the operator made a new one in
+  the right zone.
 
 ## Not in this drill
 

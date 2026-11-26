@@ -3,10 +3,11 @@
 # m1-bench, m1-eks.sh n1) so both sides are timed from one place, through
 # the gateway Service, as a client would see them.
 #
-#   n1-bench.sh cold  <pairs>    a create with no warm slot (busybox: not in
-#                                the pool), then its delete
-#   n1-bench.sh warm  <pairs>    a pool create (alpine: the pool's image),
-#                                paced so each worker's pool refills
+#   n1-bench.sh cold  <pairs>    a create the pool never serves (busybox, with
+#                                LOGNAME in its env), then its delete
+#   n1-bench.sh warm  <n>        pool creates (alpine: the pool's image) until
+#                                n rounds came from the pool on both sides
+#                                (at most 2n rounds)
 #   n1-bench.sh burst <n>        n creates at once on each side (not paired)
 #   n1-bench.sh first            one create on each side, nothing before it
 #
@@ -16,8 +17,10 @@
 # cordons the other side's worker too, so the create lands on its side.
 # (Placement never matches the gVisor-moves label: live run m1d-2.)
 # Prints one line per create:
-#   N1 <phase> <round> <mode> client_ms=<n> create_ms=<worker's Server-Timing create;dur> code=<http> id=<id>
-# and keeps the whole Server-Timing header on a "N1T" line. Needs bash,
+#   N1 <phase> <round> <mode> client_ms=<n> create_ms=<worker's Server-Timing create;dur> code=<http> id=<id> pool=<hit|miss|none>
+# (pool: the worker's containerd_pool stage; none when the create never
+# asked the pool) and keeps the whole Server-Timing header on a "N1T"
+# line; a warm round with a miss also prints an "N1M" line. Needs bash,
 # curl and date only (the Amazon Linux 2023 image).
 #
 # GW (the gateway Service URL) and TOKEN come from the pod's environment.
@@ -29,7 +32,15 @@ BUSYBOX=public.ecr.aws/docker/library/busybox:1.36
 ms() { date +%s%3N; }
 
 body() { # body <image>
-  printf '{"runtime":"gvisor","image":"%s","cpu":0.1,"memory_mb":64,"tags":{"m1-n1":"%s"}}' "$1" "$phase"
+  # Cold creates carry LOGNAME (a key toolboxd reads at boot), which keeps
+  # them off the warm pool (internal/runtime/containerd poolEligible). Off
+  # the pool, a create is also no miss, so the pool never learns busybox.
+  # Without it (m1d-3, first try), the first busybox miss made each pool
+  # park busybox slots: the split worker had room and served "cold" creates
+  # warm in ~15 ms, the single worker, full of alpine slots, did not.
+  local env=""
+  [[ "$phase" == cold ]] && env=',"env":{"LOGNAME":"root"}'
+  printf '{"runtime":"gvisor","image":"%s","cpu":0.1,"memory_mb":64,"tags":{"m1-n1":"%s"}%s}' "$1" "$phase" "$env"
 }
 # pin <mode>: only that side's worker takes new sandboxes (AerolVM's
 # admission-only cordon on the other).
@@ -61,6 +72,11 @@ one() {
   # (pkg/api/clustercreate addRouterTiming). "docker_create;dur" is a
   # stage, never first, so the anchor keeps it out.
   cdur="$(grep -o '^create;dur=[0-9.]*' <<<"$st" | cut -d= -f2)"
+  # The worker's own word on the warm pool: containerd_pool;...;desc=hit
+  # or desc=miss (none when the create path has no pool stage).
+  pool="$(grep -o 'containerd_pool;[^,]*desc=[a-z]*' <<<"$st" | sed 's/.*desc=//')"
+  pool="${pool%%$'\n'*}"
+  last_pool="${pool:-none}"
   rm -f "$hdr"
   # Still the stale moment: once more, after a wait (not timed).
   if [[ "$code" == 503 && -z "$id" && "${5:-}" != retried ]]; then
@@ -69,7 +85,7 @@ one() {
     one "$r" "$mode" "$image" "${4:-}" retried
     return
   fi
-  echo "N1 $phase $r $mode client_ms=$((t1 - t0)) create_ms=${cdur:--1} code=$code id=${id:-none}"
+  echo "N1 $phase $r $mode client_ms=$((t1 - t0)) create_ms=${cdur:--1} code=$code id=${id:-none} pool=${pool:-none}"
   echo "N1T $phase $r $mode $st"
   if [[ -n "$id" ]]; then
     curl -sS -m 60 -o /dev/null -X DELETE -H "Authorization: Bearer $TOKEN" "$GW/v1/sandboxes/$id" 2>/dev/null || true
@@ -94,10 +110,24 @@ case "$phase" in
     one prime split "$BUSYBOX" >/dev/null; one prime single "$BUSYBOX" >/dev/null
     pairs "$BUSYBOX" "$n" 1 ;;
   warm)
-    # Depth 5, refilled every 5 s (values.yaml): one claim per side every
-    # 2 s stays inside the refill. The first round waits for full pools.
+    # <n> is the number of rounds where both sides hit the pool (the
+    # worker's Server-Timing says hit or miss), up to 2n rounds in all.
+    # m1d-2 counted 70 hits of 120 rounds: its misses came in a run of
+    # rounds 3-37, both sides, while the pools refilled slowly after the
+    # cold phase. A round with a miss is followed by a longer pause, so
+    # the pools catch up instead of missing round after round. m1-eks.sh
+    # waits for full pools before this phase starts.
     sleep 20
-    pairs "$ALPINE" "$n" 2 ;;
+    hits=0; i=0
+    while (( hits < n && i < 2 * n )); do
+      i=$((i + 1))
+      if (( i % 2 )); then a=split b=single; else a=single b=split; fi
+      one "$i" "$a" "$ALPINE"; pa="$last_pool"
+      one "$i" "$b" "$ALPINE"; pb="$last_pool"
+      if [[ "$pa" == hit && "$pb" == hit ]]; then hits=$((hits + 1)); sleep 2
+      else echo "N1M warm $i pool $a=$pa $b=$pb; pausing ${MISS_PAUSE:-15}s"; sleep "${MISS_PAUSE:-15}"; fi
+    done
+    echo "N1 warm-rounds $i rounds, $hits with both sides from the pool" ;;
   burst)
     for mode in split single; do
       pin "$mode"

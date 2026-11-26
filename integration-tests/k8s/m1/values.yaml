@@ -32,9 +32,17 @@ worker:
     enabled: ~
   extraEnv:
     # The containerd warm pool, for N1's warm creates (gVisor, alpine).
+    # Depth 10 (m1d-3): with 5, m1d-2 lost 50 of 120 warm rounds to misses
+    # while the pools refilled after the cold phase.
     SB_CONTAINERD_POOL_ENABLED: "true"
-    SB_CONTAINERD_POOL_DEPTH: "5"
+    SB_CONTAINERD_POOL_DEPTH: "10"
     SB_CONTAINERD_POOL_IMAGES: "public.ecr.aws/docker/library/alpine:3.20"
+    # A pool also learns each image a create misses for and parks slots
+    # for it until the image is idle this long (the pinned image above is
+    # never dropped). The default, 15m, kept learned slots refilling beside
+    # N1's cold creates in m1d-3; at 60s they are gone before N1 starts
+    # (m1-eks.sh waits for that).
+    SB_CONTAINERD_POOL_IDLE_TTL: "60s"
 networkPolicy:
   enabled: true
 cluster:

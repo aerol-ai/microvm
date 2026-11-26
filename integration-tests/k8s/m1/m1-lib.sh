@@ -68,6 +68,11 @@ tfout() {
 refused=0
 gated=0
 refuse() { echo "m1-eks.sh: refusing to run: $*" >&2; refused=1; exit 2; }
+# bounded <seconds> <command...>: run a non-interactive read with a time
+# limit (perl's alarm survives exec; macOS has no GNU timeout). For the
+# kubectl exec checks a paid run polls: a stuck containerd or API server
+# must not hang the run.
+bounded() { perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$@"; }
 # refresh_credentials: one STS call in the foreground, at most
 # CRED_REFRESH_SECONDS (120) long, just before the teardown starts with no
 # terminal (detach). With an MFA assume-role profile whose cached
