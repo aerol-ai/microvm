@@ -229,6 +229,28 @@ func (r *selfRestart) reason() error {
 	return fmt.Errorf("sandboxd stopped to be started again: %w", r.err)
 }
 
+// cgroupParentNotifier is the containerd driver's OnCgroupParentMoved.
+type cgroupParentNotifier interface {
+	OnCgroupParentMoved(func(error))
+}
+
+// followCgroupParent stops sandboxd, to be started again with the new
+// parent, when the runtime container names another cgroup parent than the
+// one sandboxd started with: privilege mode single on Kubernetes, where the
+// parent file is set (cntr cgroup_parent_moved.go). Split hears the same
+// from its root helper (newRootHelper's onMoved); a node with no parent
+// file (a VM) checks nothing.
+func followCgroupParent(cfg config.Config, driver cgroupParentNotifier, logger *slog.Logger, restart func(error)) {
+	if driver == nil || cfg.PrivilegeMode == privmode.Split || cfg.ContainerdCgroupParentFile == "" {
+		return
+	}
+	driver.OnCgroupParentMoved(func(err error) {
+		logger.Error("the runtime container puts sandboxes under a new cgroup parent; sandboxd stops to start again with it",
+			"error", err)
+		restart(err)
+	})
+}
+
 // helperNetworkTimeout bounds one network call to the helper whose caller
 // set no deadline (the netns pool's refiller and the create path set none).
 var helperNetworkTimeout = rootclient.DefaultNetworkTimeout

@@ -283,6 +283,16 @@ type Config struct {
 	// outside the pod's CPU and memory box (plans/kubernetes-v2-architecture.md
 	// §8.3, C7; seen live in Phase 0 spike S1). SB_CONTAINERD_CGROUP_PARENT.
 	ContainerdCgroupParent string
+	// ContainerdCgroupParentFile is the file a Kubernetes worker's runtime
+	// container writes ContainerdCgroupParent to each time it starts (its
+	// supervisor, before it starts containerd). The parent is inside that
+	// container's own cgroup, so it is new after each restart, and sandboxd
+	// read it once, at its own start. With this set, privilege mode single
+	// reads the file again on each new connection to containerd and stops,
+	// for the kubelet to start it again, once it names another parent
+	// (containerd cgroup_parent_moved.go). Split learns the same from its
+	// root helper's handshake. SB_CONTAINERD_CGROUP_PARENT_FILE.
+	ContainerdCgroupParentFile string
 	// HostProcessCgroupParent is the cgroup (a path under the cgroup v2
 	// root) that the sandboxes sandboxd starts itself are made under: WASM
 	// workers, V8-isolate group hosts and their jail, Firecracker VMs. They
@@ -2551,6 +2561,7 @@ func load(keyTool bool) (Config, error) {
 		ContainerdNamespace:               getEnv("SB_CONTAINERD_NAMESPACE", "aerolvm"),
 		ContainerdRunDir:                  getEnv("SB_CONTAINERD_RUN_DIR", DefaultContainerdRunDir),
 		ContainerdCgroupParent:            strings.TrimSpace(os.Getenv("SB_CONTAINERD_CGROUP_PARENT")),
+		ContainerdCgroupParentFile:        strings.TrimSpace(os.Getenv("SB_CONTAINERD_CGROUP_PARENT_FILE")),
 		GvisorCheckpointMoves:             getEnvBool("SB_GVISOR_CHECKPOINT_MOVES", false),
 		HostProcessCgroupParent:           strings.TrimSpace(os.Getenv("SB_HOST_PROCESS_CGROUP_PARENT")),
 		ContainerdLogDir:                  strings.TrimSpace(os.Getenv("SB_CONTAINERD_LOG_DIR")),
@@ -3203,6 +3214,14 @@ func load(keyTool bool) (Config, error) {
 		}
 		if cfg.ContainerEngine != models.ContainerEngineContainerd {
 			return Config{}, errors.New("SB_CONTAINERD_CGROUP_PARENT needs SB_CONTAINER_ENGINE=containerd")
+		}
+	}
+	if f := cfg.ContainerdCgroupParentFile; f != "" {
+		if cfg.ContainerdCgroupParent == "" {
+			return Config{}, errors.New("SB_CONTAINERD_CGROUP_PARENT_FILE needs SB_CONTAINERD_CGROUP_PARENT: it is read again to check that parent")
+		}
+		if !filepath.IsAbs(f) || filepath.Clean(f) != f {
+			return Config{}, fmt.Errorf("SB_CONTAINERD_CGROUP_PARENT_FILE must be a clean absolute path, got %q", f)
 		}
 	}
 	if cfg.HostProcessCgroupParent == "" {

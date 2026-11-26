@@ -170,6 +170,12 @@ kube-state-metrics.
 - A crash in containerd or the supervisor: keep the log and open an issue.
 - Check whether other workers restarted too. Several at once point to the
   machines (a kernel or node image change), not to one pod.
+- Expect the worker's `agent` container to restart once too, in both
+  privilege modes. Sandboxes go under the `runtime` container's own
+  cgroup, which is new after a restart, and `sandboxd` reads where they go
+  only when it starts. So it stops, and the kubelet starts it again with
+  the new place. Its log says `sandboxd stops to start again with it`.
+  Creates on that worker fail until it is back.
 - Privilege mode `split`: after the restart the supervisor starts the root
   helper that ran before again, from its own checked copy. If the `runtime`
   log says `the root helper that ran last cannot start again` and then

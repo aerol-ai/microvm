@@ -112,6 +112,43 @@ func TestLoadContainerdCgroupParent(t *testing.T) {
 	}
 }
 
+// SB_CONTAINERD_CGROUP_PARENT_FILE is the runtime container's copy of the
+// parent, read again to notice that it moved (containerd
+// cgroup_parent_moved.go). It is a clean absolute path, and only with a
+// parent to check.
+func TestLoadContainerdCgroupParentFile(t *testing.T) {
+	const pod = "/kubepods.slice/kubepods-podx.slice/cri-containerd-y.scope/sandboxes"
+	for _, tc := range []struct {
+		name, parent, file, wantErr string
+	}{
+		{"unset", pod, "", ""},
+		{"with the parent", pod, "/run/aerolvm/cgroup-parent", ""},
+		{"without a parent refused", "", "/run/aerolvm/cgroup-parent", "needs SB_CONTAINERD_CGROUP_PARENT"},
+		{"relative refused", pod, "run/aerolvm/cgroup-parent", "SB_CONTAINERD_CGROUP_PARENT_FILE must be a clean absolute path"},
+		{"unclean refused", pod, "/run/aerolvm/../cgroup-parent", "SB_CONTAINERD_CGROUP_PARENT_FILE must be a clean absolute path"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SB_PAT_TOKEN", "operator-pat")
+			t.Setenv("SB_CONTAINER_ENGINE", "containerd")
+			t.Setenv("SB_CONTAINERD_CGROUP_PARENT", tc.parent)
+			t.Setenv("SB_CONTAINERD_CGROUP_PARENT_FILE", tc.file)
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to mention %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.ContainerdCgroupParentFile != tc.file {
+				t.Fatalf("ContainerdCgroupParentFile = %q, want %q", cfg.ContainerdCgroupParentFile, tc.file)
+			}
+		})
+	}
+}
+
 // The sandboxes sandboxd starts itself (WASM, V8 isolates, Firecracker) go
 // under SB_HOST_PROCESS_CGROUP_PARENT, by default the containerd parent, so
 // in a worker pod they stay inside the runtime container's sandboxes group
