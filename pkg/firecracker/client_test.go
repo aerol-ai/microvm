@@ -429,3 +429,25 @@ func TestEnclaveSendsEveryField(t *testing.T) {
 		t.Fatalf("Enclave{} = %s, want %s", got, want)
 	}
 }
+
+// GetMachineConfig reads back what Firecracker reports, as Firecracker
+// names the fields.
+func TestGetMachineConfig(t *testing.T) {
+	sock := startUDSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/machine-config" || r.Method != http.MethodGet {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"vcpu_count":2,"mem_size_mib":768,"smt":false,"track_dirty_pages":false}`))
+	}))
+	got, err := New(sock).GetMachineConfig(context.Background())
+	if err != nil || got.VcpuCount != 2 || got.MemSizeMib != 768 {
+		t.Fatalf("GetMachineConfig = %+v, %v", got, err)
+	}
+	bad := startUDSServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"fault_message":"nope"}`))
+	}))
+	if _, err := New(bad).GetMachineConfig(context.Background()); err == nil {
+		t.Fatal("an API error came back as a config")
+	}
+}

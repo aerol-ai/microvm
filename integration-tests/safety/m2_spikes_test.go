@@ -507,11 +507,19 @@ func TestM2SpikeUserDataHasADeadlineAndChecksums(t *testing.T) {
 
 // nitroStandIn is sandboxd on a Nitro node, as far as the SP-B "sandboxd"
 // step (spb_sandboxd.py, plan §4.3) asks it things. noEgress makes every
-// guest fail to reach the internet.
+// guest fail to reach the internet; loseEnv makes a start come back
+// without the sandbox's env.
 type nitroStandIn struct {
 	mu       sync.Mutex
 	next     int
 	noEgress bool
+	loseEnv  bool
+	sb       map[string]*nitroGuest
+}
+
+type nitroGuest struct {
+	env, file string
+	boot      int
 }
 
 func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -525,6 +533,16 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	refuse := func(op string) {
 		reply(http.StatusNotImplemented, map[string]string{"error": `runtime "firecracker-nitro" cannot ` + op + ` yet on this build: runtime not yet implemented on this build`})
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sb == nil {
+		s.sb = map[string]*nitroGuest{}
+	}
+	parts := strings.Split(r.URL.Path, "/")
+	var g *nitroGuest
+	if len(parts) > 3 {
+		g = s.sb[parts[3]]
+	}
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/runtimes":
 		reply(200, map[string]any{"runtimes": []map[string]any{
@@ -537,10 +555,11 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reply(http.StatusNotImplemented, map[string]string{"error": fmt.Sprintf(`runtime %q is not offered here (offered: docker, firecracker-nitro)`, body["runtime"])})
 			return
 		}
-		s.mu.Lock()
 		s.next++
 		id := fmt.Sprintf("sb-%d", s.next)
-		s.mu.Unlock()
+		env, _ := body["env"].(map[string]any)
+		val, _ := env["SPB_ENV"].(string)
+		s.sb[id] = &nitroGuest{env: val}
 		reply(http.StatusCreated, map[string]any{"id": id, "status": "started", "runtime": "firecracker-nitro", "backend": "nitro"})
 	case strings.HasSuffix(r.URL.Path, "/toolbox/process/execute"):
 		cmd, _ := body["command"].(string)
@@ -555,6 +574,16 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if s.noEgress {
 				out = "net-fail"
 			}
+		case strings.Contains(cmd, "> /root/spb-keep.txt"):
+			g.file = "persist"
+		case cmd == "cat /root/spb-keep.txt":
+			out = g.file
+		case cmd == "echo $SPB_ENV":
+			out = g.env
+		case cmd == "cat /proc/sys/kernel/random/boot_id":
+			out = fmt.Sprintf("boot-%d", g.boot)
+		case strings.HasPrefix(cmd, "ip -4 -o addr show eth0"):
+			out = "172.16.0.2/30"
 		case cmd == "uname -r":
 			out = "6.18.62"
 		case cmd == "cat /proc/cmdline":
@@ -564,7 +593,13 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(200, map[string]any{"stdout": out, "exit_code": 0})
 	case strings.HasSuffix(r.URL.Path, "/stop"):
-		refuse("stop")
+		reply(200, map[string]any{"status": "stopped"})
+	case strings.HasSuffix(r.URL.Path, "/start"):
+		g.boot++
+		if s.loseEnv {
+			g.env = ""
+		}
+		reply(200, map[string]any{"status": "started"})
 	case strings.HasSuffix(r.URL.Path, "/snapshot"):
 		refuse("take a snapshot")
 	case r.Method == http.MethodDelete:
@@ -582,15 +617,16 @@ func (s *nitroStandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func TestM2SPBSandboxdStepVerdict(t *testing.T) {
 	needTools(t, "python3")
 	for _, c := range []struct {
-		name     string
-		noEgress bool
-		want     string
+		name              string
+		noEgress, loseEnv bool
+		want              string
 	}{
-		{"guests reach the internet", false, "VERDICT SP-B: go"},
-		{"guests cannot reach the internet", true, "VERDICT SP-B: NO GO"},
+		{"guests reach the internet and keep their env across a start", false, false, "VERDICT SP-B: go"},
+		{"guests cannot reach the internet", true, false, "VERDICT SP-B: NO GO"},
+		{"a start loses the env", false, true, "VERDICT SP-B: NO GO"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			srv := httptest.NewServer(&nitroStandIn{noEgress: c.noEgress})
+			srv := httptest.NewServer(&nitroStandIn{noEgress: c.noEgress, loseEnv: c.loseEnv})
 			defer srv.Close()
 			dir := t.TempDir()
 			pat, results := filepath.Join(dir, "pat"), filepath.Join(dir, "results.jsonl")

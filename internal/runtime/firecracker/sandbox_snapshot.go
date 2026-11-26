@@ -42,6 +42,12 @@ type sandboxSnapshotManifest struct {
 	// Start restores that CPU. Empty in manifests written before it:
 	// unknown, which counts as on.
 	NestedVirt firecracker.NestedVirt `json:"nested_virt,omitempty"`
+	// Cold: the stop kept the disks and no memory (a Nitro VM, nitro.go),
+	// so Start boots the VM again from them, with VcpuCount and MemSizeMib.
+	// False (absent) in every KVM manifest: memory and state are there.
+	Cold       bool `json:"cold,omitempty"`
+	VcpuCount  int  `json:"vcpu_count,omitempty"`
+	MemSizeMib int  `json:"mem_size_mib,omitempty"`
 }
 
 // guestFlush is how the guest's freeze_fs before a Stop went.
@@ -262,6 +268,39 @@ func isUnknownOp(err error) bool {
 }
 
 func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, handle VMMHandle, client VMMClient, guestCID uint32, flush guestFlush) error {
+	return d.writeStopDir(ctx, sandboxID, handle.RunDir(), func(tmpDir string) (sandboxSnapshotManifest, []string, error) {
+		tmpMem := filepath.Join(tmpDir, sandboxSnapshotMemoryFileName)
+		tmpState := filepath.Join(tmpDir, sandboxSnapshotStateFileName)
+		if err := d.createSnapshotArtifacts(ctx, client, handle.RunDir(), tmpMem, tmpState); err != nil {
+			return sandboxSnapshotManifest{}, nil, fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
+		}
+		memDigest, _, err := hashFile(tmpMem)
+		if err != nil {
+			return sandboxSnapshotManifest{}, nil, fmt.Errorf("firecracker runtime: stop %s: hash memory: %w", sandboxID, err)
+		}
+		stateDigest, _, err := hashFile(tmpState)
+		if err != nil {
+			return sandboxSnapshotManifest{}, nil, fmt.Errorf("firecracker runtime: stop %s: hash state: %w", sandboxID, err)
+		}
+		return sandboxSnapshotManifest{
+			Version:          1,
+			SandboxID:        sandboxID,
+			VsockCID:         guestCID,
+			SnapshotChecksum: formatSnapshotChecksum(memDigest, stateDigest),
+			CreatedAt:        time.Now().UTC(),
+			GuestFlush:       flush,
+			NestedVirt:       d.vmNestedVirt(sandboxID),
+		}, []string{tmpMem, tmpState}, nil
+	})
+}
+
+// writeStopDir writes a stopped sandbox's folder and puts it in place of
+// the last one. fill writes what only some stops keep (a KVM VM's memory
+// and state) into tmpDir and returns the manifest and those files; the
+// disks under runDir are copied here for every stop. The folder is built
+// beside the live one and swapped in by rename, so a crash leaves either
+// the old folder or the new one, never half of either.
+func (d *Driver) writeStopDir(ctx context.Context, sandboxID, runDir string, fill func(tmpDir string) (sandboxSnapshotManifest, []string, error)) error {
 	base, err := d.sandboxSnapshotBase()
 	if err != nil {
 		return err
@@ -286,13 +325,12 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 		}
 	}()
 
-	tmpMem := filepath.Join(tmpDir, sandboxSnapshotMemoryFileName)
-	tmpState := filepath.Join(tmpDir, sandboxSnapshotStateFileName)
-	if err := d.createSnapshotArtifacts(ctx, client, handle.RunDir(), tmpMem, tmpState); err != nil {
-		return fmt.Errorf("firecracker runtime: stop %s: %w", sandboxID, err)
+	manifest, syncPaths, err := fill(tmpDir)
+	if err != nil {
+		return err
 	}
 
-	srcRootfs := filepath.Join(handle.RunDir(), rootfsFileName)
+	srcRootfs := filepath.Join(runDir, rootfsFileName)
 	tmpRootfs := filepath.Join(tmpDir, sandboxSnapshotRootfsFileName)
 	copyDisk := copyFile
 	if d.split != nil {
@@ -306,11 +344,10 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 		return fmt.Errorf("firecracker runtime: stop %s: copy rootfs: %w", sandboxID, err)
 	}
 
-	hasOverlay := false
-	srcOverlay := filepath.Join(handle.RunDir(), overlayFileName)
+	srcOverlay := filepath.Join(runDir, overlayFileName)
 	tmpOverlay := filepath.Join(tmpDir, sandboxSnapshotOverlayFileName)
 	if _, err := os.Stat(srcOverlay); err == nil {
-		hasOverlay = true
+		manifest.HasOverlay = true
 		if err := copyDisk(srcOverlay, tmpOverlay); err != nil {
 			return fmt.Errorf("firecracker runtime: stop %s: copy overlay: %w", sandboxID, err)
 		}
@@ -318,24 +355,6 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 		return fmt.Errorf("firecracker runtime: stop %s: stat overlay: %w", sandboxID, err)
 	}
 
-	memDigest, _, err := hashFile(tmpMem)
-	if err != nil {
-		return fmt.Errorf("firecracker runtime: stop %s: hash memory: %w", sandboxID, err)
-	}
-	stateDigest, _, err := hashFile(tmpState)
-	if err != nil {
-		return fmt.Errorf("firecracker runtime: stop %s: hash state: %w", sandboxID, err)
-	}
-	manifest := sandboxSnapshotManifest{
-		Version:          1,
-		SandboxID:        sandboxID,
-		VsockCID:         guestCID,
-		SnapshotChecksum: formatSnapshotChecksum(memDigest, stateDigest),
-		HasOverlay:       hasOverlay,
-		CreatedAt:        time.Now().UTC(),
-		GuestFlush:       flush,
-		NestedVirt:       d.vmNestedVirt(sandboxID),
-	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		return fmt.Errorf("firecracker runtime: stop %s: marshal manifest: %w", sandboxID, err)
@@ -344,8 +363,8 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 	if err := os.WriteFile(tmpManifest, append(raw, '\n'), 0o600); err != nil {
 		return fmt.Errorf("firecracker runtime: stop %s: write manifest: %w", sandboxID, err)
 	}
-	syncPaths := []string{tmpMem, tmpState, tmpRootfs, tmpManifest}
-	if hasOverlay {
+	syncPaths = append(syncPaths, tmpRootfs, tmpManifest)
+	if manifest.HasOverlay {
 		syncPaths = append(syncPaths, tmpOverlay)
 	}
 	for _, path := range syncPaths {
@@ -381,6 +400,25 @@ func (d *Driver) writeSandboxSnapshot(ctx context.Context, sandboxID string, han
 }
 
 func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
+	if state, err := d.startChecks(ctx, sandboxID); err != nil || state != nil {
+		return state, err
+	}
+	if d.nitro() {
+		// Only StartWithIdentityEnv can start a Nitro VM: it boots afresh
+		// and needs the env.
+		return nil, errNitroStartNeedsEnv
+	}
+	// A restore must be able to adopt the guest it boots (see below).
+	if strings.TrimSpace(toolboxToken) == "" {
+		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, errGuestTokenMissing)
+	}
+	return d.restoreSandboxSnapshot(ctx, sandboxID, toolboxToken)
+}
+
+// startChecks is what every start checks first: the ID, the wiring, and a
+// VM that already runs, whose state it returns (a start is idempotent). A
+// nil state and nil error mean: go on and boot it.
+func (d *Driver) startChecks(ctx context.Context, sandboxID string) (*models.SandboxRuntimeState, error) {
 	if err := validateSandboxID(sandboxID); err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start: %w", err)
 	}
@@ -414,17 +452,18 @@ func (d *Driver) startFromSandboxSnapshot(ctx context.Context, sandboxID, toolbo
 		}, nil
 	}
 	d.mu.Unlock()
-	if d.nitro() {
-		return nil, errNitroNotYet("start a stopped sandbox")
-	}
-	// A restore must be able to adopt the guest it boots (see below).
-	if strings.TrimSpace(toolboxToken) == "" {
-		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, errGuestTokenMissing)
-	}
+	return nil, nil
+}
 
+// restoreSandboxSnapshot is a KVM start: the VM's memory and state come
+// back from the snapshot Stop wrote, on the sandbox's TAP slot.
+func (d *Driver) restoreSandboxSnapshot(ctx context.Context, sandboxID, toolboxToken string) (*models.SandboxRuntimeState, error) {
 	manifest, err := d.readSandboxSnapshotManifest(sandboxID)
 	if err != nil {
 		return nil, fmt.Errorf("firecracker runtime: start %s: %w", sandboxID, err)
+	}
+	if manifest.Cold {
+		return nil, fmt.Errorf("firecracker runtime: start %s: it was stopped by a Nitro node, which keeps no memory to restore", sandboxID)
 	}
 	dir, memPath, statePath, snapshotRootfs, snapshotOverlay, _ := d.sandboxSnapshotPaths(sandboxID)
 	if d.cfg.SnapshotVerifyOnLoad && manifest.SnapshotChecksum != "" {

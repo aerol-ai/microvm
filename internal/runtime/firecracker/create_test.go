@@ -402,6 +402,7 @@ type fakeClient struct {
 	nicErr            error
 	vsockErr          error
 	enclaveErr        error
+	getMachineErr     error
 	actionErr         error
 	patchVMErr        error
 	snapshotCreateErr error
@@ -472,6 +473,20 @@ func (c *fakeClient) PutEnclave(_ context.Context, e firecracker.Enclave) error 
 	c.enclave = &e
 	c.restOrder = append(c.restOrder, "PutEnclave")
 	return c.enclaveErr
+}
+
+func (c *fakeClient) GetMachineConfig(_ context.Context) (*firecracker.MachineConfig, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.restOrder = append(c.restOrder, "GetMachineConfig")
+	if c.getMachineErr != nil {
+		return nil, c.getMachineErr
+	}
+	if c.mc == nil {
+		return nil, errors.New("fake: no machine config was put")
+	}
+	mc := *c.mc
+	return &mc, nil
 }
 
 func (c *fakeClient) Action(_ context.Context, a firecracker.Action) error {

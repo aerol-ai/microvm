@@ -106,6 +106,14 @@ func TestClusterOwnershipHelperCoverage(t *testing.T) {
 	if !isStoppedFirecrackerSnapshotRow(&models.Sandbox{Runtime: models.RuntimeFirecracker, Status: models.SandboxStatusStopped}) {
 		t.Fatal("stopped firecracker sandbox should qualify")
 	}
+	// A stopped Nitro VM's kept disk is on this node only, as a KVM
+	// snapshot is.
+	if !isStoppedFirecrackerSnapshotRow(&models.Sandbox{Runtime: models.RuntimeFirecrackerNitro, Status: models.SandboxStatusStopped}) {
+		t.Fatal("stopped firecracker-nitro row not detected")
+	}
+	if isStoppedFirecrackerSnapshotRow(&models.Sandbox{Runtime: models.RuntimeFirecrackerNitro, Status: models.SandboxStatusStarted}) {
+		t.Fatal("a running firecracker-nitro row is not a stopped one")
+	}
 	if isStoppedFirecrackerSnapshotRow(&models.Sandbox{Runtime: models.RuntimeDocker, Status: models.SandboxStatusStopped}) {
 		t.Fatal("docker sandbox should not qualify")
 	}

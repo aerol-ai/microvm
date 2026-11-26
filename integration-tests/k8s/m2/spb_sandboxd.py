@@ -11,8 +11,11 @@ Checks, each recorded:
     through its TAP, and is deleted; create time from the API;
   - the guest: its kernel, its boot line (no pci=off, the agent's init),
     whether it sees VMX (information);
-  - what a Nitro sandbox cannot do answers 501 with the runtime's name:
-    stop, snapshot; a create for "firecracker" is refused here;
+  - stop and start on the first sandbox: a file written before the stop is
+    there after the start, the env comes back, the address is the same,
+    and the boot ID is new (no memory is kept on Nitro);
+  - what a Nitro sandbox cannot do answers 501 with the runtime's name
+    (a snapshot); a create for "firecracker" is refused here;
   - nothing left: no Firecracker process and no sandbox TAP after the
     deletes.
 
@@ -103,7 +106,10 @@ def runtimes(record, say):
 def one(i, say):
     """One sandbox, end to end. Returns (result dict, create ms or None)."""
     r = {"i": i}
-    st, js, ms = call("POST", "/v1/sandboxes", {"image": IMAGE, "runtime": NITRO, "memory_mb": 512, "cpu": 1})
+    body = {"image": IMAGE, "runtime": NITRO, "memory_mb": 512, "cpu": 1}
+    if i == 0:
+        body["env"] = {"SPB_ENV": "kept-across-start"}
+    st, js, ms = call("POST", "/v1/sandboxes", body)
     sid = (js or {}).get("id")
     if st >= 300 or not sid:
         r["create_error"] = "HTTP %s %s" % (st, json.dumps(js)[:400])
@@ -122,9 +128,7 @@ def one(i, say):
             _, r["guest_kernel"] = run_cmd(sid, "uname -r")
             _, r["guest_cmdline"] = run_cmd(sid, "cat /proc/cmdline")
             _, r["guest_vmx"] = run_cmd(sid, "grep -c -w -e vmx -e svm /proc/cpuinfo || true")
-            st, js, _ = call("POST", "/v1/sandboxes/%s/stop" % sid)
-            r["stop_refused"] = st == 501 and NITRO in json.dumps(js)
-            r["stop_answer"] = "HTTP %s %s" % (st, json.dumps(js)[:240])
+            r.update(stop_start(sid, say))
             st, js, _ = call("POST", "/v1/sandboxes/%s/snapshot" % sid, {"name": "spb-nitro-snap"})
             r["snapshot_refused"] = st == 501 and NITRO in json.dumps(js)
             r["snapshot_answer"] = "HTTP %s %s" % (st, json.dumps(js)[:240])
@@ -134,6 +138,34 @@ def one(i, say):
     say("sandboxd sample %d: %s create %.0f ms exec=%s file=%s egress=%s deleted=%s"
         % (i, sid, ms, r.get("exec"), r.get("file"), r.get("egress"), r.get("deleted")))
     return r, ms
+
+
+def stop_start(sid, say):
+    """Stop and start one sandbox; what it keeps and what it does not."""
+    r = {}
+    run_cmd(sid, "echo persist > /root/spb-keep.txt && sync")
+    _, boot_before = run_cmd(sid, "cat /proc/sys/kernel/random/boot_id")
+    _, ip_before = run_cmd(sid, "ip -4 -o addr show eth0 | awk '{print $4}'")
+    st, js, stop_ms = call("POST", "/v1/sandboxes/%s/stop" % sid)
+    r["stop_answer"] = "HTTP %s %s" % (st, json.dumps(js)[:240])
+    stopped = st < 300
+    st, js, start_ms = call("POST", "/v1/sandboxes/%s/start" % sid)
+    r["start_answer"] = "HTTP %s %s" % (st, json.dumps(js)[:240])
+    started = st < 300
+    _, kept = run_cmd(sid, "cat /root/spb-keep.txt")
+    _, env = run_cmd(sid, "echo $SPB_ENV")
+    _, boot_after = run_cmd(sid, "cat /proc/sys/kernel/random/boot_id")
+    _, ip_after = run_cmd(sid, "ip -4 -o addr show eth0 | awk '{print $4}'")
+    r.update({
+        "stop_ms": round(stop_ms), "start_ms": round(start_ms),
+        "file_kept": kept == "persist", "env_kept": env == "kept-across-start",
+        "same_address": bool(ip_before) and ip_before == ip_after,
+        "new_boot": bool(boot_before) and bool(boot_after) and boot_before != boot_after,
+    })
+    r["stop_start_ok"] = stopped and started and r["file_kept"] and r["env_kept"] and r["same_address"] and r["new_boot"]
+    say("sandboxd stop/start: stop %s ms, start %s ms; file kept %s, env kept %s, same address %s (%s), new boot %s"
+        % (r["stop_ms"], r["start_ms"], r["file_kept"], r["env_kept"], r["same_address"], ip_after, r["new_boot"]))
+    return r
 
 
 def run(a, record, say):
@@ -163,7 +195,8 @@ def run(a, record, say):
         "runtimes_ok": ok_runtimes, "kvm_create_refused": kvm_refused, "kvm_create_answer": "HTTP %s %s" % (st, json.dumps(js)[:240]),
         "guest_kernel": first.get("guest_kernel"), "guest_cmdline": cmdline, "guest_vmx_lines": first.get("guest_vmx"),
         "boot_line_ok": "pci=off" not in cmdline.split() and "init=/usr/local/bin/toolboxd-init" in cmdline.split(),
-        "stop_refused": first.get("stop_refused"), "stop_answer": first.get("stop_answer"),
+        "stop_start_ok": first.get("stop_start_ok"), "stop_ms": first.get("stop_ms"), "start_ms": first.get("start_ms"),
+        "stop_answer": first.get("stop_answer"), "start_answer": first.get("start_answer"),
         "snapshot_refused": first.get("snapshot_refused"), "snapshot_answer": first.get("snapshot_answer"),
         "leftovers": leftovers, "results": results,
     }
@@ -179,12 +212,12 @@ def verdict(r):
     p50 = (r.get("create_ms") or {}).get("p50_ms")
     left = r.get("leftovers") or {}
     ok = (r.get("samples", 0) > 0 and r.get("passed") == r.get("samples") and r.get("runtimes_ok")
-          and r.get("kvm_create_refused") and r.get("boot_line_ok") and r.get("stop_refused") and r.get("snapshot_refused")
+          and r.get("kvm_create_refused") and r.get("boot_line_ok") and r.get("stop_start_ok") and r.get("snapshot_refused")
           and left.get("firecracker_processes") == 0 and left.get("sandbox_taps") == 0
           and p50 is not None and p50 < COLD_GO_MS)
     text = ("%s of %s sandboxes passed through sandboxd (create p50 %s ms, go under %g); runtimes %s; firecracker refused %s; "
-            "boot line %s; stop refused %s; snapshot refused %s; left: %s processes, %s TAPs; guest %s, vmx lines %s"
+            "boot line %s; stop/start %s (stop %s ms, start %s ms); snapshot refused %s; left: %s processes, %s TAPs; guest %s, vmx lines %s"
             % (r.get("passed"), r.get("samples"), p50, COLD_GO_MS, r.get("runtimes_ok"), r.get("kvm_create_refused"),
-               r.get("boot_line_ok"), r.get("stop_refused"), r.get("snapshot_refused"), left.get("firecracker_processes"),
-               left.get("sandbox_taps"), r.get("guest_kernel"), r.get("guest_vmx_lines")))
+               r.get("boot_line_ok"), r.get("stop_start_ok"), r.get("stop_ms"), r.get("start_ms"), r.get("snapshot_refused"),
+               left.get("firecracker_processes"), left.get("sandbox_taps"), r.get("guest_kernel"), r.get("guest_vmx_lines")))
     return bool(ok), text

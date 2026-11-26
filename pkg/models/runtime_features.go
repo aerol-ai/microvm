@@ -148,7 +148,8 @@ var runtimeTable = []RuntimeInfo{
 		// Firecracker through Nitro Sandboxes (plans/security-gaps-m1-m4.md
 		// §4.3): the same driver on SB_FIRECRACKER_BACKEND=nitro nodes. AWS
 		// gives a Nitro VM no memory snapshots and no paused state, so no
-		// snapshots, no pause and no memory moves; no warm pool yet.
+		// snapshots, no pause and no memory moves; no warm pool yet. Stop
+		// keeps the disk and Start boots it again (firecracker nitro.go).
 		Name:      RuntimeFirecrackerNitro,
 		Isolation: IsolationHardwareVM,
 		Backend:   "nitro",
