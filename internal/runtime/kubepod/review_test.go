@@ -259,7 +259,7 @@ func TestInClusterClientRefusesAnotherServer(t *testing.T) {
 	if served.Load() {
 		t.Error("the request reached the impostor: no token may be sent to an unchecked server")
 	}
-	if err := c.WatchPods(context.Background(), "ns", "", "", func(WatchEvent) error { return nil }); err == nil || !strings.Contains(err.Error(), "certificate") {
+	if err := c.WatchPods(context.Background(), "ns", "", "", nil, func(WatchEvent) error { return nil }); err == nil || !strings.Contains(err.Error(), "certificate") {
 		t.Fatalf("WatchPods = %v, want a certificate error", err)
 	}
 }
