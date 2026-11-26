@@ -494,6 +494,13 @@ system user with no login shell and a group of its own. The bootstrap makes
 it on each Firecracker node and writes its ids to `/etc/sandboxd/cluster.env`
 (`install.sh` does this in split).
 
+When you upgrade this module, a single-mode Firecracker node's start script
+changes, so the next `terraform apply` replaces that node (nodes use
+`user_data_replace_on_change`). The new node comes up with `sandboxd-jailer`.
+To keep your nodes instead, first set `jailer_uid = 1000` and
+`jailer_gid = 1000` in `firecracker` in `terraform.tfvars`: the start script
+then stays byte for byte the same, and you fix each node as below.
+
 Nodes made before this change have `SB_JAILER_UID=1000` and
 `SB_JAILER_GID=1000` in `cluster.env`. On Ubuntu and Amazon Linux images uid
 1000 is the login user (`ubuntu`, `ec2-user`), with a login shell and sudo.
