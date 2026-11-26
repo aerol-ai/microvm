@@ -256,7 +256,11 @@ func TestBuildImageChildRefusesHostileContexts(t *testing.T) {
 
 // The parent refuses a root owner before it makes anything or starts a child.
 func TestUnpackContextInChildRefusesRootOwner(t *testing.T) {
-	for _, ids := range [][2]int{{0, 1}, {1, 0}, {-1, 1}, {1, 1 << 32}} {
+	// A gid past 32 bits goes through asInt: as a constant it would not
+	// compile on a 32-bit build. There it wraps to 0, root, and is still
+	// refused.
+	asInt := func(n int64) int { return int(n) }
+	for _, ids := range [][2]int{{0, 1}, {1, 0}, {-1, 1}, {1, asInt(1 << 32)}} {
 		dir := filepath.Join(t.TempDir(), "context")
 		err := unpackContextInChild(context.Background(), nil, dir, ids[0], ids[1])
 		if err == nil || !strings.Contains(err.Error(), "non-root") {

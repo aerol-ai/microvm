@@ -252,10 +252,15 @@ func TestContextIDPool(t *testing.T) {
 	if p := b.contextIDs; p.uidBase != config.DefaultBuildContextIDBase || p.gidBase != config.DefaultBuildContextIDBase || cap(p.free) != config.BuildContextIDCount {
 		t.Fatalf("default pool = %d/%d x%d", p.uidBase, p.gidBase, cap(p.free))
 	}
-	if b.WithContextIDBase(3_000_000_000) != b || b.contextIDs.uidBase != 3_000_000_000 || b.contextIDs.gidBase != 3_000_000_000 {
+	// A base past a 32-bit int goes through a variable: as a constant it
+	// would not compile on a 32-bit build. There it wraps, and the pool
+	// still keeps and shares the base it is given.
+	var wide int64 = 3_000_000_000
+	high := int(wide)
+	if b.WithContextIDBase(high) != b || b.contextIDs.uidBase != high || b.contextIDs.gidBase != high {
 		t.Fatalf("WithContextIDBase: %d/%d", b.contextIDs.uidBase, b.contextIDs.gidBase)
 	}
-	if NewBuildKitBuilder("", "", nil).WithContextIDBase(3_000_000_000).contextIDs != b.contextIDs {
+	if NewBuildKitBuilder("", "", nil).WithContextIDBase(high).contextIDs != b.contextIDs {
 		t.Fatal("two builders on one range must share its pool")
 	}
 

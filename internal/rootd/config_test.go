@@ -332,8 +332,20 @@ func TestConfigFromEnvRefuses(t *testing.T) {
 			for k, v := range tc.env {
 				e[k] = v
 			}
-			if _, err := ConfigFromEnv(env(e)); err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("ConfigFromEnv = %v, want an error naming %q", err, tc.want)
+			// A 32-bit build refuses a number past its int sooner, in the
+			// parser, as not a whole number: either refusal will do there.
+			// A 64-bit build must give tc.want.
+			wants := []string{tc.want}
+			if strconv.IntSize == 32 {
+				for k, v := range tc.env {
+					if _, err := strconv.Atoi(v); errors.Is(err, strconv.ErrRange) {
+						wants = append(wants, k+"="+strconv.Quote(v)+": want a whole number")
+					}
+				}
+			}
+			_, err := ConfigFromEnv(env(e))
+			if err == nil || !slices.ContainsFunc(wants, func(w string) bool { return strings.Contains(err.Error(), w) }) {
+				t.Fatalf("ConfigFromEnv = %v, want an error naming one of %q", err, wants)
 			}
 		})
 	}
@@ -366,8 +378,16 @@ func TestHostsConfigRefusesWrappingIDs(t *testing.T) {
 	} {
 		h := good()
 		h.Wasm.UID, h.Wasm.GID = int(tc.uid), int(tc.gid)
-		if err := h.validate(); err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("%s: %v, want an error naming %q", tc.name, err, tc.want)
+		// A 32-bit build wraps an id past its int in the conversion above
+		// (to -1, root or the agent), and refuses it as that id: either
+		// refusal will do there. A 64-bit build must give tc.want.
+		wants := []string{tc.want}
+		if strconv.IntSize == 32 && (int64(h.Wasm.UID) != tc.uid || int64(h.Wasm.GID) != tc.gid) {
+			wants = append(wants, "neither root nor the agent")
+		}
+		err := h.validate()
+		if err == nil || !slices.ContainsFunc(wants, func(w string) bool { return strings.Contains(err.Error(), w) }) {
+			t.Errorf("%s: %v, want an error naming one of %q", tc.name, err, wants)
 		}
 	}
 }
