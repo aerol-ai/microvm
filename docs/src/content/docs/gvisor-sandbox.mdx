@@ -225,6 +225,8 @@ On a cluster, set `with_gvisor = true` on each worker in Terraform's `nodes` (se
 
 If a create fails with `runtime "gvisor" not supported on this host`, the server does not list gVisor in `SB_HOST_RUNTIMES`. Add it there and restart the server.
 
+The server offers a runtime from `SB_HOST_RUNTIMES` only when that runtime is turned on. `firecracker` needs `SB_ENABLE_FIRECRACKER=true`, `wasm` needs `SB_ENABLE_WASM=true`, and `isolate` needs `SB_ENABLE_ISOLATE=true`. On a cluster, `wasm` and `isolate` also need a node whose role has `worker` in it, or is `mixed`. If a listed runtime is not turned on, the server does not offer it, and it logs one warning at start that names it. If no runtime is left, the server offers `docker`. `docker` and `gvisor` have no switch, so they always stay on the list.
+
 ## Next steps
 
 - [Choose a runtime](/choose-isolation/): compare every runtime and pick one per sandbox.
