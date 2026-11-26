@@ -4,6 +4,7 @@ runtime/docker
 runtime/gvisor
 runtime/kata
 runtime/firecracker
+runtime/firecracker-nitro
 runtime/wasm
 runtime/isolate
 --- stderr

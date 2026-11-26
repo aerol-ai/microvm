@@ -159,6 +159,14 @@ const (
 	// (a different shape — Kata-with-Firecracker abstracts the snapshot
 	// API away and is not what this constant refers to).
 	RuntimeFirecracker = "firecracker"
+	// RuntimeFirecrackerNitro is a Firecracker VM on the Nitro backend:
+	// the same driver, run through Nitro Enclaves' direct mode instead of
+	// KVM, on ordinary (not metal) EC2 machines
+	// (plans/security-gaps-m1-m4.md §4.3). A separate name, so a create for
+	// "firecracker" always gets today's KVM VM with snapshots and pause, and
+	// is never moved to a backend that has neither. Reserved until the Nitro
+	// driver lands: every create refuses it (ErrRuntimeNotImplemented).
+	RuntimeFirecrackerNitro = "firecracker-nitro"
 	// RuntimeWasm selects the WASM/WASI runtime (plans/wasm-runtime.md).
 	// ValidRuntime accepts the identifier ahead of the implementation; create
 	// rejects with ErrRuntimeNotImplemented until SB_ENABLE_WASM lands.
@@ -301,11 +309,11 @@ func (g *GPURequest) Validate() error {
 // the runtime layer, we should already know the value is one we can act on.
 func ValidRuntime(value string) (string, error) {
 	switch value {
-	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm, RuntimeIsolate:
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeFirecrackerNitro, RuntimeWasm, RuntimeIsolate:
 		return value, nil
 	default:
-		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s, %s, %s)",
-			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeWasm, RuntimeIsolate)
+		return "", fmt.Errorf("unsupported runtime %q (allowed: %s, %s, %s, %s, %s, %s, %s)",
+			value, RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeFirecrackerNitro, RuntimeWasm, RuntimeIsolate)
 	}
 }
 
@@ -317,7 +325,7 @@ func ValidRuntime(value string) (string, error) {
 // ready gateway.
 func RuntimeUsesEgressGateway(runtime string) bool {
 	switch runtime {
-	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker:
+	case "", RuntimeDocker, RuntimeGvisor, RuntimeKata, RuntimeFirecracker, RuntimeFirecrackerNitro:
 		return true
 	}
 	return false
@@ -407,7 +415,7 @@ func ResolveOCIRuntime(value string) (string, error) {
 		return "runsc", nil
 	case RuntimeKata:
 		return "", ErrRuntimeNotImplemented
-	case RuntimeFirecracker, RuntimeWasm, RuntimeIsolate:
+	case RuntimeFirecracker, RuntimeFirecrackerNitro, RuntimeWasm, RuntimeIsolate:
 		// Firecracker, WASM, and isolate are not OCI runtimes Docker can shell
 		// out to. Reaching this branch means the service layer failed to
 		// dispatch the request away from the Docker driver.

@@ -2402,12 +2402,12 @@ func (s *Service) createSandbox(ctx context.Context, req models.CreateSandboxReq
 	if chosenRuntime == "" {
 		chosenRuntime = s.cfg.Runtime
 	}
-	// "kata" is reserved as a future runtime. Accept it through validation
-	// (so operators can pre-stage the host default) but reject individual
-	// create requests until the runtime is wired up. Surfaced as a clear
-	// 4xx-shaped error so clients see "not implemented" rather than a
-	// generic Docker failure 30s later.
-	if chosenRuntime == models.RuntimeKata {
+	// A reserved runtime (kata, firecracker-nitro until its driver lands)
+	// passes validation, so operators can pre-stage it, but every create
+	// refuses it. The runtime table says which ones are reserved, so a new
+	// one needs no branch here. A clear 4xx-shaped error, so clients see
+	// "not implemented" rather than a generic driver failure 30s later.
+	if row, ok := models.LookupRuntime(chosenRuntime); ok && row.Reserved {
 		return nil, fmt.Errorf("runtime %q: %w", chosenRuntime, models.ErrRuntimeNotImplemented)
 	}
 	// destroy_at becomes destroy_at_age from now (L6), before the defaults

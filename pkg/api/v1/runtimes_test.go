@@ -173,7 +173,7 @@ func TestCreateRefusalNamesOfferedRuntimesOverHTTP(t *testing.T) {
 		Role:      controlplane.RoleRunner,
 		Principal: controlplane.Principal{Kind: controlplane.PrincipalToken, ID: "tok_team"},
 	}
-	for _, runtime := range []string{models.RuntimeKata, models.RuntimeFirecracker, models.RuntimeWasm, models.RuntimeIsolate} {
+	for _, runtime := range []string{models.RuntimeKata, models.RuntimeFirecracker, models.RuntimeFirecrackerNitro, models.RuntimeWasm, models.RuntimeIsolate} {
 		t.Run(runtime, func(t *testing.T) {
 			mux := newRefusalMux(t, []string{models.RuntimeDocker, models.RuntimeGvisor}, tenant)
 			rr := do(t, mux, http.MethodPost, "/v1/sandboxes", map[string]any{"image": "alpine:3.20", "runtime": runtime})

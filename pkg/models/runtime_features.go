@@ -90,8 +90,8 @@ type RuntimeLimits struct {
 type RuntimeInfo struct {
 	Name      string
 	Isolation string
-	// Backend names the hardware a VM runtime runs on ("kvm"). Empty for
-	// runtimes that are not VMs.
+	// Backend names the hardware a VM runtime runs on ("kvm", "nitro").
+	// Empty for runtimes that are not VMs.
 	Backend  string
 	Features RuntimeFeatures
 	Limits   *RuntimeLimits
@@ -145,6 +145,18 @@ var runtimeTable = []RuntimeInfo{
 		Features:  RuntimeFeatures{Snapshots: true, Pause: true, Moves: MovesMemory, WarmPool: WarmPoolKindSnapshot},
 	},
 	{
+		// Firecracker through Nitro Enclaves' direct mode
+		// (plans/security-gaps-m1-m4.md §4.3). AWS gives a Nitro VM no
+		// memory snapshots, so no snapshots, no pause and no memory moves.
+		// Reserved until the Nitro driver lands; the features say what it
+		// will offer when it does, nothing more.
+		Name:      RuntimeFirecrackerNitro,
+		Isolation: IsolationHardwareVM,
+		Backend:   "nitro",
+		Features:  RuntimeFeatures{Moves: MovesNone, WarmPool: WarmPoolKindNone},
+		Reserved:  true,
+	},
+	{
 		// A snapshot is a checkpoint file, not an image a create can start
 		// from, so no snapshots here. Stop does not keep memory; only
 		// passivation at shutdown does. A drain moves passivatable and
@@ -195,8 +207,8 @@ func (r RuntimeInfo) clone() RuntimeInfo {
 }
 
 // RuntimeBackend is the backend a sandbox of this runtime runs on, from the
-// table: "kvm" for firecracker, "" for runtimes that are not VMs and for
-// names the table does not hold.
+// table: "kvm" for firecracker, "nitro" for firecracker-nitro, "" for
+// runtimes that are not VMs and for names the table does not hold.
 func RuntimeBackend(name string) string {
 	for _, row := range runtimeTable {
 		if row.Name == name {
