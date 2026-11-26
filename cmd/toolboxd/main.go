@@ -229,13 +229,21 @@ func main() {
 		os.Exit(runExportHelper(logger))
 	}
 
+	// Pod mode (pod_mode.go): parked until its worker adopts it over mTLS.
+	pod, err := loadPodModeFn()
+	if err != nil {
+		logger.Error("toolboxd cannot start in pod mode", "error", err)
+		os.Exit(1)
+	}
+	scrubPodEnv()
+
 	srv := &server{
 		logger:       logger,
 		sandboxID:    readSandboxID(),
 		authToken:    strings.TrimSpace(os.Getenv("SB_TOOLBOX_TOKEN")),
 		port:         envInt("SB_TOOLBOX_PORT", 2280),
 		allowedPorts: map[int]struct{}{},
-		parkedMode:   strings.TrimSpace(os.Getenv("SB_POOL_PARKED")) == "1",
+		parkedMode:   strings.TrimSpace(os.Getenv("SB_POOL_PARKED")) == "1" || pod != nil,
 		daytona:      newDaytonaCompat(),
 		envd:         newEnvdCompat(),
 		cloneGen:     clonegen.New(envString("SB_CLONE_GEN_PATH", clonegen.DefaultPath), logger),
@@ -284,9 +292,15 @@ func main() {
 	// as /health 200: a client that connects will get a response. Everything
 	// between here and Serve (session dir mkdir, user-command fork/exec) is
 	// deliberately kept off the time-to-ready path.
-	if srv.parkedMode {
+	switch {
+	case pod != nil:
+		if _, err := startPodAdoptFn(logger, srv, pod); err != nil {
+			logger.Error("toolboxd cannot start in pod mode", "error", err)
+			os.Exit(1)
+		}
+	case srv.parkedMode:
 		go runParkedReadyHandshake(logger, srv, readySocket, bootstrapToken, readyNonce)
-	} else {
+	default:
 		announceReady(logger, srv.sandboxID, srv.authToken, readyNonce, readySocket)
 	}
 
