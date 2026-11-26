@@ -32,10 +32,15 @@ import time
 import urllib.error
 import urllib.request
 
-API = "http://127.0.0.1:21212"
+# SPA_API, SPA_HOME and SPA_CYCLE_GAP point a run at a stand-in API with its
+# files off the machine (integration-tests/safety/m2_spikes_test.go).
+API = os.environ.get("SPA_API", "http://127.0.0.1:21212")
 IMAGE = "alpine:3.20"
-# SPA_HOME moves the files for a run against a stand-in API off the machine.
 HOME = os.environ.get("SPA_HOME", "/root")
+# Seconds between a resume and the next pause, so the guest runs a while.
+CYCLE_GAP = float(os.environ.get("SPA_CYCLE_GAP", "1.2"))
+# Seconds a resumed guest has to answer an exec with its /tmp marker.
+EXEC_WAIT = float(os.environ.get("SPA_EXEC_WAIT", "5"))
 STATE = HOME + "/spa-state.json"
 RESULTS = HOME + "/spa-results"
 RETRIES = 3
@@ -235,10 +240,21 @@ def phase_base(a):
                                   failures=fails, notes=notes[:3])
     results["pause_resume_busy"] = pause_resume(tbody, a.cycles, busy=True)
     results["pause_resume_idle"] = pause_resume(tbody, a.idle_cycles, busy=False)
-    lost = results["pause_resume_busy"].get("cycles_lost", 0) + results["pause_resume_idle"].get("cycles_lost", 0)
-    say("VERDICT pause/resume: %d lost of %d cycles (go: 0 lost) -> %s"
-        % (lost, a.cycles + a.idle_cycles, "PASS" if lost == 0 else "FAIL"))
+    say(pause_resume_verdict(results["pause_resume_busy"], a.cycles, results["pause_resume_idle"], a.idle_cycles))
     return results
+
+
+def pause_resume_verdict(busy, n_busy, idle, n_idle):
+    """Plan §4.2's bar is every cycle intact, not only none lost: a start
+    that works but hands back a rebooted guest (a new boot ID), an empty
+    /tmp or no exec answer lost the sandbox's memory just as surely."""
+    parts, ok = [], True
+    for label, res, n in (("busy", busy, n_busy), ("idle", idle, n_idle)):
+        intact = res.get("cycles_intact", 0)
+        if "error" in res or intact != n:
+            ok = False
+        parts.append("%s %d of %d intact (%d lost)" % (label, intact, n, res.get("cycles_lost", 0)))
+    return "VERDICT pause/resume: %s (go: every cycle intact) -> %s" % ("; ".join(parts), "PASS" if ok else "FAIL")
 
 
 def pause_resume(body, n, busy):
@@ -270,7 +286,7 @@ def pause_resume(body, n, busy):
     dumps = 0
     last_counter = 0
     for i in range(n):
-        time.sleep(1.2)
+        time.sleep(CYCLE_GAP)
         rec = {"cycle": i, "sandbox": sid}
         s1, js, _, ms1 = call("POST", "/v1/sandboxes/%s/stop" % sid)
         rec["stop_ms"] = round(ms1, 1)
@@ -320,9 +336,9 @@ def pause_resume(body, n, busy):
             retry_ok += 1
         t0 = time.monotonic()
         code, out = 0, ""
-        for _ in range(100):
+        while True:
             code, out, _ = exec_(sid, "cat /proc/sys/kernel/random/boot_id; cat /tmp/marker; cat /tmp/counter 2>/dev/null || echo 0")
-            if code < 300 and "spa-marker" in out:
+            if (code < 300 and "spa-marker" in out) or time.monotonic() - t0 > EXEC_WAIT:
                 break
             time.sleep(0.05)
         first_exec_ms.append((time.monotonic() - t0) * 1000)

@@ -44,12 +44,27 @@ m2_sg=""
 m2_bucket=""
 m2_finished=0
 
-say() { echo "[$(date -u +%T)] $*" | tee -a "$report" >&2; }
+# m2_out <line>: to the report and the terminal. It never fails: the
+# cleanup must go on when the terminal is gone (a closed SSH session).
+m2_out() {
+  printf '%s\n' "$*" >>"$report" 2>/dev/null || true
+  # stdout to the terminal (fd 2), then the shell's own write-error message
+  # to /dev/null; in this order fd 1 keeps the terminal.
+  printf '%s\n' "$*" >&2 2>/dev/null || true
+}
+say() { m2_out "[$(date -u +%T)] $*"; }
 
 # x runs an AWS (or other) command, or with --dry-run prints it.
 x() {
-  if [[ "$dry" == 1 ]]; then printf 'dry-run:' >&2; printf ' %q' "$@" >&2; printf '\n' >&2; return 0; fi
+  if [[ "$dry" == 1 ]]; then m2_out "dry-run:$(printf ' %q' "$@")"; return 0; fi
   "$@"
+}
+
+# xq is x with the command's own output dropped: the cleanup's calls, whose
+# failures are reported by say (which cannot fail) instead.
+xq() {
+  if [[ "$dry" == 1 ]]; then x "$@"; return 0; fi
+  "$@" >/dev/null 2>&1
 }
 
 m2_parse_flags() { # "$@" of the script; usage() comes from the script
@@ -137,7 +152,7 @@ m2_stage_src() {
   git -C "$REPO" archive --format=tar.gz -o "$f" "$1"
   sum="$(m2_sha256 "$f")"
   if [[ "$dry" == 1 ]]; then
-    echo "dry-run: aws s3api head-object --bucket $m2_bucket --key $key; put it unless its sha256 metadata is $sum" >&2
+    m2_out "dry-run: aws s3api head-object --bucket $m2_bucket --key $key; put it unless its sha256 metadata is $sum"
   else
     have="$(aws s3api head-object --region "$M2_REGION" --bucket "$m2_bucket" --key "$key" --query Metadata.sha256 --output text 2>/dev/null || true)"
     if [[ "$have" != "$sum" ]]; then
@@ -224,7 +239,7 @@ m2_follow() {
   local max_min="$1" start i j out state n_open from lines l seen
   if [[ "$dry" == 1 ]]; then
     for ((i = 0; i < ${#leg_names[@]}; i++)); do
-      echo "dry-run: aws ec2 get-console-output --region $M2_REGION --instance-id ${leg_ids[$i]} --latest every 20 s, '${leg_prefix[$i]} ' lines, until '${leg_prefix[$i]} DONE' or the machine is gone (at most $max_min min)" >&2
+      m2_out "dry-run: aws ec2 get-console-output --region $M2_REGION --instance-id ${leg_ids[$i]} --latest every 20 s, '${leg_prefix[$i]} ' lines, until '${leg_prefix[$i]} DONE' or the machine is gone (at most $max_min min)"
     done
     return 0
   fi
@@ -250,7 +265,7 @@ m2_follow() {
       fi
       for ((j = from; j < ${#lines[@]}; j++)); do
         echo "${lines[$j]}" >>"$sd/${leg_names[$i]}.txt"
-        echo "[${leg_names[$i]}] ${lines[$j]}" | tee -a "$report" >&2
+        m2_out "[${leg_names[$i]}] ${lines[$j]}"
       done
       leg_seen[i]=${#lines[@]}
       ((${#lines[@]} > 0)) && leg_last[i]="${lines[${#lines[@]} - 1]}"
@@ -274,25 +289,28 @@ m2_follow() {
 }
 
 # m2_leak_check [--all]: what is left with owner=aerolvm-spike, this run's
-# only unless --all. Read-only: describe calls, nothing deleted. Returns 1
-# when anything is left.
+# only unless --all: machines, disks, network interfaces, security groups,
+# and the per-run kit in S3 (builds/spike-m2/<run>/; the source copies and
+# the results under spike-m2/<run>/ are kept on purpose and not counted).
+# Read-only: describe and list calls, nothing deleted. Returns 1 when
+# anything is left or could not be listed.
 m2_leak_left=0
 m2_leak_list() { # <what> <aws args...>
   local what="$1" got
   shift
-  if [[ "$dry" == 1 ]]; then printf 'dry-run: leak check %s: aws' "$what" >&2; printf ' %q' "$@" >&2; printf '\n' >&2; return 0; fi
+  if [[ "$dry" == 1 ]]; then m2_out "dry-run: leak check $what: aws$(printf ' %q' "$@")"; return 0; fi
   if got="$(aws "$@" 2>&1)"; then
     got="$(tr -s '\t\n ' ' ' <<<"$got" | sed -e 's/^ //' -e 's/ $//' -e 's/^None$//')"
   else
     got="could not list: ${got:0:160}"
   fi
-  echo "leak check $what: ${got:-none}" | tee -a "$report" >&2
+  m2_out "leak check $what: ${got:-none}"
   [[ -z "$got" ]] || m2_leak_left=1
 }
 
 m2_leak_check() {
-  local scope=("Name=tag:owner,Values=$M2_OWNER") who="run $run"
-  if [[ "${1:-}" == --all ]]; then who="any $M2_OWNER run"; else scope+=("Name=tag:aerol:run,Values=$run"); fi
+  local scope=("Name=tag:owner,Values=$M2_OWNER") who="run $run" all=0
+  if [[ "${1:-}" == --all ]]; then all=1 who="any $M2_OWNER run"; else scope+=("Name=tag:aerol:run,Values=$run"); fi
   m2_leak_left=0
   m2_leak_list instances ec2 describe-instances --region "$M2_REGION" --filters "${scope[@]}" \
     Name=instance-state-name,Values=pending,running,stopping,stopped,shutting-down \
@@ -303,42 +321,59 @@ m2_leak_check() {
     --query 'NetworkInterfaces[].NetworkInterfaceId' --output text
   m2_leak_list "security groups" ec2 describe-security-groups --region "$M2_REGION" --filters "${scope[@]}" \
     --query 'SecurityGroups[].GroupId' --output text
+  if [[ -z "$m2_bucket" ]]; then
+    m2_out "leak check S3 kit: not checked (the run stopped before it put anything in S3)"
+  elif [[ "$all" == 1 ]]; then
+    m2_leak_list "S3 kit" s3api list-objects-v2 --region "$M2_REGION" --bucket "$m2_bucket" --prefix builds/spike-m2/ \
+      --query "Contents[?!starts_with(Key, 'builds/spike-m2/src-')].Key" --output text
+  else
+    m2_leak_list "S3 kit" s3api list-objects-v2 --region "$M2_REGION" --bucket "$m2_bucket" --prefix "builds/spike-m2/$run/" \
+      --query 'Contents[].Key' --output text
+  fi
   [[ "$dry" == 1 ]] && return 0
   if [[ "$m2_leak_left" == 0 ]]; then
-    echo "leak check: nothing of $who is left" | tee -a "$report" >&2
+    m2_out "leak check: nothing of $who is left"
   else
-    echo "leak check: something of $who is LEFT (above); end it by hand, or make integration-reap after its ttl" | tee -a "$report" >&2
+    m2_out "leak check: something of $who is LEFT (above); end it by hand, or make integration-reap after its ttl"
   fi
   return "$m2_leak_left"
 }
 
 # m2_finish (the EXIT trap): every machine terminated and waited for, the
-# group deleted, the per-run kit deleted, then the leak check.
+# group deleted, the per-run kit deleted, then the leak check. The exit code
+# is the run's own (130 Ctrl-C, 143 TERM, 129 hangup, 5 a finished run whose
+# verdict is no-go, a failed command's code), or 1 when the run was fine but
+# something is left.
 m2_finish() {
-  local rc=$? i ids=()
+  local rc=$? i ids=() key
   [[ "$m2_finished" == 0 ]] || exit "$rc"
   m2_finished=1
-  # A second Ctrl-C (or a TERM) must not cut the cleanup short.
-  trap '' INT TERM
+  # The cleanup runs to its end: a second Ctrl-C, a TERM, a hangup (the
+  # terminal closed) or a dead pipe on stderr stops nothing, and no failed
+  # command ends it early (every output goes through m2_out or xq).
+  trap '' INT TERM HUP PIPE
+  set +e
   for ((i = 0; i < ${#leg_ids[@]}; i++)); do ids+=("${leg_ids[$i]}"); done
   if ((${#ids[@]} > 0)); then
-    x aws ec2 terminate-instances --region "$M2_REGION" --instance-ids "${ids[@]}" >/dev/null ||
+    xq aws ec2 terminate-instances --region "$M2_REGION" --instance-ids "${ids[@]}" ||
       say "terminate failed: aws ec2 terminate-instances --region $M2_REGION --instance-ids ${ids[*]}"
-    x aws ec2 wait instance-terminated --region "$M2_REGION" --instance-ids "${ids[@]}" || say "wait for termination failed"
+    xq aws ec2 wait instance-terminated --region "$M2_REGION" --instance-ids "${ids[@]}" || say "wait for termination failed"
   fi
   if [[ -n "$m2_sg" ]]; then
     # A terminated machine's network interface can hold the group for a
     # few seconds more.
     for i in 1 2 3 4 5 6; do
-      x aws ec2 delete-security-group --region "$M2_REGION" --group-id "$m2_sg" && { m2_sg=""; break; }
+      xq aws ec2 delete-security-group --region "$M2_REGION" --group-id "$m2_sg" && { m2_sg=""; break; }
       sleep 10
     done
     [[ -z "$m2_sg" ]] || say "security group $m2_sg is left: aws ec2 delete-security-group --region $M2_REGION --group-id $m2_sg"
   fi
   for ((i = 0; i < ${#m2_tmp_keys[@]}; i++)); do
-    x aws s3 rm --only-show-errors --region "$M2_REGION" "s3://$m2_bucket/${m2_tmp_keys[$i]}" || true
+    key="${m2_tmp_keys[$i]}"
+    xq aws s3 rm --only-show-errors --region "$M2_REGION" "s3://$m2_bucket/$key" ||
+      say "kit $key may be left: aws s3 rm s3://$m2_bucket/$key"
   done
-  # A leak turns any exit into a failure; it never hides an earlier one.
+  # A leak turns a clean exit into a failure; it never hides an earlier one.
   if ! m2_leak_check && [[ "$rc" == 0 ]]; then rc=1; fi
   say "--- $run ended (exit $rc); report $report"
   exit "$rc"

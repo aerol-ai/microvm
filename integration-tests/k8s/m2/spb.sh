@@ -27,12 +27,14 @@
 # Results: integration-tests/k8s/.state/<run>/ (report.txt, spb.txt,
 # spb-results.tgz). Go (plan §4.2): steps 1-4 pass and a cold create is
 # under 2 s end to end.
+# Exit: 0 go; 5 the run finished without a go; 3 past the ceiling; 4 not
+# approved; 130/143/129 Ctrl-C/TERM/hangup; 1 something left.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 
-usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; }
 
 run="m2-spb-$(date -u +%m%d%H%M)"
 ceiling=3
@@ -60,6 +62,7 @@ m2_gate --leg "spb:$itype:$plan:$ttl:$disk"
 trap m2_finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 m2_bucket="aerol-itest-artifacts-$(m2_account)"
 m2_stage_src "$sha"
 src_sum="$M2_SUM"
@@ -78,5 +81,9 @@ m2_follow $((ttl + 5))
 x aws s3 cp --only-show-errors --region "$M2_REGION" "s3://$m2_bucket/spike-m2/$run/spb-results.tgz" "$sd/spb-results.tgz" ||
   say "no results in S3"
 if [[ "$dry" != 1 ]]; then
-  grep -h '^SPB VERDICT' "$sd/spb.txt" 2>/dev/null | tee -a "$report" >&2 || say "no verdict lines: the run did not finish"
+  verdicts="$(grep -h '^SPB VERDICT' "$sd/spb.txt" 2>/dev/null || true)"
+  while IFS= read -r line; do [[ -z "$line" ]] || m2_out "$line"; done <<<"$verdicts"
+  [[ -n "$verdicts" ]] || say "no verdict lines: the run did not finish"
+  # m2_finish reports this code (5: the run finished without a go).
+  grep -q '^SPB VERDICT SP-B: go$' <<<"$verdicts" || exit 5
 fi

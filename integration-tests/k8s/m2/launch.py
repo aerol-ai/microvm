@@ -18,6 +18,7 @@ import argparse
 import gzip
 import json
 import sys
+import uuid
 
 REGION = "us-east-1"
 
@@ -32,9 +33,13 @@ def tags_of(pairs):
     return out
 
 
-def run_kwargs(a, ami, userdata):
+def run_kwargs(a, ami, userdata, token):
     tags = tags_of(a.tag)
     kw = {
+        # One token per launch: when boto3 retries the call (a timeout, a
+        # throttle), EC2 hands back the machine it already started instead of
+        # starting a second one.
+        "ClientToken": token,
         "ImageId": ami, "InstanceType": a.type, "MinCount": 1, "MaxCount": 1,
         "InstanceInitiatedShutdownBehavior": "terminate",
         "SecurityGroupIds": [a.sg],
@@ -54,8 +59,10 @@ def run_kwargs(a, ami, userdata):
 
 def cmd_run(a):
     raw = open(a.userdata, "rb").read()
+    # At most 64 ASCII characters (EC2's limit).
+    token = ("%s-%s" % (a.name[:30], uuid.uuid4().hex))[:64]
     if a.dry_run:
-        kw = run_kwargs(a, "<ssm:%s>" % a.ami_param, "<gzip of %s: %d bytes>" % (a.userdata, len(gzip.compress(raw))))
+        kw = run_kwargs(a, "<ssm:%s>" % a.ami_param, "<gzip of %s: %d bytes>" % (a.userdata, len(gzip.compress(raw))), token)
         print("dry-run: ssm.get_parameter(Name=%r)" % a.ami_param, file=sys.stderr)
         print("dry-run: ec2.run_instances(%s)" % json.dumps(kw, sort_keys=True), file=sys.stderr)
         print("i-dry-%s" % a.name)
@@ -64,7 +71,7 @@ def cmd_run(a):
     ssm = boto3.client("ssm", region_name=REGION)
     ec2 = boto3.client("ec2", region_name=REGION)
     ami = ssm.get_parameter(Name=a.ami_param)["Parameter"]["Value"]
-    r = ec2.run_instances(**run_kwargs(a, ami, gzip.compress(raw)))
+    r = ec2.run_instances(**run_kwargs(a, ami, gzip.compress(raw), token))
     print(r["Instances"][0]["InstanceId"])
     return 0
 

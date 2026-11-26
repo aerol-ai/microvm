@@ -29,13 +29,15 @@
 #
 # Results: integration-tests/k8s/.state/<run>/ (report.txt, <leg>.txt, and
 # <leg>-results.tgz from each bench leg). Go (plan §4.2): warm create p50
-# under 100 ms, no pause/resume cycle lost, the move passes.
+# under 100 ms, every pause/resume cycle intact, the move passes.
+# Exit: 0 go; 5 the run finished and the verdict is no-go; 3 past the
+# ceiling; 4 not approved; 130/143/129 Ctrl-C/TERM/hangup; 1 something left.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "$here/lib.sh"
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
 run="m2-spa-$(date -u +%m%d%H%M)"
 ceiling=10
@@ -86,6 +88,7 @@ fi
 trap m2_finish EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
 m2_bucket="aerol-itest-artifacts-$(m2_account)"
 m2_stage_src "$sha"
 src_sum="$M2_SUM"
@@ -105,7 +108,7 @@ for l in "${want[@]}"; do
       PATCH="$L_PATCH" LEG="$l"
     m2_launch "$l" "$L_TYPE" "$L_AMI" "$ud" "$L_ROOT" "$L_DISK" "$L_NESTED" 0 "$L_TTL" SPA
   else
-    m2_render "$K8S/fckind/userdata.sh" "$ud" SRC_URL="$src_url" PROOF=move
+    m2_render "$K8S/fckind/userdata.sh" "$ud" SRC_URL="$src_url" SRC_SHA="$src_sum" PROOF=move
     m2_launch "$l" "$L_TYPE" "$L_AMI" "$ud" "$L_ROOT" "$L_DISK" "$L_NESTED" 0 "$L_TTL" FCK
   fi
 done
@@ -120,5 +123,9 @@ for l in "${want[@]}"; do
     say "$l: no results in S3"
 done
 if [[ "$dry" != 1 ]]; then
-  python3 -I "$here/verdict.py" "$sd" | tee -a "$report" >&2 || true
+  vrc=0
+  python3 -I "$here/verdict.py" "$sd" >"$sd/verdict.txt" 2>&1 || vrc=$?
+  while IFS= read -r line; do m2_out "$line"; done <"$sd/verdict.txt"
+  # m2_finish reports this code (5: the run finished, the verdict is no-go).
+  [[ "$vrc" == 0 ]] || exit 5
 fi

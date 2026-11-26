@@ -1,12 +1,17 @@
 package safety
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -78,6 +83,7 @@ func TestM2SpikeDryRunPrintsEveryCallAndMakesNone(t *testing.T) {
 		}
 		for _, w := range append(c.want,
 			"dry-run: ec2.run_instances(",
+			`"ClientToken": "`,
 			`"InstanceInitiatedShutdownBehavior": "terminate"`,
 			`{"Key": "owner", "Value": "aerolvm-spike"}`,
 			`{"Key": "itest", "Value": "true"}`,
@@ -157,15 +163,19 @@ func TestM2LeakCheckIsReadOnly(t *testing.T) {
 	if code != 0 || calls != "" {
 		t.Fatalf("leak-check --dry-run: exit %d, aws calls %q\n%s", code, calls, out)
 	}
-	verbs := regexp.MustCompile(`leak check [a-z ]+: aws ec2 ([a-z-]+)`)
+	// Machines, disks, network interfaces, groups, and the kit in S3.
+	verbs := regexp.MustCompile(`leak check [A-Za-z0-9 ]+: aws (ec2|s3api) ([a-z0-9-]+)`)
 	found := verbs.FindAllStringSubmatch(out, -1)
-	if len(found) != 4 {
-		t.Fatalf("want 4 checks, got %d\n%s", len(found), out)
+	if len(found) != 5 {
+		t.Fatalf("want 5 checks, got %d\n%s", len(found), out)
 	}
 	for _, m := range found {
-		if !strings.HasPrefix(m[1], "describe-") {
-			t.Errorf("leak check makes a call that is not read-only: %s", m[1])
+		if !strings.HasPrefix(m[2], "describe-") && !strings.HasPrefix(m[2], "list-") {
+			t.Errorf("leak check makes a call that is not read-only: %s %s", m[1], m[2])
 		}
+	}
+	if !strings.Contains(out, "list-objects-v2") || !strings.Contains(out, "builds/spike-m2/") {
+		t.Errorf("leak check does not look at the kit in S3\n%s", out)
 	}
 }
 
@@ -255,6 +265,200 @@ echo "states: ${leg_state[*]}"
 	}
 }
 
+// m2StandIn is a stand-in for sandboxd's v1 API, just enough for
+// spa-bench.py's base phase. Every stop and start succeeds. A sandbox for
+// which broken(its creation number) is true comes back from each start the
+// way a rebooted guest would: a new boot ID and an empty /tmp.
+type m2StandIn struct {
+	mu     sync.Mutex
+	n      int
+	broken func(n int) bool
+	sb     map[string]*m2Guest
+}
+
+type m2Guest struct {
+	n       int
+	boot    string
+	marker  bool
+	busy    bool
+	counter int
+}
+
+func (s *m2StandIn) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reply := func(code int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	switch {
+	case r.URL.Path == "/health":
+		reply(200, map[string]bool{"ok": true})
+	case r.Method == "POST" && r.URL.Path == "/v1/templates":
+		reply(201, map[string]string{"id": "tpl-standin"})
+	case r.Method == "GET" && len(parts) == 3 && parts[1] == "templates":
+		reply(200, map[string]string{"id": parts[2], "status": "ready"})
+	case r.Method == "POST" && r.URL.Path == "/v1/sandboxes":
+		s.n++
+		id := fmt.Sprintf("sb-standin-%04d", s.n)
+		s.sb[id] = &m2Guest{n: s.n, boot: fmt.Sprintf("%032x", s.n*1000)}
+		w.Header().Set("Server-Timing", "create;dur=50.0")
+		reply(201, map[string]string{"id": id, "status": "started"})
+	case len(parts) < 3 || parts[1] != "sandboxes" || s.sb[parts[2]] == nil:
+		reply(404, map[string]string{"error": "not found"})
+	case r.Method == "GET", r.Method == "DELETE":
+		reply(200, map[string]string{"id": parts[2], "status": "started"})
+	case len(parts) == 4 && parts[3] == "stop":
+		reply(200, map[string]string{})
+	case len(parts) == 4 && parts[3] == "start":
+		g := s.sb[parts[2]]
+		if s.broken(g.n) {
+			g.boot = fmt.Sprintf("%032x", g.n*1000+g.counter+7)
+			g.marker, g.counter = false, 0
+		}
+		reply(200, map[string]string{})
+	case strings.HasSuffix(r.URL.Path, "/toolbox/process/execute"):
+		g := s.sb[parts[2]]
+		var body struct {
+			Command string `json:"command"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		out := "agent-ok\n5.10.245"
+		switch {
+		case strings.Contains(body.Command, "setsid nohup"):
+			g.busy, out = true, ""
+		case strings.Contains(body.Command, "echo spa-marker"):
+			g.marker, out = true, g.boot+"\n"
+		case strings.Contains(body.Command, "cat /tmp/marker"):
+			out = g.boot + "\n"
+			if g.marker {
+				out += "spa-marker\n"
+			}
+			if g.busy && g.marker {
+				g.counter++
+				out += fmt.Sprintf("%d\n", g.counter)
+			} else if !g.busy {
+				out += "0\n"
+			}
+		}
+		reply(200, map[string]string{"stdout": out})
+	default:
+		reply(404, map[string]string{"error": "no route"})
+	}
+}
+
+// The pause/resume verdict is every cycle intact, not only none lost: a
+// start that works but hands back a rebooted guest must fail the bench and
+// SP-A's verdict (review of #1483). Every third sandbox here comes back
+// from each start with a new boot ID and an empty /tmp; the same run with
+// no broken sandbox passes.
+func TestM2BenchFailsWhenAResumeLosesTheGuestsMemory(t *testing.T) {
+	needTools(t, "python3")
+	cases := []struct {
+		name    string
+		broken  func(int) bool
+		bench   string
+		verdict string
+	}{
+		{"every third sandbox rebooted", func(n int) bool { return n%3 == 0 }, "-> FAIL", "VERDICT SP-A: NO GO"},
+		{"every sandbox intact", func(int) bool { return false }, "-> PASS", "VERDICT SP-A: go"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := httptest.NewServer(&m2StandIn{broken: c.broken, sb: map[string]*m2Guest{}})
+			defer srv.Close()
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, "pat"), []byte("standin\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("python3", "-I", k8sFile(t, "m2", "spa-bench.py"), "base",
+				"--samples", "2", "--cycles", "6", "--idle-cycles", "3", "--leg", "standin")
+			cmd.Env = append(os.Environ(), "SPA_API="+srv.URL, "SPA_HOME="+home, "SPA_CYCLE_GAP=0", "SPA_EXEC_WAIT=0.2")
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("spa-bench.py: %v\n%s", err, out)
+			}
+			var spa []string
+			for _, l := range strings.Split(string(out), "\n") {
+				if strings.HasPrefix(l, "SPA ") {
+					spa = append(spa, l)
+				}
+				if strings.HasPrefix(l, "SPA VERDICT pause/resume") && !strings.HasSuffix(l, c.bench) {
+					t.Errorf("bench verdict: want %q at the end\n%s", c.bench, l)
+				}
+			}
+			if !strings.Contains(string(out), "SPA VERDICT pause/resume") {
+				t.Fatalf("no pause/resume verdict\n%s", out)
+			}
+			// verdict.py over the leg, with a passing warm row: the
+			// pause/resume row alone decides.
+			state := t.TempDir()
+			leg := strings.Join(append(spa, "SPA VERDICT warm create p50 20.0 ms over 20 hits of 20 (go: under 100 ms) -> PASS", "SPA DONE"), "\n") + "\n"
+			if err := os.WriteFile(filepath.Join(state, "bench-m8i.txt"), []byte(leg), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			vout, _ := exec.Command("python3", "-I", k8sFile(t, "m2", "verdict.py"), state).CombinedOutput()
+			if !strings.Contains(string(vout), c.verdict) {
+				t.Errorf("verdict.py: want %q\n%s", c.verdict, vout)
+			}
+		})
+	}
+}
+
+// A hangup (the terminal closed) runs the cleanup to its end and reports the
+// run's own exit code: stderr is gone, so every write to it fails, and the
+// machines, the group and the kit must still be removed and the leak check
+// run (review of #1483).
+func TestM2CleanupFinishesAfterAHangupWithNoTerminal(t *testing.T) {
+	needTools(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := "#!/bin/sh\necho \"$*\" >> \"$OUT/calls\"\ncase \"$2\" in describe-*|list-*) echo None ;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "aws"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := `set -euo pipefail
+. "$LIB"
+sleep() { :; }
+dry=0 run=m2t-hup sd="$OUT" report="$OUT/report.txt"
+m2_bucket=bkt m2_sg=sg-1 leg_ids=(i-1 i-2) m2_tmp_keys=(builds/spike-m2/m2t-hup/kit.tgz)
+trap m2_finish EXIT
+trap 'exit 129' HUP
+exec 2>&-
+kill -HUP $$
+:
+`
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"OUT="+dir, "LIB="+k8sFile(t, "m2", "lib.sh"))
+	err := cmd.Run()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 129 {
+		t.Fatalf("exit: %v, want 129 (the hangup's own code)", err)
+	}
+	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+	for _, w := range []string{
+		"ec2 terminate-instances --region us-east-1 --instance-ids i-1 i-2",
+		"ec2 wait instance-terminated",
+		"ec2 delete-security-group --region us-east-1 --group-id sg-1",
+		"s3 rm --only-show-errors --region us-east-1 s3://bkt/builds/spike-m2/m2t-hup/kit.tgz",
+		"ec2 describe-instances", "s3api list-objects-v2 --region us-east-1 --bucket bkt --prefix builds/spike-m2/m2t-hup/",
+	} {
+		if !strings.Contains(string(calls), w) {
+			t.Errorf("cleanup did not call %q; calls:\n%s", w, calls)
+		}
+	}
+	report, _ := os.ReadFile(filepath.Join(dir, "report.txt"))
+	if !strings.Contains(string(report), "nothing of run m2t-hup is left") || !strings.Contains(string(report), "ended (exit 129)") {
+		t.Errorf("report:\n%s", report)
+	}
+}
+
 // Every machine's user data puts it on a deadline that powers it off (and
 // so terminates it), and its downloads are checked against the SHA-256
 // the launching script took.
@@ -267,6 +471,26 @@ func TestM2SpikeUserDataHasADeadlineAndChecksums(t *testing.T) {
 		s := string(b)
 		for _, w := range []string{"@TTL_MIN@", "sha256sum -c", "@SRC_SHA@", "@KIT_SHA@", "poweroff"} {
 			if !strings.Contains(s, w) {
+				t.Errorf("%s lacks %q", f, w)
+			}
+		}
+	}
+	// The move leg runs fckind's user data: its source is checked too, and
+	// fckind.sh fills the checksum in.
+	for f, wants := range map[string][]string{
+		"fckind/userdata.sh": {"'@SRC_SHA@  src.tgz' | sha256sum -c --quiet -"},
+		"fckind.sh":          {`.replace("@SRC_SHA@", os.environ["SUM"])`},
+		// The throwaway admin token stays out of spa.log, the console and
+		// the results: the installer's output, the journal and the log
+		// copy all go through mask.
+		"m2/spa-userdata.sh": {"--build-from-source 2>&1 | mask", "| mask | gzip", "mask </var/log/spa.log"},
+	} {
+		b, err := os.ReadFile(k8sFile(t, f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range wants {
+			if !strings.Contains(string(b), w) {
 				t.Errorf("%s lacks %q", f, w)
 			}
 		}

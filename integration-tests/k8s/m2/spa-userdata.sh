@@ -13,12 +13,17 @@ shutdown -h +@TTL_MIN@
 say() { echo "SPA $*"; echo "SPA $*" >/dev/console; }
 results=/root/spa-results
 mkdir -p "$results"
+# mask: the throwaway admin token (/root/pat, made below) never reaches
+# spa.log, the console or the results; it is hex, so it is safe in sed.
+mask() {
+  if [ -s /root/pat ]; then sed -u "s/$(cat /root/pat)/<pat>/g"; else cat; fi
+}
 # finish: results up, then DONE. The console is read every 20 s from
 # outside: stay up long enough after the last line for it to be read.
 finish() {
-  journalctl -u sandboxd --no-pager 2>/dev/null | gzip -c >"$results/sandboxd-journal.log.gz"
+  journalctl -u sandboxd --no-pager 2>/dev/null | mask | gzip -c >"$results/sandboxd-journal.log.gz"
   dmesg 2>/dev/null | tail -400 >"$results/dmesg-tail.txt"
-  cp /var/log/spa.log "$results/" 2>/dev/null
+  mask </var/log/spa.log >"$results/spa.log" 2>/dev/null
   cp /root/spa-*.json "$results/" 2>/dev/null
   tar -czf /root/spa-results.tgz -C /root spa-results
   if curl -fsS --retry 3 -X PUT -T /root/spa-results.tgz '@RESULTS_URL@' -o /dev/null; then
@@ -63,9 +68,11 @@ fi
 gov="$(awk '/^go /{print $2; exit}' src/go.mod)"
 curl -fsSL --retry 5 "https://go.dev/dl/go${gov}.linux-amd64.tar.gz" | tar -C /usr/local -xz
 export PATH=/usr/local/go/bin:$PATH GOFLAGS=-buildvcs=false
-openssl rand -hex 24 >/root/pat && chmod 600 /root/pat
+( umask 077 && openssl rand -hex 24 >/root/pat )
 t0=$(date +%s)
-if ! (cd src && ./scripts/install.sh --with-firecracker --public-host 127.0.0.1 --pat-token "$(cat /root/pat)" --build-from-source); then
+# The installer's output goes through mask, so spa.log never holds the token.
+if ! (cd src && ./scripts/install.sh --with-firecracker --public-host 127.0.0.1 --pat-token "$(cat /root/pat)" --build-from-source 2>&1 | mask
+  exit "${PIPESTATUS[0]}"); then
   say "install FAILED; last lines:"; tail -20 /var/log/spa.log | sed 's/^/SPA   /' >/dev/console; finish; exit 0
 fi
 say "install done in $(( $(date +%s) - t0 ))s; $(/usr/local/bin/firecracker --version 2>&1 | head -1); kernel files: $(ls /var/lib/sandboxd/firecracker/ | tr '\n' ' ')"
@@ -73,7 +80,7 @@ say "install done in $(( $(date +%s) - t0 ))s; $(/usr/local/bin/firecracker --ve
 # Only SPA lines go to the console (it keeps its last 64 KB); the rest is
 # in the results.
 bench() {
-  python3 kit/spa-bench.py "$@" 2>&1 | while IFS= read -r l; do
+  python3 kit/spa-bench.py "$@" 2>&1 | mask | while IFS= read -r l; do
     echo "$l"
     case "$l" in SPA*) echo "$l" >/dev/console ;; esac
   done
@@ -87,5 +94,5 @@ systemctl restart sandboxd
 bench warm --samples @SAMPLES@ --depth 4 --leg @LEG@
 # A warm spawn that failed: the first one, in short (the full log is in
 # the results).
-journalctl -u sandboxd --no-pager 2>/dev/null | grep -m1 'vmm pool: spawn failed' | grep -o 'error=.*' | cut -c1-400 | sed 's/^/SPA   warm spawn: /' >/dev/console
+journalctl -u sandboxd --no-pager 2>/dev/null | mask | grep -m1 'vmm pool: spawn failed' | grep -o 'error=.*' | cut -c1-400 | sed 's/^/SPA   warm spawn: /' >/dev/console
 finish
